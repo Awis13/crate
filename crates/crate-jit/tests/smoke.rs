@@ -88,6 +88,46 @@ fn a_branch_is_followed() {
 }
 
 #[test]
+fn x18_is_a_virtual_register() {
+    // The host reserves x18 (the OS clobbers it), so guest X18 must live in the
+    // state block, not host x18. Exercise a read, a write, arithmetic, X18 as the
+    // Rm of a shifted-register add, and a store through the memory helper:
+    //   movz x18,#0x1234 ; mov x5,x18 ; add x18,x18,#1 ; add x6,x7,x18 ;
+    //   str x18,[x1] ; brk #0
+    let (mut cpu, mut cache) = setup(&[
+        0xd2824692, 0xaa1203e5, 0x91000652, 0x8b1200e6, 0xf9000032, 0xd4200000,
+    ]);
+    cpu.state.x[7] = 0x100;
+    cpu.state.x[1] = RAM + 0x800;
+    cpu.state.pc = RAM;
+    assert_eq!(cpu.run(&mut cache), Stop::Brk(0));
+    assert_eq!(cpu.state.x[18], 0x1235, "X18 written then incremented");
+    assert_eq!(cpu.state.x[5], 0x1234, "mov x5,x18 read X18 before the add");
+    assert_eq!(cpu.state.x[6], 0x1335, "X18 as the Rm of add x6,x7,x18");
+    assert_eq!(
+        cpu.mem.read_u64(RAM + 0x800).unwrap(),
+        0x1235,
+        "str x18 used X18"
+    );
+}
+
+#[test]
+fn x18_is_read_from_the_state() {
+    // mov x5, x18 ; add x18, sp, #8 ; brk #0 -- X18 as a plain source, and as the
+    // destination of an SP-form add (which also keeps X18 in the state).
+    let (mut cpu, mut cache) = setup(&[0xaa1203e5, 0x910023f2, 0xd4200000]);
+    cpu.state.x[18] = 0xcafe;
+    cpu.state.sp = 0x9000;
+    cpu.state.pc = RAM;
+    assert_eq!(cpu.run(&mut cache), Stop::Brk(0));
+    assert_eq!(cpu.state.x[5], 0xcafe, "read the guest X18");
+    assert_eq!(
+        cpu.state.x[18], 0x9008,
+        "add x18, sp, #8 wrote X18 in the state"
+    );
+}
+
+#[test]
 fn shifted_value_then_store() {
     // mov w2,#1 ; lsl w2,w2,#27 ; str w2,[x1] ; ldr x3,[x1] ; brk #0
     // reproduces the GIC-setup pattern that lost its value.

@@ -37,7 +37,13 @@ pub fn save_stub(asm: &mut Asm) -> u32 {
     asm.emit(str_imm(3, 1, SP, offsets::x(1)));
     let mut n = 2;
     while n <= 28 {
-        asm.emit(stp(n, n + 1, SP, (offsets::x(n)) as i32));
+        if n == 18 {
+            // Guest X18 is virtual: the host's x18 is reserved by the OS and holds
+            // garbage, so storing it would corrupt state.x[18]. Save X19 alone.
+            asm.emit(str_imm(3, 19, SP, offsets::x(19)));
+        } else {
+            asm.emit(stp(n, n + 1, SP, (offsets::x(n)) as i32));
+        }
         n += 2;
     }
     // X29 is the last odd register; it was stored by the pair above (x28,x29).
@@ -103,10 +109,10 @@ pub fn exit(asm: &mut Asm, save_stub_rel: i64, code: u32, next: Next, info: Exit
             asm.emit(str_imm(3, SCRATCH0, SP, offsets::NEXT_PC));
         }
         Next::Reg(rn) => {
-            if rn == 0 {
-                asm.emit(ldr_imm(3, SCRATCH0, SP, offsets::x(0)));
-            } else if rn == 30 {
-                asm.emit(ldr_imm(3, SCRATCH0, SP, offsets::x(30)));
+            // X0 and X30 are already saved; X18 is virtual (it never lives in the
+            // host's reserved x18) and is read from the state block.
+            if rn == 0 || rn == 18 || rn == 30 {
+                asm.emit(ldr_imm(3, SCRATCH0, SP, offsets::x(rn)));
             } else {
                 asm.emit(mov(SCRATCH0, rn));
             }
@@ -169,7 +175,13 @@ pub fn call_mem(asm: &mut Asm, helper: u64, word: u32) {
 pub fn spill_full(asm: &mut Asm) {
     let mut n = 0;
     while n <= 28 {
-        asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
+        if n == 18 {
+            // Guest X18 is virtual; the host's x18 is OS-reserved garbage. Storing
+            // it would corrupt state.x[18], which the helper reads. Save X19 alone.
+            asm.emit(str_imm(3, 19, SP, offsets::x(19)));
+        } else {
+            asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
+        }
         n += 2;
     }
     asm.emit(str_imm(3, 30, SP, offsets::x(30)));

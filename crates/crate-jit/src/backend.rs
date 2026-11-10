@@ -378,11 +378,22 @@ impl Block {
     fn emit(&mut self, op: Op, word: u32, pc: u64) -> bool {
         match op {
             Op::Copy => {
-                self.asm.emit(word);
+                if copy_uses_x18(word) {
+                    self.emit_x18_copy(word, gpr_field_positions(word));
+                } else {
+                    self.asm.emit(word);
+                }
                 false
             }
             Op::PcRel { rd, imm, .. } => {
-                if rd != 31 {
+                if rd == 18 {
+                    // Guest X18 is virtual (see emit_x18_copy): write it in memory.
+                    let v = Self::victim(&[]);
+                    self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
+                    self.asm.mov_imm(v, imm as u64);
+                    self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
+                    self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+                } else if rd != 31 {
                     self.asm.mov_imm(rd, imm as u64);
                 }
                 false
@@ -525,6 +536,37 @@ impl Block {
         (9..=15).find(|r| !avoid.contains(r)).unwrap()
     }
 
+    /// Emits a verbatim data-processing instruction that names guest X18 in one
+    /// or more GPR fields. X18 is the platform register: the host OS reserves it
+    /// and clobbers it (macOS zeroes it on return from preemption), so guest X18
+    /// cannot live in host x18 -- it lives in `state.x[18]`, like SP. The
+    /// instruction runs against a victim register loaded from, and stored back
+    /// to, that slot. `cands` are the GPR field bit-positions for this word.
+    fn emit_x18_copy(&mut self, word: u32, cands: &[u32]) {
+        // Borrow a victim that collides with none of the instruction's registers.
+        let mut avoid = [0u32; 4];
+        for (i, &p) in cands.iter().enumerate() {
+            avoid[i] = (word >> p) & 0x1f;
+        }
+        let v = Self::victim(&avoid[..cands.len()]);
+        self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH)); // save the victim's guest value
+        self.asm.emit(ldr_imm(3, v, SP, offsets::x(18))); // victim = guest X18
+        let mut w = word;
+        let mut writes_x18 = false;
+        for &p in cands {
+            if (word >> p) & 0x1f == 18 {
+                w = (w & !(0x1f << p)) | (v << p);
+                // A GPR at bit 0 is the destination of every form that reaches here.
+                writes_x18 |= p == 0;
+            }
+        }
+        self.asm.emit(w);
+        if writes_x18 {
+            self.asm.emit(str_imm(3, v, SP, offsets::x(18))); // guest X18 = victim
+        }
+        self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH)); // restore the victim
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_sp_imm(
         &mut self,
@@ -539,9 +581,12 @@ impl Block {
         let discard = rd == 31 && set_flags;
         let v = Self::victim(&[rd, rn]);
         self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
-        // Load the source.
+        // Load the source (SP and X18 both live in the state block, not a host
+        // register).
         if rn == 31 {
             self.asm.emit(ldr_imm(3, v, SP, offsets::SP));
+        } else if rn == 18 {
+            self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
         } else {
             self.asm.emit(mov(v, rn));
         }
@@ -557,6 +602,8 @@ impl Block {
         if !discard {
             if rd == 31 {
                 self.asm.emit(str_imm(3, v, SP, offsets::SP));
+            } else if rd == 18 {
+                self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
             } else {
                 self.asm.emit(mov(rd, v));
             }
@@ -584,12 +631,16 @@ impl Block {
         self.asm.emit(str_imm(3, vm, SP, offsets::SCRATCH + 8));
         if rn == 31 {
             self.asm.emit(ldr_imm(3, v, SP, offsets::SP));
+        } else if rn == 18 {
+            self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
         } else {
             self.asm.emit(mov(v, rn));
         }
-        // rm is never SP (register 31 there is the zero register).
+        // rm is never SP (register 31 there is the zero register), but may be X18.
         if rm == 31 {
             self.asm.emit(movz(true, vm, 0, 0));
+        } else if rm == 18 {
+            self.asm.emit(ldr_imm(3, vm, SP, offsets::x(18)));
         } else {
             self.asm.emit(mov(vm, rm));
         }
@@ -604,6 +655,8 @@ impl Block {
         if !discard {
             if rd == 31 {
                 self.asm.emit(str_imm(3, v, SP, offsets::SP));
+            } else if rd == 18 {
+                self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
             } else {
                 self.asm.emit(mov(rd, v));
             }
@@ -643,17 +696,43 @@ impl Block {
 
     fn emit_cond_branch(&mut self, word: u32, kind: CondKind, taken: u64, fallthrough: u64) {
         let taken_label = self.asm.label();
+        // A compare-and-branch on guest X18 reads it from the state block (X18 is
+        // virtual, see emit_x18_copy) via a victim, restored on both paths.
+        let x18_reg = match kind {
+            CondKind::Cbz { rt, .. } | CondKind::Cbnz { rt, .. } if rt == 18 => true,
+            CondKind::Tbz { rt, .. } | CondKind::Tbnz { rt, .. } if rt == 18 => true,
+            _ => false,
+        };
+        let v = Self::victim(&[]);
+        if x18_reg {
+            self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
+            self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
+        }
         match kind {
             CondKind::Cond => {
                 let cond = word & 0xf;
                 self.asm.b_cond(cond, taken_label);
             }
-            CondKind::Cbz { sf, rt } => self.asm.cbz(sf, rt, taken_label),
-            CondKind::Cbnz { sf, rt } => self.asm.cbnz(sf, rt, taken_label),
-            CondKind::Tbz { rt, bit } => self.asm.tbz(rt, bit, taken_label),
-            CondKind::Tbnz { rt, bit } => self.asm.tbnz(rt, bit, taken_label),
+            CondKind::Cbz { sf, rt } => {
+                self.asm.cbz(sf, if rt == 18 { v } else { rt }, taken_label)
+            }
+            CondKind::Cbnz { sf, rt } => {
+                self.asm
+                    .cbnz(sf, if rt == 18 { v } else { rt }, taken_label)
+            }
+            CondKind::Tbz { rt, bit } => {
+                self.asm
+                    .tbz(if rt == 18 { v } else { rt }, bit, taken_label)
+            }
+            CondKind::Tbnz { rt, bit } => {
+                self.asm
+                    .tbnz(if rt == 18 { v } else { rt }, bit, taken_label)
+            }
         }
-        // Fall-through (condition false).
+        // Fall-through (condition false); restore the victim first.
+        if x18_reg {
+            self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+        }
         emit::exit(
             &mut self.asm,
             self.save_stub_rel,
@@ -662,6 +741,9 @@ impl Block {
             ExitInfo::default(),
         );
         self.asm.bind(taken_label);
+        if x18_reg {
+            self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+        }
         emit::exit(
             &mut self.asm,
             self.save_stub_rel,
@@ -2252,6 +2334,66 @@ fn crosses_page(addr: u64, n: u64, page_shift: u32) -> bool {
     (addr & (page - 1)) + n > page
 }
 
+/// The bit-positions of the GPR operand fields a verbatim-copied data-processing
+/// instruction uses -- Rd at 0, Rn at 5, Rm at 16, Ra at 10, as its class needs
+/// them. Empty for SIMD/FP and anything with no GPR operand. Used only to find
+/// and rewrite guest X18, which cannot live in the host's reserved x18.
+fn gpr_field_positions(word: u32) -> &'static [u32] {
+    const RD_RN: &[u32] = &[0, 5];
+    const RD: &[u32] = &[0];
+    const RD_RN_RM: &[u32] = &[0, 5, 16];
+    const RD_RN_RM_RA: &[u32] = &[0, 5, 16, 10];
+    const RN_RM: &[u32] = &[5, 16];
+    const RN: &[u32] = &[5];
+    match (word >> 25) & 0xf {
+        // Data processing -- immediate. Add/sub, logical and bitfield take Rd and
+        // Rn; move-wide only Rd; extract also Rm. (PC-rel and tagged add/sub are
+        // decoded elsewhere, never as Copy.)
+        0b1000 | 0b1001 => match (word >> 23) & 7 {
+            0b010 | 0b100 | 0b110 => RD_RN,
+            0b101 => RD,
+            0b111 => RD_RN_RM,
+            _ => &[],
+        },
+        // Data processing -- register.
+        0b0101 | 0b1101 => {
+            if (word >> 28) & 1 == 0 {
+                // Logical, add/sub shifted, add/sub extended: Rd, Rn, Rm.
+                RD_RN_RM
+            } else {
+                match (word >> 21) & 0xf {
+                    0b0000 => RD_RN_RM, // add/sub with carry
+                    0b0010 => {
+                        if word & (1 << 11) == 0 {
+                            RN_RM
+                        } else {
+                            RN
+                        }
+                    } // cond compare: no Rd
+                    0b0100 => RD_RN_RM, // conditional select
+                    0b0110 => {
+                        if (word >> 30) & 1 == 1 {
+                            RD_RN
+                        } else {
+                            RD_RN_RM
+                        }
+                    } // 1- / 2-source
+                    o if o & 0b1000 != 0 => RD_RN_RM_RA, // 3-source (Ra)
+                    _ => RD_RN_RM,      // unallocated: conservative
+                }
+            }
+        }
+        _ => &[],
+    }
+}
+
+/// Whether a verbatim data-processing instruction names guest X18 in a GPR field.
+fn copy_uses_x18(word: u32) -> bool {
+    gpr_field_positions(word)
+        .iter()
+        .any(|&p| (word >> p) & 0x1f == 18)
+}
+
 /// Extends a freshly loaded value to the destination register width.
 fn extend_loaded(m: &Mem, raw: u64) -> u64 {
     let mut value = raw;
@@ -2306,6 +2448,27 @@ mod tests {
     #[test]
     fn epilogue_symbol_resolves() {
         assert_ne!(CodeCache::epilogue_addr(), 0);
+    }
+
+    #[test]
+    fn detects_x18_operands() {
+        // mov x4, x18 (orr x4, xzr, x18): x18 is Rm, not written.
+        assert!(copy_uses_x18(0xaa1203e4));
+        assert_eq!(gpr_field_positions(0xaa1203e4), &[0, 5, 16]);
+        // add x18, x18, #1: x18 is Rd and Rn.
+        assert!(copy_uses_x18(0x91000652));
+        // movz x18, #0x1234: x18 is Rd only.
+        assert!(copy_uses_x18(0xd2824692));
+        assert_eq!(gpr_field_positions(0xd2824692), &[0]);
+        // add x5, x6, x18 (shifted register): x18 is Rm.
+        assert!(copy_uses_x18(0x8b120ca5));
+        // madd x0, x1, x2, x18: x18 is Ra (3-source).
+        assert!(copy_uses_x18(0x9b024820));
+        assert_eq!(gpr_field_positions(0x9b024820), &[0, 5, 16, 10]);
+        // add x0, x0, x1: no x18.
+        assert!(!copy_uses_x18(0x8b010000));
+        // A SIMD/FP word is never rewritten here.
+        assert_eq!(gpr_field_positions(0x4e218400), &[] as &[u32]);
     }
 
     #[test]
