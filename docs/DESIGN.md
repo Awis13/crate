@@ -97,6 +97,62 @@ The kernel goes at the start of RAM, the device tree in the last 2 MiB and the
 initrd just below it. The boot CPU starts at EL1 with the MMU off, interrupts
 masked and the device tree's address in x0.
 
+## The translator (jit backend)
+
+The `jit` backend (crate-jit) runs guest code on the same board and devices as
+`hvf`, for hosts with no hypervisor. It translates a block at a time: most
+instructions are copied into the host block unchanged, and only the ones that
+touch the machine are rewritten.
+
+**The register convention.** While translated code runs, the guest's registers
+live in the host's registers of the same number — guest X0..X30 in host
+X0..X30, the guest's NZCV in the host's, the guest V0..V31 in the host's — so a
+guest instruction that only moves data between registers *is* the same host
+instruction. The host stack pointer does not hold the guest's; it points at the
+`CpuState` block. That lets translated code spill a guest register with a plain
+`STP Xn, Xm, [SP, #off]` without first needing a scratch register, and read or
+set SP with `ADD Xn, SP, #0`. The guest's own SP lives in the state and every
+guest access to it is rewritten; a real host stack, for the moments the engine
+calls back into Rust, is kept in the state too. Keeping all 31 guest registers
+resident is what lets the common instruction copy verbatim, flags included — no
+reserved register, no per-instruction register allocation.
+
+**What is rewritten.** Loads and stores (translated through the guest MMU),
+branches (which end a block), the stack-pointer forms of add and subtract,
+PC-relative addresses and literal loads (materialised at translation time),
+system registers, barriers and cache/TLB maintenance, waits, and the
+instructions that change the exception level. Everything else is copied.
+
+**Entering and leaving.** A trampoline (`crate_jit_enter`) saves the host's
+callee-saved registers, loads the guest state, makes SP the state block, and
+branches to the block. A block ends by storing the guest registers back and
+returning an exit code that says why (a branch, a system register, a call, an
+exception, a wait). The dispatcher acts on it: it follows branches and waits
+itself, emulates system registers (delegating the GIC's CPU interface to the
+controller, as `hvf` does), takes exceptions to VBAR with SP banking, returns
+through ERET, and drives the virtual timer from the host's counter. Memory
+accesses call a Rust helper that walks the guest page tables (4 KiB, 16 KiB and
+64 KiB granules; the page size comes from the guest's TCR), does the access on
+RAM or routes it to a device, and raises a fault where the architecture would.
+
+**Executable memory** comes from `crate-host`: a MAP_JIT region on a Mac, or two
+mappings of the same pages (writable and executable aliases) elsewhere, which is
+the shape iOS needs. The translator writes through the writable alias and
+branches into the executable one, so nothing in crate-jit is macOS-only.
+
+**Testing.** Random EL0 instruction streams run natively (in a child process,
+caught at a trailing BRK through the signal machine context) and translated, and
+the full register file and memory are compared, so any instruction the
+translator gets wrong shows up as a divergence from the CPU itself
+(`crates/crate-jit/tests/el0_random.rs`). EL1 behaviour — the MMU, exceptions,
+system registers, the timer and the GIC — is checked against `hvf` as the
+oracle: `tools/el1-diff.sh` runs the same bare-metal programs on both backends
+and compares their output.
+
+The inline software-TLB fast path for loads and stores, block chaining, and
+running several CPUs are milestone 3; the helper-per-access memory path and the
+single boot CPU here are correct but not yet fast.
+
 ## Not yet
 
 - The C API (`include/crate.h`) is not implemented; crate-run uses the Rust

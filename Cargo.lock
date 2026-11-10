@@ -47,6 +47,12 @@ dependencies = [
 [[package]]
 name = "crate-jit"
 version = "0.0.0"
+dependencies = [
+ "crate-core",
+ "crate-devices",
+ "crate-host",
+ "libc",
+]
 
 [[package]]
 name = "crate-run"
@@ -55,6 +61,7 @@ dependencies = [
  "crate-core",
  "crate-host",
  "crate-hvf",
+ "crate-jit",
  "crate-virt",
  "libc",
 ]

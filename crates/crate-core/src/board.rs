@@ -41,6 +41,8 @@ pub struct Board {
     pub boot: BootState,
     /// The private interrupt the virtual timer raises (11 is INTID 27).
     pub vtimer_ppi: u32,
+    /// The private interrupt the EL1 physical timer raises (14 is INTID 30).
+    pub ptimer_ppi: u32,
     pub psci: Arc<Psci>,
     pub run: Arc<RunControl>,
 }

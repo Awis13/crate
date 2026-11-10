@@ -30,6 +30,11 @@ pub const HV_REG_CPSR: u32 = 34;
 /// hv_sys_reg_t uses the same packing as crate_core::cpu::SysReg.
 pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
 pub const HV_SYS_REG_SCTLR_EL1: u16 = 0xc080;
+pub const HV_SYS_REG_SPSR_EL1: u16 = 0xc200;
+pub const HV_SYS_REG_ELR_EL1: u16 = 0xc201;
+pub const HV_SYS_REG_ESR_EL1: u16 = 0xc290;
+pub const HV_SYS_REG_FAR_EL1: u16 = 0xc300;
+pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
 pub const HV_SYS_REG_CNTV_CTL_EL0: u16 = 0xdf19;
 pub const HV_SYS_REG_CNTV_CVAL_EL0: u16 = 0xdf1a;
 

@@ -27,7 +27,14 @@ const EC_WFX: u64 = 0x01;
 const EC_HVC64: u64 = 0x16;
 const EC_SMC64: u64 = 0x17;
 const EC_SYSREG: u64 = 0x18;
+const EC_IABT_LOWER: u64 = 0x20;
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
+
+// The EL1 physical timer, which the framework traps to us.
+const CNTPCT_EL0: SysReg = SysReg::new(3, 3, 14, 0, 1);
+const CNTP_TVAL_EL0: SysReg = SysReg::new(3, 3, 14, 2, 0);
+const CNTP_CTL_EL0: SysReg = SysReg::new(3, 3, 14, 2, 1);
+const CNTP_CVAL_EL0: SysReg = SysReg::new(3, 3, 14, 2, 2);
 
 const NO_VCPU: u64 = u64::MAX;
 const STATE_OTHER: u8 = 0;
@@ -241,6 +248,10 @@ struct Vcpu<'a> {
     /// The framework masked the virtual timer after it fired; its interrupt is
     /// asserted until the guest has dealt with it.
     vtimer_masked: bool,
+    /// The EL1 physical timer, which the framework traps to us rather than
+    /// delivering itself: CNTP_CTL_EL0 (ENABLE/IMASK) and CNTP_CVAL_EL0.
+    cntp_ctl: u64,
+    cntp_cval: u64,
     noted: HashSet<u64>,
 }
 
@@ -276,6 +287,8 @@ impl<'a> Vcpu<'a> {
             timebase,
             reset_sctlr: 0,
             vtimer_masked: false,
+            cntp_ctl: 0,
+            cntp_cval: 0,
             noted: HashSet::new(),
         };
         vcpu.set_sys(HV_SYS_REG_MPIDR_EL1, board.mpidrs[cpu])?;
@@ -361,6 +374,9 @@ impl<'a> Vcpu<'a> {
             if self.vtimer_masked && !self.vtimer_asserted()? {
                 self.release_vtimer()?;
             }
+            // Drive the physical timer's PPI before deciding what is pending, so
+            // a WFI that the timer should end delivers its interrupt.
+            self.service_ptimer();
             let interrupts = &self.board.interrupts;
             let (irq, fiq) = (
                 interrupts.irq_pending(self.cpu),
@@ -379,6 +395,9 @@ impl<'a> Vcpu<'a> {
             // SAFETY: the exit record is valid while the vCPU exists and
             // describes the run that just returned.
             let exit = unsafe { std::ptr::read(self.exit) };
+            // Refresh the physical timer after running, so a GIC read in the
+            // exit that follows sees its line at the current count.
+            self.service_ptimer();
             let flow = match exit.reason {
                 HV_EXIT_REASON_CANCELED => Flow::Continue,
                 HV_EXIT_REASON_VTIMER_ACTIVATED => {
@@ -427,6 +446,13 @@ impl<'a> Vcpu<'a> {
                 self.advance_pc()?;
                 Ok(Flow::Continue)
             }
+            // An instruction fetch that reached no stage-2 mapping: the guest
+            // branched into unbacked memory. Hand it an external abort, as
+            // hardware would for a fetch from an address nothing answers.
+            EC_IABT_LOWER => {
+                self.inject_instruction_abort(e.virtual_address)?;
+                Ok(Flow::Continue)
+            }
             ec => Err(Error::Backend(format!(
                 "unhandled exception class {ec:#x} (ESR {esr:#x}) at PC {:#x}, address {:#x}, IPA {:#x}",
                 self.reg(HV_REG_PC)?,
@@ -451,9 +477,49 @@ impl<'a> Vcpu<'a> {
         })
     }
 
+    /// Emulates the trapped EL1 physical timer, returning whether `reg` was one
+    /// of its registers. CNTPCT reads the guest counter; CNTP_CTL exposes a live
+    /// ISTATUS; TVAL is the signed `CVAL - now` down-counter.
+    fn physical_timer_reg(&mut self, reg: SysReg, rt: u32, is_read: bool) -> Result<bool> {
+        let now = self.guest_ticks();
+        let read = |this: &mut Self, v: u64| -> Result<()> {
+            if rt != 31 {
+                this.set_reg(rt, v)?;
+            }
+            Ok(())
+        };
+        match reg {
+            CNTPCT_EL0 if is_read => read(self, now)?,
+            CNTP_CTL_EL0 if is_read => {
+                let fired = self.cntp_ctl & 1 != 0 && now >= self.cntp_cval;
+                read(self, (self.cntp_ctl & 0b11) | ((fired as u64) << 2))?;
+            }
+            CNTP_CTL_EL0 => {
+                self.cntp_ctl = (if rt == 31 { 0 } else { self.reg(rt)? }) & 0b11;
+                self.service_ptimer();
+            }
+            CNTP_CVAL_EL0 if is_read => read(self, self.cntp_cval)?,
+            CNTP_CVAL_EL0 => {
+                self.cntp_cval = if rt == 31 { 0 } else { self.reg(rt)? };
+                self.service_ptimer();
+            }
+            CNTP_TVAL_EL0 if is_read => read(self, self.cntp_cval.wrapping_sub(now) & 0xffff_ffff)?,
+            CNTP_TVAL_EL0 => {
+                let tval = if rt == 31 { 0 } else { self.reg(rt)? };
+                self.cntp_cval = now.wrapping_add(tval as i32 as i64 as u64);
+                self.service_ptimer();
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     fn sysreg(&mut self, iss: u32) -> Result<()> {
         let reg = SysReg::from_iss(iss);
         let rt = (iss >> 5) & 31;
+        if self.physical_timer_reg(reg, rt, iss & 1 != 0)? {
+            return Ok(());
+        }
         let interrupts = &self.board.interrupts;
         if iss & 1 != 0 {
             let value = match interrupts.read_sysreg(self.cpu, reg) {
@@ -520,6 +586,34 @@ impl<'a> Vcpu<'a> {
         Ok(())
     }
 
+    /// Redirects the guest to its own EL1 vector for a synchronous instruction
+    /// abort, as the architecture would, since the framework reports the fault
+    /// to us rather than delivering it. `far` is the faulting virtual address.
+    fn inject_instruction_abort(&mut self, far: u64) -> Result<()> {
+        let cpsr = self.reg(HV_REG_CPSR)?;
+        let pc = self.reg(HV_REG_PC)?;
+        let lower = (cpsr >> 2) & 3 == 0;
+        // EC: instruction abort, from a lower EL (0x20) or the current one.
+        let ec: u64 = if lower { 0x20 } else { 0x21 };
+        // IFSC 0x10: synchronous external abort, not on a translation walk.
+        self.set_sys(HV_SYS_REG_ESR_EL1, (ec << 26) | (1 << 25) | 0x10)?;
+        self.set_sys(HV_SYS_REG_FAR_EL1, far)?;
+        self.set_sys(HV_SYS_REG_ELR_EL1, pc)?;
+        self.set_sys(HV_SYS_REG_SPSR_EL1, cpsr)?;
+        let vbar = self.sys(HV_SYS_REG_VBAR_EL1)? & !0x7ff;
+        // Vector: lower EL (0x400), or same EL with SP_EL0 (0x000) or SP_ELx.
+        let offset = if lower {
+            0x400
+        } else if cpsr & 1 != 0 {
+            0x200
+        } else {
+            0x000
+        };
+        self.set_reg(HV_REG_PC, vbar + offset)?;
+        self.set_reg(HV_REG_CPSR, (cpsr & 0xf000_0000) | PSTATE_EL1H_MASKED)?;
+        Ok(())
+    }
+
     /// Logs something odd the guest did, once per `key`.
     fn note(&mut self, key: u64, message: impl FnOnce() -> String) {
         if self.noted.insert(key) {
@@ -554,23 +648,47 @@ impl<'a> Vcpu<'a> {
         )
     }
 
-    /// When the virtual timer fires, if it is armed and nothing has raised its
-    /// interrupt yet.
-    fn timer_deadline(&self) -> Result<Option<Instant>> {
-        if self.vtimer_masked {
-            return Ok(None);
-        }
-        let ctl = self.sys(HV_SYS_REG_CNTV_CTL_EL0)?;
-        if ctl & 1 == 0 || ctl & 2 != 0 {
-            return Ok(None);
-        }
-        let cval = self.sys(HV_SYS_REG_CNTV_CVAL_EL0)?;
-        let now = Instant::now();
-        let ticks = cval.saturating_sub(self.guest_ticks());
+    /// Whether the EL1 physical timer's condition holds: enabled, not masked by
+    /// the guest, and its compare value reached. The framework traps CNTP_* to
+    /// us instead of delivering the timer, so crate keeps the registers and
+    /// drives the modelled PPI itself; CNTPCT shares the one guest counter.
+    fn ptimer_asserted(&self) -> bool {
+        self.cntp_ctl & 1 != 0 && self.cntp_ctl & 2 == 0 && self.guest_ticks() >= self.cntp_cval
+    }
+
+    /// Raises or lowers the physical timer's PPI from its current condition.
+    fn service_ptimer(&self) {
+        let asserted = self.ptimer_asserted();
+        self.board
+            .lines
+            .set_ppi(self.cpu, self.board.ptimer_ppi, asserted);
+    }
+
+    /// `ticks` of the guest counter from now as a host deadline, capped so a
+    /// WFI sleep still wakes to look again.
+    fn deadline_in(&self, ticks: u64) -> Instant {
         let nanos = ticks as u128 * self.timebase.numer as u128 / self.timebase.denom as u128;
-        Ok(Some(
-            now + Duration::from_nanos(nanos.min(LONGEST_SLEEP.as_nanos()) as u64),
-        ))
+        Instant::now() + Duration::from_nanos(nanos.min(LONGEST_SLEEP.as_nanos()) as u64)
+    }
+
+    /// When either architected timer would next fire, whichever is sooner, for
+    /// bounding a WFI sleep.
+    fn timer_deadline(&self) -> Result<Option<Instant>> {
+        let mut deadline: Option<Instant> = None;
+        // The virtual timer, unless Apple has already raised and masked it.
+        if !self.vtimer_masked {
+            let ctl = self.sys(HV_SYS_REG_CNTV_CTL_EL0)?;
+            if ctl & 1 != 0 && ctl & 2 == 0 {
+                let cval = self.sys(HV_SYS_REG_CNTV_CVAL_EL0)?;
+                deadline = Some(self.deadline_in(cval.saturating_sub(self.guest_ticks())));
+            }
+        }
+        // The physical timer, which crate keeps itself.
+        if self.cntp_ctl & 1 != 0 && self.cntp_ctl & 2 == 0 {
+            let d = self.deadline_in(self.cntp_cval.saturating_sub(self.guest_ticks()));
+            deadline = Some(deadline.map_or(d, |e| e.min(d)));
+        }
+        Ok(deadline)
     }
 
     /// WFI: sleeps until an interrupt is signalled, the timer would fire or

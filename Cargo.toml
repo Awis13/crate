@@ -17,6 +17,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 
 crate-core = { path = "crates/crate-core" }
 crate-devices = { path = "crates/crate-devices" }
+crate-jit = { path = "crates/crate-jit" }
 crate-host = { path = "crates/crate-host" }
 crate-hvf = { path = "crates/crate-hvf" }
 crate-virt = { path = "crates/crate-virt" }

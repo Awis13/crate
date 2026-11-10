@@ -6,3 +6,10 @@
 //! is translated a block at a time: most instructions are copied into host
 //! code as they are, and those that touch the machine (loads and stores,
 //! branches, system registers, exceptions) are rewritten.
+
+pub mod asm;
+pub mod backend;
+pub mod decode;
+pub mod emit;
+pub mod mmu;
+pub mod state;
