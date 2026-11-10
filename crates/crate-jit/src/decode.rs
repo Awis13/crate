@@ -536,6 +536,13 @@ fn decode_single(word: u32, v: bool) -> Op {
     let rt = word & 31;
     let rn = (word >> 5) & 31;
 
+    // PRFM (prefetch) is opc 0b10 with size 0b11 in the non-SIMD group; it is a
+    // hint with no architectural effect, so copy it (a host prefetch to an
+    // unmapped address is a no-op) rather than treating it as a load.
+    if !v && opc == 0b10 && size_field == 0b11 {
+        return Op::Copy;
+    }
+
     // Size and whether this is a load, its sign-extension and register width.
     let (size, load, signed, reg64) = if v {
         // SIMD: the size is (opc<1> : size_field).

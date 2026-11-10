@@ -1077,8 +1077,42 @@ impl Cpu {
             return Ok(());
         }
         if o1 {
-            // LDXP/STXP: a register pair, not needed yet.
-            return Err(external_abort(!load));
+            let rt2 = (word >> 10) & 31;
+            let elem = if word & (1 << 30) != 0 { 3 } else { 2 };
+            let n = 1u64 << elem;
+            let m = if elem >= 3 {
+                u64::MAX
+            } else {
+                (1u64 << (8 << elem)) - 1
+            };
+            let acc = if load { Access::Read } else { Access::Write };
+            let t0 = mmu::translate(&self.mem, regs, el, addr, acc)?;
+            self.state.exception_far = addr.wrapping_add(n);
+            let t1 = mmu::translate(&self.mem, regs, el, addr.wrapping_add(n), acc)?;
+            if word & (1 << 31) != 0 {
+                // LDXP / STXP: a 32- or 64-bit register pair.
+                if load {
+                    self.xwrite_z(rt, self.read_phys(t0.pa, elem)? & m);
+                    self.xwrite_z(rt2, self.read_phys(t1.pa, elem)? & m);
+                } else {
+                    self.write_phys(t0.pa, elem, self.xread_z(rt))?;
+                    self.write_phys(t1.pa, elem, self.xread_z(rt2))?;
+                    self.xwrite_z(rs, 0); // the monitor always succeeds on one CPU
+                }
+            } else {
+                // CASP: a compare-and-swap of a register pair. Rs is the even
+                // register of the compare pair, Rt of the swap pair.
+                let t0w = mmu::translate(&self.mem, regs, el, addr, Access::Write)?;
+                let t1w = mmu::translate(&self.mem, regs, el, addr.wrapping_add(n), Access::Write)?;
+                let (old0, old1) = (self.read_phys(t0w.pa, elem)?, self.read_phys(t1w.pa, elem)?);
+                if old0 & m == self.xread_z(rs) & m && old1 & m == self.xread_z(rs | 1) & m {
+                    self.write_phys(t0w.pa, elem, self.xread_z(rt))?;
+                    self.write_phys(t1w.pa, elem, self.xread_z(rt | 1))?;
+                }
+                self.xwrite_z(rs, old0 & m);
+                self.xwrite_z(rs | 1, old1 & m);
+            }
+            return Ok(());
         }
         let access = if load { Access::Read } else { Access::Write };
         let t = mmu::translate(&self.mem, regs, el, addr, access)?;
@@ -1099,6 +1133,17 @@ impl Cpu {
     }
 
     fn take_data_abort(&mut self, fault: mmu::Fault) {
+        if std::env::var_os("CRATE_TRAP_MEM").is_some() {
+            let far = self.state.exception_far;
+            let pa = mmu::translate(&self.mem, &self.state.mmu, self.el(), far, Access::Read)
+                .map(|t| t.pa);
+            crate_core::debug!(
+                "data abort far={far:#x} fsc={:#x} write={} pc={:#x} -> pa={pa:x?}",
+                fault.fsc,
+                fault.write,
+                self.state.pc
+            );
+        }
         // ESR for a data abort from the current EL: EC 0x24/0x25. The dispatcher
         // builds the full ESR; here record the fault class and FAR.
         self.state.exception_syndrome = fault.fsc as u64 | ((fault.write as u64) << 6);
@@ -1517,14 +1562,36 @@ impl Cpu {
             }
             return;
         }
-        // A cache or TLB maintenance op (CRn 7 or 8): invalidate our caches.
         let crn = (word >> 12) & 0xf;
+        let crm = (word >> 8) & 0xf;
         if crn == 0b1000 {
             // A TLBI: drop the software TLBs the fast path would keep (none yet).
             self.state.clear_tlbs();
+        } else if crn == 0b0111 && crm == 0b1000 {
+            // AT (address translation): translate Rt's VA and set PAR_EL1.
+            self.address_translate(word);
         }
         // IC/DC by address: our translated code reads guest memory afresh each
         // block, and self-modifying code is milestone 3, so these are no-ops.
+    }
+
+    /// AT S1E{0,1}{R,W}: do a stage-1 translation of the VA in Rt and record
+    /// the result (a physical address, or a fault) in PAR_EL1.
+    fn address_translate(&mut self, word: u32) {
+        let rt = (word & 31) as usize;
+        let va = if rt == 31 { 0 } else { self.state.x[rt] };
+        let op2 = (word >> 5) & 7;
+        // op2: 0 S1E1R, 1 S1E1W, 2 S1E0R, 3 S1E0W (4..7 are the EL2/unpriv forms).
+        let el = if op2 & 0b010 != 0 { 0 } else { 1 };
+        let write = op2 & 1 != 0;
+        let regs = self.state.mmu;
+        let access = if write { Access::Write } else { Access::Read };
+        self.state.banked.par_el1 = match mmu::translate(&self.mem, &regs, el, va, access) {
+            // F=0: the physical address in bits [51:12], attributes left zero.
+            Ok(t) => t.pa & 0x000f_ffff_ffff_f000,
+            // F=1 (bit 0), with the fault status in bits [6:1]; stage-1 (bit 9 = 0).
+            Err(f) => 1 | ((f.fsc as u64) << 1),
+        };
     }
 
     fn set_daif(&mut self, crm: u32, set: bool) {
@@ -1556,6 +1623,7 @@ impl Cpu {
             r if r == sr::MAIR_EL1 => self.state.mmu.mair_el1,
             r if r == sr::AMAIR_EL1 => self.state.mmu.amair_el1,
             r if r == sr::CONTEXTIDR_EL1 => self.state.mmu.contextidr_el1,
+            r if r == sr::PAR_EL1 => b.par_el1,
             r if r == sr::VBAR_EL1 => b.vbar_el1,
             r if r == sr::ELR_EL1 => b.elr_el1,
             r if r == sr::SPSR_EL1 => b.spsr_el1,
@@ -1627,6 +1695,7 @@ impl Cpu {
             r if r == sr::MAIR_EL1 => self.state.mmu.mair_el1 = value,
             r if r == sr::AMAIR_EL1 => self.state.mmu.amair_el1 = value,
             r if r == sr::CONTEXTIDR_EL1 => self.state.mmu.contextidr_el1 = value,
+            r if r == sr::PAR_EL1 => self.state.banked.par_el1 = value,
             r if r == sr::VBAR_EL1 => self.state.banked.vbar_el1 = value,
             r if r == sr::ELR_EL1 => self.state.banked.elr_el1 = value,
             r if r == sr::SPSR_EL1 => self.state.banked.spsr_el1 = value,
@@ -1718,6 +1787,7 @@ mod sr {
     pub const MAIR_EL1: SysReg = SysReg::new(3, 0, 10, 2, 0);
     pub const AMAIR_EL1: SysReg = SysReg::new(3, 0, 10, 3, 0);
     pub const CONTEXTIDR_EL1: SysReg = SysReg::new(3, 0, 13, 0, 1);
+    pub const PAR_EL1: SysReg = SysReg::new(3, 0, 7, 4, 0);
     pub const VBAR_EL1: SysReg = SysReg::new(3, 0, 12, 0, 0);
     pub const ELR_EL1: SysReg = SysReg::new(3, 0, 4, 0, 1);
     pub const SPSR_EL1: SysReg = SysReg::new(3, 0, 4, 0, 0);

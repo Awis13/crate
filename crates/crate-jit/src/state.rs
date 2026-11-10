@@ -97,6 +97,8 @@ pub struct Banked {
     pub cpacr_el1: u64,
     pub mdscr_el1: u64,
     pub actlr_el1: u64,
+    /// The result of the last address-translation (AT) instruction.
+    pub par_el1: u64,
 }
 
 /// The translation and memory system registers the MMU reads.
