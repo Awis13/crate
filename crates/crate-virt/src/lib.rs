@@ -258,6 +258,7 @@ impl VirtMachine {
                 x: [placement.dtb, 0, 0, 0],
             },
             vtimer_ppi: VTIMER_PPI,
+            ptimer_ppi: PTIMER_PPI,
             psci,
             run,
         };

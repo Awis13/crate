@@ -1654,27 +1654,42 @@ impl Cpu {
         crate_host::jit::counter::now().wrapping_sub(self.timer_offset)
     }
 
-    /// When the virtual timer would next fire, in host counter ticks, if armed.
+    /// When either architected timer would next fire, in host counter ticks,
+    /// whichever is sooner, if either is armed and unmasked.
     fn timer_deadline(&self) -> Option<u64> {
-        let ctl = self.state.banked.cntv_ctl;
-        if ctl & 1 == 0 || ctl & 2 != 0 {
-            return None; // disabled or masked
+        let mut deadline: Option<u64> = None;
+        for (ctl, cval) in [
+            (self.state.banked.cntv_ctl, self.state.banked.cntv_cval),
+            (self.state.banked.cntp_ctl, self.state.banked.cntp_cval),
+        ] {
+            if ctl & 1 == 0 || ctl & 2 != 0 {
+                continue; // disabled or masked
+            }
+            let d = self.timer_offset.wrapping_add(cval);
+            deadline = Some(deadline.map_or(d, |x| x.min(d)));
         }
-        Some(self.timer_offset.wrapping_add(self.state.banked.cntv_cval))
+        deadline
     }
 
-    /// Raises or lowers the virtual timer's interrupt from its compare value.
+    /// Raises or lowers each architected timer's interrupt from its compare
+    /// value. CNTVCT and CNTPCT share the one guest counter (CNTVOFF is 0 for
+    /// an EL1 guest), so both compare against it.
     fn service_timer(&mut self, board: &Board) {
-        let ctl = self.state.banked.cntv_ctl;
-        let fired = ctl & 1 != 0 && self.guest_counter() >= self.state.banked.cntv_cval;
+        let now = self.guest_counter();
         // ISTATUS (bit 2) reads as the raw condition; the line is gated by IMASK.
-        if fired {
-            self.state.banked.cntv_ctl |= 1 << 2;
-        } else {
-            self.state.banked.cntv_ctl &= !(1 << 2);
-        }
-        let asserted = fired && ctl & 2 == 0;
-        board.lines.set_ppi(self.cpu, board.vtimer_ppi, asserted);
+        let vctl = self.state.banked.cntv_ctl;
+        let vfired = vctl & 1 != 0 && now >= self.state.banked.cntv_cval;
+        self.state.banked.cntv_ctl = (vctl & !(1 << 2)) | ((vfired as u64) << 2);
+        board
+            .lines
+            .set_ppi(self.cpu, board.vtimer_ppi, vfired && vctl & 2 == 0);
+
+        let pctl = self.state.banked.cntp_ctl;
+        let pfired = pctl & 1 != 0 && now >= self.state.banked.cntp_cval;
+        self.state.banked.cntp_ctl = (pctl & !(1 << 2)) | ((pfired as u64) << 2);
+        board
+            .lines
+            .set_ppi(self.cpu, board.ptimer_ppi, pfired && pctl & 2 == 0);
     }
 }
 
