@@ -78,6 +78,9 @@ void crate_set_log_callback(crate_log_fn fn, void *context, crate_log_level max)
 crate_config *crate_config_new(const char *machine);
 void crate_config_free(crate_config *config);
 
+/* hvf needs the process to be signed with the hypervisor entitlement. Without
+   it, CRATE_CPU_AUTO logs that hvf was refused and uses jit, and CRATE_CPU_HVF
+   fails with CRATE_ERR_UNSUPPORTED. */
 typedef enum crate_cpu_backend {
     CRATE_CPU_AUTO, /* hvf when this process may use it, otherwise jit */
     CRATE_CPU_JIT,  /* the translator */
@@ -85,7 +88,11 @@ typedef enum crate_cpu_backend {
 } crate_cpu_backend;
 
 crate_status crate_config_set_cpu_backend(crate_config *config, crate_cpu_backend backend);
+
+/* 1 to 32 on virt. */
 crate_status crate_config_set_cpus(crate_config *config, uint32_t count);
+
+/* A multiple of 2 MiB, from 64 MiB up to 63 GiB on virt. */
 crate_status crate_config_set_memory(crate_config *config, uint64_t bytes);
 
 /* Executable memory for the translator.
@@ -114,6 +121,19 @@ crate_status crate_config_set_cmdline(crate_config *config, const char *cmdline)
 
 #define CRATE_DISK_READ_ONLY (1u << 0)
 
+/* When the guest flushes a disk, crate calls fsync on its file by default. On
+   Apple systems that reaches only the drive's own cache: FULL_FLUSH uses
+   F_FULLFSYNC instead, which is slower and survives power loss; elsewhere it
+   changes nothing. NO_FLUSH ignores the guest's flushes, fastest but a host
+   crash can lose recent writes, for scratch disks. The two together are
+   CRATE_ERR_INVALID_ARGUMENT. */
+#define CRATE_DISK_FULL_FLUSH (1u << 1)
+#define CRATE_DISK_NO_FLUSH (1u << 2)
+
+/* The guest may discard blocks it no longer uses, and the file gives that space
+   back to the host (a sparse file's hole). */
+#define CRATE_DISK_DISCARD (1u << 3)
+
 /* A virtio block device on a raw image file. Disks appear to the guest in the
    order they are added (vda, vdb, ...). */
 crate_status crate_config_add_disk(crate_config *config, const char *path, uint32_t flags);
@@ -124,6 +144,15 @@ crate_status crate_config_add_disk(crate_config *config, const char *path, uint3
    through the host's own sockets, with no privileges needed. The guest is
    10.0.2.15 and the host 10.0.2.2. `index` receives the device's number. */
 crate_status crate_config_add_network(crate_config *config, uint32_t *index);
+
+/* The device's MAC address. Without one, each network device gets a locally
+   administered address of its own, the same on every run, so the guest's
+   network setup keeps matching it. */
+crate_status crate_config_set_network_mac(crate_config *config, uint32_t network,
+                                          const uint8_t mac[6]);
+
+/* IPv6 beside IPv4 on that network. Off by default. */
+crate_status crate_config_set_network_ipv6(crate_config *config, uint32_t network, bool enabled);
 
 typedef enum crate_protocol {
     CRATE_TCP,
@@ -149,14 +178,20 @@ typedef struct crate_console_callbacks {
     void *context;
     /* Bytes the guest wrote, valid only during the call. */
     void (*output)(void *context, uint32_t console, const uint8_t *bytes, size_t length);
+    /* The console can take bytes again, after a crate_console_write took fewer
+       than it was offered. May be NULL; the app then retries on its own. */
+    void (*input_ready)(void *context, uint32_t console);
 } crate_console_callbacks;
 
+/* A machine has at most one serial console; a second is
+   CRATE_ERR_INVALID_ARGUMENT. Virtio consoles become hvc0, hvc1, ... in the
+   order they are added. */
 crate_status crate_config_add_console(crate_config *config, crate_console_kind kind,
                                       const crate_console_callbacks *callbacks, uint32_t *index);
 
-/* Bytes for the guest to read. Never blocks: returns how many were taken,
-   possibly none while the guest is not reading, and the app offers the rest
-   later. */
+/* Bytes for the guest to read. Never blocks: returns how many were taken, which
+   for the serial console is only a few at a time and possibly none while the
+   guest is not reading. The app offers the rest when input_ready says so. */
 size_t crate_console_write(crate_machine *machine, uint32_t console, const uint8_t *bytes,
                            size_t length);
 
@@ -232,8 +267,11 @@ typedef void (*crate_state_fn)(void *context, crate_state state, crate_stop_reas
 crate_status crate_config_set_state_callback(crate_config *config, crate_state_fn fn, void *context);
 
 /* Builds the machine from the description: guest memory, executable memory,
-   devices, the kernel loaded. The config may be freed afterwards. One machine
-   per process for now. */
+   devices, the kernel loaded. The config may be freed afterwards.
+
+   One machine per process: Apple's Hypervisor framework allows one virtual
+   machine per process, and jit keeps the same rule for now. Creating a second
+   while one exists is CRATE_ERR_STATE. */
 crate_status crate_machine_create(const crate_config *config, crate_machine **machine);
 
 /* Returns at once; the guest runs on the engine's threads. */
