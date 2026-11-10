@@ -874,13 +874,24 @@ impl Cpu {
                     addr,
                     if m.load { Access::Read } else { Access::Write },
                 )?;
+                let crosses = crosses_page(addr, n, t.page_shift);
                 if m.load {
-                    self.xwrite_z(m.rt, self.load_value(t.pa, &m)?);
+                    let raw = if crosses {
+                        let mut buf = [0u8; 8];
+                        self.gather(addr, &mut buf[..n as usize], el, &regs)?;
+                        u64::from_le_bytes(buf)
+                    } else {
+                        self.read_phys(t.pa, m.size)?
+                    };
+                    self.xwrite_z(m.rt, extend_loaded(&m, raw));
                 } else {
                     let value = self.xread_z(m.rt);
-                    self.write_phys(t.pa, m.size, value)?;
+                    if crosses {
+                        self.scatter(addr, &value.to_le_bytes()[..n as usize], el, &regs)?;
+                    } else {
+                        self.write_phys(t.pa, m.size, value)?;
+                    }
                 }
-                let _ = n;
                 self.apply_writeback(&m, base);
                 Ok(())
             }
@@ -897,11 +908,23 @@ impl Cpu {
                         ea,
                         if m.load { Access::Read } else { Access::Write },
                     )?;
+                    let crosses = crosses_page(ea, n, t.page_shift);
                     if m.load {
-                        self.xwrite_z(rt, self.load_value(t.pa, &m)?);
+                        let raw = if crosses {
+                            let mut buf = [0u8; 8];
+                            self.gather(ea, &mut buf[..n as usize], el, &regs)?;
+                            u64::from_le_bytes(buf)
+                        } else {
+                            self.read_phys(t.pa, m.size)?
+                        };
+                        self.xwrite_z(rt, extend_loaded(&m, raw));
                     } else {
                         let value = self.xread_z(rt);
-                        self.write_phys(t.pa, m.size, value)?;
+                        if crosses {
+                            self.scatter(ea, &value.to_le_bytes()[..n as usize], el, &regs)?;
+                        } else {
+                            self.write_phys(t.pa, m.size, value)?;
+                        }
                     }
                 }
                 self.apply_writeback(&m, base);
@@ -1014,16 +1037,59 @@ impl Cpu {
         Err(external_abort(false))
     }
 
-    /// Reads a load's value and extends it to the destination register width.
-    fn load_value(&self, pa: u64, m: &Mem) -> Result<u64, mmu::Fault> {
-        let mut value = self.read_phys(pa, m.size)?;
-        if m.signed {
-            value = sign_extend(value, 8 << m.size);
+    /// Reads `buf.len()` bytes at guest VA `addr`, re-walking the page tables at
+    /// every page boundary so a misaligned access that crosses into a
+    /// physically separate page reads each page's bytes from its own
+    /// translation. The fast single-page path stays in `read_phys`; this is the
+    /// rare page-crossing case, where contiguous physical bytes would be wrong.
+    fn gather(
+        &mut self,
+        addr: u64,
+        buf: &mut [u8],
+        el: u32,
+        regs: &MmuRegs,
+    ) -> Result<(), mmu::Fault> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let va = addr.wrapping_add(done as u64);
+            self.state.exception_far = va;
+            let t = mmu::translate(&self.mem, regs, el, va, Access::Read)?;
+            let page = 1u64 << t.page_shift;
+            let chunk = ((page - (va & (page - 1))) as usize).min(buf.len() - done);
+            if self.mem.read(t.pa, &mut buf[done..done + chunk]).is_err() {
+                for k in 0..chunk {
+                    buf[done + k] = self.read_phys(t.pa + k as u64, 0)? as u8;
+                }
+            }
+            done += chunk;
         }
-        if !m.reg64 {
-            value &= 0xffff_ffff;
+        Ok(())
+    }
+
+    /// Writes `bytes` at guest VA `addr`, re-walking the page tables at every
+    /// page boundary; the write counterpart of `gather`.
+    fn scatter(
+        &mut self,
+        addr: u64,
+        bytes: &[u8],
+        el: u32,
+        regs: &MmuRegs,
+    ) -> Result<(), mmu::Fault> {
+        let mut done = 0usize;
+        while done < bytes.len() {
+            let va = addr.wrapping_add(done as u64);
+            self.state.exception_far = va;
+            let t = mmu::translate(&self.mem, regs, el, va, Access::Write)?;
+            let page = 1u64 << t.page_shift;
+            let chunk = ((page - (va & (page - 1))) as usize).min(bytes.len() - done);
+            if self.mem.write(t.pa, &bytes[done..done + chunk]).is_err() {
+                for k in 0..chunk {
+                    self.write_phys(t.pa + k as u64, 0, bytes[done + k] as u64)?;
+                }
+            }
+            done += chunk;
         }
-        Ok(value)
+        Ok(())
     }
 
     fn write_phys(&self, pa: u64, size: u32, value: u64) -> Result<(), mmu::Fault> {
@@ -1062,25 +1128,15 @@ impl Cpu {
         };
         for (i, &rt) in regs_list.iter().enumerate() {
             let ea = start.wrapping_add((i * bytes) as u64);
-            self.state.exception_far = ea;
-            let t = mmu::translate(
-                &self.mem,
-                regs,
-                el,
-                ea,
-                if m.load { Access::Read } else { Access::Write },
-            )?;
             if m.load {
+                // The upper lanes past `bytes` read as zero (SIMD loads clear
+                // the rest of the register).
                 let mut reg = [0u8; 16];
-                for (b, slot) in reg.iter_mut().take(bytes).enumerate() {
-                    *slot = self.read_phys(t.pa + b as u64, 0)? as u8;
-                }
+                self.gather(ea, &mut reg[..bytes], el, regs)?;
                 self.state.v[rt as usize] = reg;
             } else {
                 let reg = self.state.v[rt as usize];
-                for (b, &byte) in reg.iter().take(bytes).enumerate() {
-                    self.write_phys(t.pa + b as u64, 0, byte as u64)?;
-                }
+                self.scatter(ea, &reg[..bytes], el, regs)?;
             }
         }
         self.apply_writeback(m, base);
@@ -1816,14 +1872,38 @@ impl Cpu {
             // A TLBI: drop the software TLBs the fast path would keep (none yet).
             self.state.clear_tlbs();
         } else if crn == 0b0111 {
-            match crm {
+            let op2 = (word >> 5) & 7;
+            match (crm, op2) {
                 // AT (address translation): translate Rt's VA, set PAR_EL1.
-                0b1000 => self.address_translate(word),
+                (0b1000, _) => self.address_translate(word),
                 // IC IALLU(IS) / IC IVAU (CRm 1 or 5): the guest changed code it
-                // may re-run, so drop every translation. DC (data cache) is a
-                // no-op since the helper reads memory afresh.
-                0b0001 | 0b0101 => self.state.flush_cache = 1,
+                // may re-run, so drop every translation. The cache-maintenance
+                // DC ops are no-ops since the helper reads memory afresh.
+                (0b0001, _) | (0b0101, _) => self.state.flush_cache = 1,
+                // DC ZVA: zero the block at Rt's VA. This one is not a cache
+                // hint -- it writes zeros, and we advertise it in DCZID_EL0.
+                (0b0100, 1) => self.dc_zva(word),
                 _ => {}
+            }
+        }
+    }
+
+    /// DC ZVA: zero the DCZID_EL0-sized block (64 bytes) holding Rt's VA. The
+    /// guest zeroes memory this way (clear_page, kzalloc), so a recycled page
+    /// it clears must actually read back zero -- otherwise a freed structure
+    /// keeps stale bytes and, e.g., the slab freelist is corrupted. The block
+    /// fits within one page, so one translation covers it; a fault is dropped
+    /// (the caller advances past the instruction) as the guest only zeroes
+    /// mapped, writable memory.
+    fn dc_zva(&mut self, word: u32) {
+        let rt = (word & 31) as usize;
+        let va = if rt == 31 { 0 } else { self.state.x[rt] };
+        let base = va & !63;
+        let el = self.el();
+        let regs = self.state.mmu;
+        if let Ok(t) = mmu::translate(&self.mem, &regs, el, base, Access::Write) {
+            for off in (0..64u64).step_by(8) {
+                let _ = self.write_phys(t.pa + off, 3, 0);
             }
         }
     }
@@ -2164,6 +2244,26 @@ fn sign_extend(value: u64, bits: u32) -> u64 {
     (((value << shift) as i64) >> shift) as u64
 }
 
+/// Whether an `n`-byte access at `addr` runs past the end of its page, so it
+/// must be split and each page translated on its own: consecutive guest pages
+/// need not map to consecutive physical pages.
+fn crosses_page(addr: u64, n: u64, page_shift: u32) -> bool {
+    let page = 1u64 << page_shift;
+    (addr & (page - 1)) + n > page
+}
+
+/// Extends a freshly loaded value to the destination register width.
+fn extend_loaded(m: &Mem, raw: u64) -> u64 {
+    let mut value = raw;
+    if m.signed {
+        value = sign_extend(value, 8 << m.size);
+    }
+    if !m.reg64 {
+        value &= 0xffff_ffff;
+    }
+    value
+}
+
 /// The signed maximum or minimum of two values at a given access size, for the
 /// LDSMAX/LDSMIN atomics.
 fn signed_minmax(a: u64, b: u64, size: u32, max: bool) -> u64 {
@@ -2206,5 +2306,87 @@ mod tests {
     #[test]
     fn epilogue_symbol_resolves() {
         assert_ne!(CodeCache::epilogue_addr(), 0);
+    }
+
+    #[test]
+    fn crosses_page_is_exact() {
+        // A whole page's worth that ends exactly on the boundary does not cross.
+        assert!(!crosses_page(0x1000, 0x1000, 12));
+        assert!(!crosses_page(0x1ff8, 8, 12)); // ends at 0x2000
+        assert!(crosses_page(0x1ff9, 8, 12)); // one byte over
+        assert!(crosses_page(0x1ffc, 8, 12));
+        assert!(!crosses_page(0x1ffc, 4, 12)); // ends at 0x2000
+        assert!(crosses_page(0x3ffc, 8, 14)); // 16 KiB granule, still crosses
+    }
+
+    /// Maps two adjacent guest pages to two *non-adjacent* physical frames, so a
+    /// misaligned access over the boundary only reads/writes the right bytes if
+    /// each page is translated on its own. Returns (cpu, va_base, pa_a, pa_b).
+    fn two_page_cpu() -> (Box<Cpu>, u64, u64, u64) {
+        use crate_core::memory::{HeapRam, RamBlock};
+        const RAM: u64 = 0x4000_0000;
+        let block: Arc<dyn RamBlock> = Arc::new(HeapRam::new(0x40_0000).unwrap());
+        let mem = Arc::new(GuestMemory::new(vec![(RAM, block)]).unwrap());
+        // A four-level 4 KiB walk (T0SZ = 16). All four tables live in one frame
+        // each; `va` and `va + 0x1000` share the whole path down to one leaf
+        // table, differing only in the level-3 index.
+        let (l0, l1, l2, l3) = (
+            RAM + 0x10_0000,
+            RAM + 0x10_1000,
+            RAM + 0x10_2000,
+            RAM + 0x10_3000,
+        );
+        let va = 0x4_0000u64;
+        let pa_a = RAM + 0x20_0000; // the frame for `va`
+        let pa_b = RAM + 0x30_0000; // the frame for `va + 0x1000`, far from pa_a
+        mem.write_u64(l0 + ((va >> 39) & 0x1ff) * 8, l1 | 3)
+            .unwrap();
+        mem.write_u64(l1 + ((va >> 30) & 0x1ff) * 8, l2 | 3)
+            .unwrap();
+        mem.write_u64(l2 + ((va >> 21) & 0x1ff) * 8, l3 | 3)
+            .unwrap();
+        let leaf = |pa: u64| pa | 3 | (1 << 10); // valid page, AF set, AP = EL1 RW
+        mem.write_u64(l3 + ((va >> 12) & 0x1ff) * 8, leaf(pa_a))
+            .unwrap();
+        mem.write_u64(l3 + (((va + 0x1000) >> 12) & 0x1ff) * 8, leaf(pa_b))
+            .unwrap();
+
+        let mut cpu = Cpu::new(mem);
+        cpu.state.pstate = 0b0101; // EL1h
+        cpu.state.mmu = MmuRegs {
+            sctlr_el1: 1, // M: MMU on
+            ttbr0_el1: l0,
+            tcr_el1: 16, // T0SZ = 16, TG0 = 4 KiB
+            ..Default::default()
+        };
+        (cpu, va, pa_a, pa_b)
+    }
+
+    #[test]
+    fn misaligned_load_crossing_a_page_reads_both_frames() {
+        let (mut cpu, va, pa_a, pa_b) = two_page_cpu();
+        // Eight bytes at va+0xffc: four in page A, four in page B.
+        cpu.mem
+            .write(pa_a + 0xffc, &[0x11, 0x22, 0x33, 0x44])
+            .unwrap();
+        cpu.mem.write(pa_b, &[0x55, 0x66, 0x77, 0x88]).unwrap();
+        cpu.state.x[1] = va + 0xffc;
+        // LDR x5, [x1]
+        cpu.memory_access(0xf940_0025).unwrap();
+        assert_eq!(cpu.state.x[5], 0x8877_6655_4433_2211);
+    }
+
+    #[test]
+    fn misaligned_store_crossing_a_page_writes_both_frames() {
+        let (mut cpu, va, pa_a, pa_b) = two_page_cpu();
+        cpu.state.x[1] = va + 0xffc;
+        cpu.state.x[7] = 0xaabb_ccdd_eeff_0011;
+        // STR x7, [x1]
+        cpu.memory_access(0xf900_0027).unwrap();
+        let (mut a, mut b) = ([0u8; 4], [0u8; 4]);
+        cpu.mem.read(pa_a + 0xffc, &mut a).unwrap();
+        cpu.mem.read(pa_b, &mut b).unwrap();
+        assert_eq!(a, [0x11, 0x00, 0xff, 0xee]);
+        assert_eq!(b, [0xdd, 0xcc, 0xbb, 0xaa]);
     }
 }
