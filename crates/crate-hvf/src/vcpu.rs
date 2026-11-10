@@ -27,6 +27,7 @@ const EC_WFX: u64 = 0x01;
 const EC_HVC64: u64 = 0x16;
 const EC_SMC64: u64 = 0x17;
 const EC_SYSREG: u64 = 0x18;
+const EC_IABT_LOWER: u64 = 0x20;
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
 
 // The EL1 physical timer, which the framework traps to us.
@@ -445,6 +446,13 @@ impl<'a> Vcpu<'a> {
                 self.advance_pc()?;
                 Ok(Flow::Continue)
             }
+            // An instruction fetch that reached no stage-2 mapping: the guest
+            // branched into unbacked memory. Hand it an external abort, as
+            // hardware would for a fetch from an address nothing answers.
+            EC_IABT_LOWER => {
+                self.inject_instruction_abort(e.virtual_address)?;
+                Ok(Flow::Continue)
+            }
             ec => Err(Error::Backend(format!(
                 "unhandled exception class {ec:#x} (ESR {esr:#x}) at PC {:#x}, address {:#x}, IPA {:#x}",
                 self.reg(HV_REG_PC)?,
@@ -575,6 +583,34 @@ impl<'a> Vcpu<'a> {
                 self.set_reg(rt, value)?;
             }
         }
+        Ok(())
+    }
+
+    /// Redirects the guest to its own EL1 vector for a synchronous instruction
+    /// abort, as the architecture would, since the framework reports the fault
+    /// to us rather than delivering it. `far` is the faulting virtual address.
+    fn inject_instruction_abort(&mut self, far: u64) -> Result<()> {
+        let cpsr = self.reg(HV_REG_CPSR)?;
+        let pc = self.reg(HV_REG_PC)?;
+        let lower = (cpsr >> 2) & 3 == 0;
+        // EC: instruction abort, from a lower EL (0x20) or the current one.
+        let ec: u64 = if lower { 0x20 } else { 0x21 };
+        // IFSC 0x10: synchronous external abort, not on a translation walk.
+        self.set_sys(HV_SYS_REG_ESR_EL1, (ec << 26) | (1 << 25) | 0x10)?;
+        self.set_sys(HV_SYS_REG_FAR_EL1, far)?;
+        self.set_sys(HV_SYS_REG_ELR_EL1, pc)?;
+        self.set_sys(HV_SYS_REG_SPSR_EL1, cpsr)?;
+        let vbar = self.sys(HV_SYS_REG_VBAR_EL1)? & !0x7ff;
+        // Vector: lower EL (0x400), or same EL with SP_EL0 (0x000) or SP_ELx.
+        let offset = if lower {
+            0x400
+        } else if cpsr & 1 != 0 {
+            0x200
+        } else {
+            0x000
+        };
+        self.set_reg(HV_REG_PC, vbar + offset)?;
+        self.set_reg(HV_REG_CPSR, (cpsr & 0xf000_0000) | PSTATE_EL1H_MASKED)?;
         Ok(())
     }
 
