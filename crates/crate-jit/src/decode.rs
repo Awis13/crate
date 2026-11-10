@@ -679,6 +679,25 @@ fn decode_single(word: u32, v: bool) -> Op {
                 index_reg: Some((rm, option, amount)),
             })
         }
+        // Unprivileged load/store (LDTR/STTR family): bits 11:10 == 10, bit 21
+        // clear. It is an unscaled `[Xn, #imm9]` access the kernel uses for
+        // usercopy; the memory helper reads the EL from the word and translates
+        // it at EL0. There is no SIMD unprivileged form.
+        0b10 if !v => Op::Memory(Mem {
+            word,
+            kind,
+            size,
+            signed,
+            reg64,
+            load,
+            rn,
+            rt,
+            rt2: 0,
+            offset: imm9,
+            writeback: false,
+            pre: true,
+            index_reg: None,
+        }),
         _ => Op::Undefined,
     }
 }

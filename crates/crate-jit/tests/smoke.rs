@@ -112,6 +112,26 @@ fn x18_is_a_virtual_register() {
 }
 
 #[test]
+fn unprivileged_load_store_round_trips() {
+    // With the MMU off (flat map), STTR/LDTR behave as ordinary accesses -- the
+    // point is that they are decoded and run, not rejected as undefined:
+    //   sttr x0,[x1] ; ldtr x2,[x1] ; brk #0
+    let (mut cpu, mut cache) = setup(&[0xf8000820, 0xf8400822, 0xd4200000]);
+    cpu.state.x[0] = 0xdead_beef_0bad_f00d;
+    cpu.state.x[1] = RAM + 0x800;
+    cpu.state.pc = RAM;
+    assert_eq!(cpu.run(&mut cache), Stop::Brk(0));
+    assert_eq!(
+        cpu.state.x[2], 0xdead_beef_0bad_f00d,
+        "LDTR read what STTR wrote"
+    );
+    assert_eq!(
+        cpu.mem.read_u64(RAM + 0x800).unwrap(),
+        0xdead_beef_0bad_f00d
+    );
+}
+
+#[test]
 fn x18_is_read_from_the_state() {
     // mov x5, x18 ; add x18, sp, #8 ; brk #0 -- X18 as a plain source, and as the
     // destination of an SP-form add (which also keeps X18 in the state).

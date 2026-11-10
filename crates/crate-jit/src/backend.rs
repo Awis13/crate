@@ -949,10 +949,12 @@ impl Cpu {
                 let addr = self.effective_address(&m, base);
                 let n = 1u64 << m.size;
                 self.state.exception_far = addr;
+                // LDTR/STTR are unprivileged: checked at EL0 even from EL1.
+                let acc_el = if is_unprivileged(word) { 0 } else { el };
                 let t = mmu::translate(
                     &self.mem,
                     &regs,
-                    el,
+                    acc_el,
                     addr,
                     if m.load { Access::Read } else { Access::Write },
                 )?;
@@ -960,7 +962,7 @@ impl Cpu {
                 if m.load {
                     let raw = if crosses {
                         let mut buf = [0u8; 8];
-                        self.gather(addr, &mut buf[..n as usize], el, &regs)?;
+                        self.gather(addr, &mut buf[..n as usize], acc_el, &regs)?;
                         u64::from_le_bytes(buf)
                     } else {
                         self.read_phys(t.pa, m.size)?
@@ -969,7 +971,7 @@ impl Cpu {
                 } else {
                     let value = self.xread_z(m.rt);
                     if crosses {
-                        self.scatter(addr, &value.to_le_bytes()[..n as usize], el, &regs)?;
+                        self.scatter(addr, &value.to_le_bytes()[..n as usize], acc_el, &regs)?;
                     } else {
                         self.write_phys(t.pa, m.size, value)?;
                     }
@@ -2387,6 +2389,14 @@ fn gpr_field_positions(word: u32) -> &'static [u32] {
     }
 }
 
+/// Whether a load/store register word is an unprivileged access (LDTR/STTR and
+/// the byte/half variants): bit 24 clear (not unsigned-offset), bit 21 clear
+/// (not register-offset), and the addressing-mode bits 11:10 == 0b10. The kernel
+/// uses these for usercopy; they translate at EL0 even when run from EL1.
+fn is_unprivileged(word: u32) -> bool {
+    (word >> 24) & 1 == 0 && (word >> 21) & 1 == 0 && (word >> 10) & 3 == 0b10
+}
+
 /// Whether a verbatim data-processing instruction names guest X18 in a GPR field.
 fn copy_uses_x18(word: u32) -> bool {
     gpr_field_positions(word)
@@ -2537,6 +2547,33 @@ mod tests {
         // LDR x5, [x1]
         cpu.memory_access(0xf940_0025).unwrap();
         assert_eq!(cpu.state.x[5], 0x8877_6655_4433_2211);
+    }
+
+    #[test]
+    fn detects_unprivileged_accesses() {
+        // STTR x0, [x1] and LDTR x2, [x1] are unprivileged; STUR/LDR/register-
+        // offset forms are not.
+        assert!(is_unprivileged(0xf8000820)); // sttr x0, [x1]
+        assert!(is_unprivileged(0xf8400822)); // ldtr x2, [x1]
+        assert!(!is_unprivileged(0xf8000020)); // stur x0, [x1]
+        assert!(!is_unprivileged(0xf9000020)); // str x0, [x1] (unsigned offset)
+        assert!(!is_unprivileged(0xf8206820)); // str x0, [x1, x0] (register offset)
+        // And they decode as memory operations rather than undefined.
+        assert!(matches!(decode::decode(0xf8000820, 0), Op::Memory(_)));
+        assert!(matches!(decode::decode(0xf8400822, 0), Op::Memory(_)));
+    }
+
+    #[test]
+    fn unprivileged_store_is_checked_at_el0() {
+        // two_page_cpu maps its pages AP=00: EL1 read/write, EL0 no access.
+        let (mut cpu, va, _pa_a, _pa_b) = two_page_cpu();
+        cpu.state.x[1] = va;
+        cpu.state.x[0] = 0x1234;
+        // A normal store runs at EL1 and succeeds.
+        assert!(cpu.memory_access(0xf9000020).is_ok(), "str at EL1");
+        // STTR is unprivileged -- the same page is forbidden at EL0.
+        let err = cpu.memory_access(0xf8000820).unwrap_err();
+        assert_eq!(err.fsc & 0x3c, 0x0c, "STTR takes a permission fault at EL0");
     }
 
     #[test]
