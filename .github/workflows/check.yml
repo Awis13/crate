@@ -1,0 +1,15 @@
+# Formatting and lints for the Apple targets. These only type-check, so they
+# run on a Linux runner; building and running tests needs an arm64 Mac.
+name: check
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - run: rustup target add aarch64-apple-darwin aarch64-apple-ios
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --target aarch64-apple-darwin -- -D warnings
+      - run: cargo clippy --workspace --target aarch64-apple-ios -- -D warnings
