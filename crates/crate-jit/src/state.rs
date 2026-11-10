@@ -101,6 +101,21 @@ pub struct Banked {
     pub par_el1: u64,
 }
 
+/// The self-hosted debug registers: hardware breakpoints and watchpoints, and
+/// the OS lock. Linux and the debug tests program these through MSR/MRS.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct Debug {
+    /// Breakpoint value and control, DBGBVR0..5 / DBGBCR0..5.
+    pub bvr: [u64; 6],
+    pub bcr: [u64; 6],
+    /// Watchpoint value and control, DBGWVR0..3 / DBGWCR0..3.
+    pub wvr: [u64; 4],
+    pub wcr: [u64; 4],
+    /// OSLAR_EL1.OSLK: the OS lock, which Linux unlocks at boot.
+    pub oslock: u64,
+}
+
 /// The translation and memory system registers the MMU reads.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -176,6 +191,7 @@ pub struct CpuState {
 
     pub banked: Banked,
     pub mmu: MmuRegs,
+    pub debug: Debug,
 
     // --- the dispatcher's own fields, below what guest state the block holds ---
     /// Where a block puts its exit code before returning.

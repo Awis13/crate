@@ -171,18 +171,30 @@ impl CodeCache {
         self.cursor += bytes;
     }
 
-    /// The host address of the block for `pc`, translating it if needed.
-    pub fn block(&mut self, pc: u64, mem: &GuestMemory, el: u32, el1_regs: &MmuRegs) -> u64 {
+    /// The host address of the block for `pc`, translating it if needed. With
+    /// `debug`, the block holds a single instruction so the dispatcher can
+    /// check for breakpoints and steps around each one.
+    pub fn block(
+        &mut self,
+        pc: u64,
+        mem: &GuestMemory,
+        el: u32,
+        el1_regs: &MmuRegs,
+        debug: bool,
+    ) -> u64 {
         if let Some(&off) = self.blocks.get(&pc) {
             return self.region.exec_base() as u64 + off as u64;
         }
-        let off = self.translate(pc, mem, el, el1_regs).unwrap_or_else(|_| {
-            // Out of space: start over. Safe because a block is only entered
-            // from the dispatcher, never while another block runs.
-            self.reset();
-            self.translate(pc, mem, el, el1_regs)
-                .expect("a block in an empty cache")
-        });
+        let limit = if debug { 1 } else { MAX_BLOCK };
+        let off = self
+            .translate(pc, mem, el, el1_regs, limit)
+            .unwrap_or_else(|_| {
+                // Out of space: start over. Safe because a block is only entered
+                // from the dispatcher, never while another block runs.
+                self.reset();
+                self.translate(pc, mem, el, el1_regs, limit)
+                    .expect("a block in an empty cache")
+            });
         self.region.exec_base() as u64 + off as u64
     }
 
@@ -206,6 +218,7 @@ impl CodeCache {
         mem: &GuestMemory,
         el: u32,
         el1_regs: &MmuRegs,
+        limit: usize,
     ) -> Result<usize, TranslateError> {
         let base = self.region.exec_base() as u64 + self.cursor as u64;
         let save_stub_rel = self.save_stub as i64 - self.cursor as i64;
@@ -217,7 +230,7 @@ impl CodeCache {
         emit::block_dispatch_prologue(&mut t.asm);
 
         let mut cur = pc;
-        for _ in 0..MAX_BLOCK {
+        for _ in 0..limit {
             let word = match read_insn(mem, el, el1_regs, cur) {
                 Ok(w) => w,
                 Err(_) => {
@@ -702,7 +715,10 @@ unsafe extern "C" fn jit_mem(cpu: *mut Cpu, word: u32) -> u64 {
     match cpu.memory_access(word) {
         Ok(()) => 0,
         Err(fault) => {
-            cpu.take_data_abort(fault);
+            // A watchpoint has already recorded its own exception kind.
+            if cpu.state.exception_kind != WATCHPOINT_KIND {
+                cpu.take_data_abort(fault);
+            }
             1
         }
     }
@@ -770,7 +786,7 @@ impl Cpu {
             let pc = self.state.pc;
             let el = self.el();
             let regs = self.state.mmu;
-            let target = cache.block(pc, &mem, el, &regs);
+            let target = cache.block(pc, &mem, el, &regs, false);
             self.state.dispatch_target = target;
             // SAFETY: the state is a stable heap box; the enter trampoline runs
             // the block at `target` and returns the exit code.
@@ -829,6 +845,22 @@ impl Cpu {
         let el = self.el();
         let regs = self.mmu_regs();
         let base = self.xread(m.rn);
+
+        // A watchpoint takes precedence over the access, which must not happen.
+        if self.debug_active() {
+            let addr = match m.kind {
+                MemKind::Pair | MemKind::VecPair => self.pair_address(&m, base),
+                MemKind::Ordered | MemKind::Atomic => base,
+                _ => self.effective_address(&m, base),
+            };
+            let total = (1u64 << m.size)
+                * if matches!(m.kind, MemKind::Pair) {
+                    2
+                } else {
+                    1
+                };
+            self.watchpoint(addr, total, !m.load)?;
+        }
 
         match m.kind {
             MemKind::Gpr => {
@@ -1161,6 +1193,18 @@ impl Cpu {
         Ok(())
     }
 
+    /// Checks a watchpoint before an access; on a match it records a watchpoint
+    /// exception and returns an error so the access is not performed.
+    fn watchpoint(&mut self, addr: u64, size: u64, write: bool) -> Result<(), mmu::Fault> {
+        if self.watchpoint_at(addr, size, write) {
+            self.state.exception_far = addr;
+            self.state.exception_kind = WATCHPOINT_KIND;
+            self.state.exception_syndrome = (write as u64) << 6;
+            return Err(mmu::Fault { fsc: 0x22, write });
+        }
+        Ok(())
+    }
+
     fn take_data_abort(&mut self, fault: mmu::Fault) {
         if std::env::var_os("CRATE_TRAP_MEM").is_some() {
             let far = self.state.exception_far;
@@ -1209,6 +1253,15 @@ const EC_INSN_ABORT_SAME: u64 = 0x21;
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
 const EC_DATA_ABORT_SAME: u64 = 0x25;
 const EC_BRK: u64 = 0x3c;
+const EC_BREAKPOINT_LOWER: u64 = 0x30;
+const EC_BREAKPOINT_SAME: u64 = 0x31;
+const EC_SOFTWARE_STEP_LOWER: u64 = 0x32;
+const EC_SOFTWARE_STEP_SAME: u64 = 0x33;
+const EC_WATCHPOINT_LOWER: u64 = 0x34;
+const EC_WATCHPOINT_SAME: u64 = 0x35;
+/// PSTATE.SS, the software-step bit, in `state.pstate`.
+const PSTATE_SS: u64 = 1 << 21;
+const WATCHPOINT_KIND: u64 = 2;
 
 impl Cpu {
     /// Builds a CPU for `board`, starting the boot CPU at its reset state
@@ -1260,11 +1313,41 @@ impl Cpu {
             }
             let el = self.el();
             let regs = self.state.mmu;
-            self.state.dispatch_target = cache.block(pc, &mem, el, &regs);
+            // Self-hosted debug: when a breakpoint, watchpoint or step is armed,
+            // take any breakpoint that matches this PC before running, and
+            // translate one instruction at a time so a step fires after it.
+            let debug = self.debug_active();
+            if debug && self.breakpoint_at(pc) {
+                self.take_breakpoint(pc);
+                continue;
+            }
+            // Software step: with MDSCR.SS set and debug unmasked, PSTATE.SS=0 is
+            // the active-pending state -- take the step exception before this
+            // instruction. PSTATE.SS=1 is active-not-pending -- run one
+            // instruction, then move to pending.
+            let step_on =
+                debug && self.state.banked.mdscr_el1 & 1 != 0 && self.state.pstate & PSTATE_D == 0;
+            if step_on && self.state.pstate & PSTATE_SS == 0 {
+                self.take_step(pc);
+                continue;
+            }
+            let stepping_now = step_on && self.state.pstate & PSTATE_SS != 0;
+            self.state.dispatch_target = cache.block(pc, &mem, el, &regs, debug);
             // SAFETY: the state is a stable heap box for the whole dispatch run.
             let code = unsafe { crate_jit_enter(&mut *self.state) } as u32;
+            // One instruction ran: leave active-pending unless it faulted.
+            if stepping_now
+                && !matches!(
+                    Exit::from_u32(code),
+                    Some(Exit::Exception) | Some(Exit::Undefined)
+                )
+            {
+                self.state.pstate &= !PSTATE_SS;
+            }
             match Exit::from_u32(code) {
-                Some(Exit::Branch) => self.state.pc = self.state.next_pc,
+                Some(Exit::Branch) => {
+                    self.state.pc = self.state.next_pc;
+                }
                 Some(Exit::WaitForInterrupt) => {
                     self.state.pc = self.state.next_pc;
                     self.wait_for_interrupt(board);
@@ -1387,6 +1470,20 @@ impl Cpu {
             self.take_exception(ec, 0x10, Some(pc), pc);
             return;
         }
+        if self.state.exception_kind == WATCHPOINT_KIND {
+            // A watchpoint the memory helper matched: EC 0x34/0x35, FAR set, the
+            // access not performed. ISS: the cache-maintenance and write bits.
+            let ec = if self.el() == 0 {
+                EC_WATCHPOINT_LOWER
+            } else {
+                EC_WATCHPOINT_SAME
+            };
+            let write = self.state.exception_syndrome & (1 << 6) != 0;
+            let far = self.state.exception_far;
+            self.take_exception(ec, 0x22 | ((write as u64) << 6), Some(far), pc);
+            self.state.exception_kind = 0;
+            return;
+        }
         // A data abort the memory helper reported.
         let ec = if self.el() == 0 {
             EC_DATA_ABORT_LOWER
@@ -1445,6 +1542,7 @@ impl Cpu {
         }
         self.state.nzcv = spsr & 0xf000_0000;
         self.state.pstate = (spsr & (0xf << 6)) // DAIF
+            | (spsr & PSTATE_SS) // software-step
             | (((spsr >> 2) & 3) << PSTATE_EL_SHIFT)
             | (spsr & PSTATE_SPSEL);
         self.state.pc = self.state.banked.elr_el1;
@@ -1452,7 +1550,102 @@ impl Cpu {
 
     fn pack_spsr(&self) -> u64 {
         let m = ((self.el() as u64) << 2) | (self.state.pstate & PSTATE_SPSEL);
-        (self.state.nzcv & 0xf000_0000) | (self.state.pstate & (0xf << 6)) | m
+        (self.state.nzcv & 0xf000_0000)
+            | (self.state.pstate & (0xf << 6))
+            | (self.state.pstate & PSTATE_SS)
+            | m
+    }
+
+    // ---- self-hosted debug ----
+
+    /// Whether an enabled, unmasked breakpoint matches the instruction at `pc`
+    /// for the current EL.
+    fn breakpoint_at(&self, pc: u64) -> bool {
+        if self.state.pstate & PSTATE_D != 0 {
+            return false; // debug exceptions are masked
+        }
+        let el = self.el();
+        for n in 0..6 {
+            let bcr = self.state.debug.bcr[n];
+            if bcr & 1 == 0 {
+                continue; // not enabled
+            }
+            // Address-match breakpoint (BT == 0). PMC (bits 2:1) gives the EL:
+            // 0b01 = EL1, 0b10 = EL0, 0b11 = both.
+            let pmc = (bcr >> 1) & 3;
+            let el_ok = match el {
+                0 => pmc & 2 != 0,
+                _ => pmc & 1 != 0,
+            };
+            if el_ok && self.state.debug.bvr[n] & !0x3 == pc & !0x3 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Takes a hardware breakpoint exception: the instruction at `pc` has not
+    /// run, and ELR points at it.
+    fn take_breakpoint(&mut self, pc: u64) {
+        let ec = if self.el() == 0 {
+            EC_BREAKPOINT_LOWER
+        } else {
+            EC_BREAKPOINT_SAME
+        };
+        self.take_exception(ec, 0x22, None, pc);
+    }
+
+    /// Takes a software-step exception in the active-pending state, before the
+    /// instruction at `pc` runs; ELR points at that instruction. The dispatcher
+    /// manages PSTATE.SS (cleared once a stepped instruction completes).
+    fn take_step(&mut self, pc: u64) {
+        let ec = if self.el() == 0 {
+            EC_SOFTWARE_STEP_LOWER
+        } else {
+            EC_SOFTWARE_STEP_SAME
+        };
+        // ISS.ISV = 0, IFSC = 0b100010 (debug exception).
+        self.take_exception(ec, 0x22, None, pc);
+    }
+
+    /// Whether an enabled, unmasked watchpoint matches a `size`-byte access at
+    /// `addr` of the given direction; the helper calls this before the access.
+    fn watchpoint_at(&self, addr: u64, size: u64, write: bool) -> bool {
+        if self.state.pstate & PSTATE_D != 0 {
+            return false;
+        }
+        for n in 0..4 {
+            let wcr = self.state.debug.wcr[n];
+            if wcr & 1 == 0 {
+                continue;
+            }
+            // LSC (bits 4:3): bit 0 load, bit 1 store.
+            let lsc = (wcr >> 3) & 3;
+            if (write && lsc & 2 == 0) || (!write && lsc & 1 == 0) {
+                continue;
+            }
+            // BAS (bits 12:5) selects which bytes of the 8-byte-aligned DBGWVR
+            // are watched; MASK (bits 28:24) widens the region.
+            let mask_bits = (wcr >> 24) & 0x1f;
+            let region = if mask_bits >= 3 {
+                !((1u64 << mask_bits) - 1)
+            } else {
+                !0x7
+            };
+            let base = self.state.debug.wvr[n] & region;
+            let bas = (wcr >> 5) & 0xff;
+            // The access overlaps a watched byte of this doubleword.
+            let aligned = addr & !0x7;
+            if aligned & region == base {
+                for b in 0..size {
+                    let byte = (addr.wrapping_add(b) & 0x7) as u32;
+                    if mask_bits >= 3 || bas & (1 << byte) != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     // ---- the generic timer ----
@@ -1719,9 +1912,23 @@ impl Cpu {
             r if r == sr::ID_AA64MMFR0_EL1 => ID_AA64MMFR0,
             r if r == sr::ID_AA64PFR0_EL1 => ID_AA64PFR0,
             r if r == sr::ID_AA64DFR0_EL1 => ID_AA64DFR0,
+            r if r == sr::OSLSR_EL1 => {
+                // OSLM = 0b10 (the v8 model), OSLK (bit 1) from the OS lock.
+                0b1000 | (self.state.debug.oslock & 2)
+            }
+            // The hardware breakpoint and watchpoint value/control registers.
+            _ if debug_reg(reg).is_some() => {
+                let (which, n) = debug_reg(reg).unwrap();
+                match which {
+                    DebugReg::Bvr => self.state.debug.bvr[n],
+                    DebugReg::Bcr => self.state.debug.bcr[n],
+                    DebugReg::Wvr => self.state.debug.wvr[n],
+                    DebugReg::Wcr => self.state.debug.wcr[n],
+                }
+            }
             // The rest of the ID register space reads as zero (RAZ).
             r if is_id_space(r) => 0,
-            // Debug breakpoint/watchpoint and OS-lock registers: quiet.
+            // The remaining debug and OS-lock registers: quiet.
             r if is_quiet(r) => 0,
             _ => return None,
         })
@@ -1785,11 +1992,72 @@ impl Cpu {
             r if r == sr::SPSEL => {
                 self.state.pstate = (self.state.pstate & !PSTATE_SPSEL) | (value & PSTATE_SPSEL)
             }
-            // Cache-size selection and the OS lock: accepted, no effect here.
+            r if r == sr::MDSCR_EL1 => {
+                self.state.banked.mdscr_el1 = value;
+                // MDSCR.SS / MDE change whether blocks must step; re-translate.
+                self.state.flush_cache = 1;
+            }
+            r if r == sr::OSLAR_EL1 => self.state.debug.oslock = (value & 1) << 1,
+            // A hardware breakpoint or watchpoint register; a control write can
+            // change whether debug is active, so re-translate.
+            _ if debug_reg(reg).is_some() => {
+                let (which, n) = debug_reg(reg).unwrap();
+                match which {
+                    DebugReg::Bvr => self.state.debug.bvr[n] = value,
+                    DebugReg::Bcr => {
+                        self.state.debug.bcr[n] = value;
+                        self.state.flush_cache = 1;
+                    }
+                    DebugReg::Wvr => self.state.debug.wvr[n] = value,
+                    DebugReg::Wcr => {
+                        self.state.debug.wcr[n] = value;
+                        self.state.flush_cache = 1;
+                    }
+                }
+            }
+            // Cache-size selection and the remaining debug/OS-lock registers:
+            // accepted, no effect here.
             r if r == sr::CSSELR_EL1 || is_quiet(r) => {}
             _ => return false,
         }
         true
+    }
+
+    /// Whether any self-hosted debug exception is armed, so blocks must be
+    /// translated one instruction at a time and the dispatcher must check for
+    /// breakpoints and steps. Recomputed from the debug registers each time it
+    /// is needed; it is cheap.
+    fn debug_active(&self) -> bool {
+        let mdscr = self.state.banked.mdscr_el1;
+        let breakpoints = mdscr & (1 << 15) != 0 // MDE
+            && self.state.debug.bcr.iter().any(|&c| c & 1 != 0);
+        let watchpoints = self.state.debug.wcr.iter().any(|&c| c & 1 != 0);
+        let step = mdscr & 1 != 0; // SS
+        (breakpoints || watchpoints || step) && self.state.debug.oslock & 2 == 0
+    }
+}
+
+/// The hardware debug registers, by kind and index.
+enum DebugReg {
+    Bvr,
+    Bcr,
+    Wvr,
+    Wcr,
+}
+
+/// Decodes a debug breakpoint/watchpoint register (op0 2, op1 0, CRn 0, op2
+/// 4..7, CRm the index) into its kind and index.
+fn debug_reg(r: SysReg) -> Option<(DebugReg, usize)> {
+    if r.op0() != 2 || r.op1() != 0 || r.crn() != 0 {
+        return None;
+    }
+    let n = r.crm() as usize;
+    match r.op2() {
+        4 if n < 6 => Some((DebugReg::Bvr, n)),
+        5 if n < 6 => Some((DebugReg::Bcr, n)),
+        6 if n < 4 => Some((DebugReg::Wvr, n)),
+        7 if n < 4 => Some((DebugReg::Wcr, n)),
+        _ => None,
     }
 }
 
@@ -1862,6 +2130,8 @@ mod sr {
     pub const ID_AA64DFR0_EL1: SysReg = SysReg::new(3, 0, 0, 5, 0);
     pub const ID_AA64MMFR0_EL1: SysReg = SysReg::new(3, 0, 0, 7, 0);
     pub const MDSCR_EL1: SysReg = SysReg::new(2, 0, 0, 2, 2);
+    pub const OSLAR_EL1: SysReg = SysReg::new(2, 0, 1, 0, 4);
+    pub const OSLSR_EL1: SysReg = SysReg::new(2, 0, 1, 1, 4);
     pub const CNTFRQ_EL0: SysReg = SysReg::new(3, 3, 14, 0, 0);
     pub const CNTPCT_EL0: SysReg = SysReg::new(3, 3, 14, 0, 1);
     pub const CNTVCT_EL0: SysReg = SysReg::new(3, 3, 14, 0, 2);
