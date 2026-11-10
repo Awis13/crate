@@ -86,3 +86,15 @@ fn a_branch_is_followed() {
     cpu.state.pc = RAM;
     assert_eq!(cpu.run(&mut cache), Stop::Brk(5));
 }
+
+#[test]
+fn shifted_value_then_store() {
+    // mov w2,#1 ; lsl w2,w2,#27 ; str w2,[x1] ; ldr x3,[x1] ; brk #0
+    // reproduces the GIC-setup pattern that lost its value.
+    let (mut cpu, mut cache) = setup(&[0x52800022, 0x53051042, 0xb9000022, 0xf9400023, 0xd4200000]);
+    cpu.state.x[1] = RAM + 0x800;
+    cpu.state.pc = RAM;
+    assert_eq!(cpu.run(&mut cache), Stop::Brk(0));
+    assert_eq!(cpu.state.x[2], 0x0800_0000, "w2 = 1<<27");
+    assert_eq!(cpu.state.x[3], 0x0800_0000, "stored and read back");
+}

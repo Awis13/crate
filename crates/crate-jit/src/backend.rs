@@ -504,6 +504,7 @@ impl Block {
         (9..=15).find(|r| !avoid.contains(r)).unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_sp_imm(
         &mut self,
         sub: bool,
@@ -909,9 +910,10 @@ impl Cpu {
         if self.mem.read(pa, &mut buf[..1 << size]).is_ok() {
             return Ok(u64::from_le_bytes(buf));
         }
-        // Not RAM: a device, if the board has one here.
+        // Not RAM: a device, if the board has one here. The bus takes a byte
+        // count, not the log2 size the access carries.
         if !self.board.is_null() {
-            if let Some(v) = self.board().mmio.read(pa, size as u8) {
+            if let Some(v) = self.board().mmio.read(pa, 1u8 << size) {
                 return Ok(v);
             }
         }
@@ -938,7 +940,7 @@ impl Cpu {
         {
             return Ok(());
         }
-        if !self.board.is_null() && self.board().mmio.write(pa, size as u8, value) {
+        if !self.board.is_null() && self.board().mmio.write(pa, 1u8 << size, value) {
             return Ok(());
         }
         Err(external_abort(true))

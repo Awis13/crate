@@ -96,6 +96,7 @@ struct Captured {
     pc: u64,
     nzcv: u64,
     done: u64,
+    sig: u64,
 }
 
 /// macOS arm64 machine context, from <mach/arm/_structs.h>, enough to read the
@@ -133,7 +134,7 @@ struct Mcontext64 {
 /// fork, inherited by the child.
 static mut RESULT: *mut Captured = std::ptr::null_mut();
 
-extern "C" fn on_brk(_sig: i32, _info: *mut libc::siginfo_t, ucontext: *mut libc::c_void) {
+extern "C" fn on_brk(sig: i32, _info: *mut libc::siginfo_t, ucontext: *mut libc::c_void) {
     // SAFETY: the kernel hands a valid ucontext_t; its mcontext matches the
     // layout above. RESULT points at the shared mapping.
     unsafe {
@@ -148,6 +149,7 @@ extern "C" fn on_brk(_sig: i32, _info: *mut libc::siginfo_t, ucontext: *mut libc
         out.pc = ss.pc;
         out.nzcv = (ss.cpsr as u64) & 0xf000_0000;
         out.done = 1;
+        out.sig = sig as u64;
         libc::_exit(0);
     }
 }
@@ -692,6 +694,12 @@ fn random_streams_match_the_cpu() {
         // Native, then reset the data region and run translated.
         shared.write(DATA_OFF, &vec![0u8; DATA_LEN]);
         let mut native = run_native(exec.exec_base() as u64, &init);
+        // Only a clean BRK (SIGTRAP) makes the native run a valid oracle; a
+        // fault or the watchdog means an unsafe generated stream, which is a
+        // generator edge case, not a translator error, so skip it.
+        if native.sig != libc::SIGTRAP as u64 {
+            continue;
+        }
         let native_scratch = shared.read(DATA_OFF, DATA_LEN);
 
         shared.write(DATA_OFF, &vec![0u8; DATA_LEN]);
@@ -704,6 +712,8 @@ fn random_streams_match_the_cpu() {
         translated.pc = 0;
         native.x[18] = 0;
         translated.x[18] = 0;
+        native.sig = 0;
+        translated.sig = 0;
 
         if native != translated || native_scratch != translated_scratch {
             report_divergence(iter, &prog, &init, &native, &translated);
