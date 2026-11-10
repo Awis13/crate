@@ -1127,7 +1127,6 @@ const PSTATE_DAIF: u64 = PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F;
 /// Exception classes (ESR_EL1.EC) the machine raises.
 const EC_UNKNOWN: u64 = 0x00;
 const EC_SVC64: u64 = 0x15;
-const EC_MSR_MRS: u64 = 0x18;
 const EC_INSN_ABORT_LOWER: u64 = 0x20;
 const EC_INSN_ABORT_SAME: u64 = 0x21;
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
@@ -1460,7 +1459,7 @@ impl Cpu {
                 }
                 None => {
                     let pc = self.state.pc;
-                    self.take_exception(EC_MSR_MRS, 0, None, pc);
+                    self.take_exception(EC_UNKNOWN, 0, None, pc); // unimplemented sysreg: undefined
                 }
             }
         } else {
@@ -1473,7 +1472,7 @@ impl Cpu {
                 self.state.pc = next;
             } else {
                 let pc = self.state.pc;
-                self.take_exception(EC_MSR_MRS, 0, None, pc);
+                self.take_exception(EC_UNKNOWN, 0, None, pc); // unimplemented sysreg: undefined
             }
         }
     }
