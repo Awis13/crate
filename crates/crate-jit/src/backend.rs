@@ -558,7 +558,9 @@ impl Block {
         let discard = rd == 31 && set_flags;
         let v = Self::victim(&[rd, rn, rm]);
         let vm = Self::victim(&[rd, rn, rm, v]);
-        self.asm.emit(stp(v, vm, SP, offsets::SCRATCH as i32));
+        // STR (unsigned offset), not STP: SCRATCH is far past STP's ±512 reach.
+        self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
+        self.asm.emit(str_imm(3, vm, SP, offsets::SCRATCH + 8));
         if rn == 31 {
             self.asm.emit(ldr_imm(3, v, SP, offsets::SP));
         } else {
@@ -585,7 +587,8 @@ impl Block {
                 self.asm.emit(mov(rd, v));
             }
         }
-        self.asm.emit(ldp(v, vm, SP, offsets::SCRATCH as i32));
+        self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+        self.asm.emit(ldr_imm(3, vm, SP, offsets::SCRATCH + 8));
     }
 
     fn emit_memory(&mut self, _m: Mem, word: u32, pc: u64) {
@@ -1165,6 +1168,22 @@ impl Cpu {
             if std::env::var_os("CRATE_TRACE_PC").is_some() {
                 crate_core::debug!("block pc={pc:#x} el={}", self.el());
             }
+            if let Ok(t) = std::env::var("CRATE_TRAP_PC") {
+                if u64::from_str_radix(t.trim_start_matches("0x"), 16) == Ok(pc) {
+                    let x = &self.state.x;
+                    crate_core::debug!(
+                        "trap {pc:#x}: x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x} x6={:#x} sp={:#x}",
+                        x[0],
+                        x[1],
+                        x[2],
+                        x[3],
+                        x[4],
+                        x[5],
+                        x[6],
+                        self.state.sp
+                    );
+                }
+            }
             let el = self.el();
             let regs = self.state.mmu;
             self.state.dispatch_target = cache.block(pc, &mem, el, &regs);
@@ -1663,9 +1682,11 @@ impl Cpu {
 /// CTR_EL0: 16-byte I- and D-cache lines, IDC and DIC set so no cache
 /// maintenance is needed for the data path (our translator reads memory afresh).
 const CTR_EL0: u64 = (1 << 28) | (1 << 29) | (2 << 16) | 2 | (3 << 24);
-/// ID_AA64MMFR0_EL1: PARange 40-bit (2), 4 KiB (TGran4=0), 16 KiB (TGran16=2)
-/// and 64 KiB (TGran64=0) granules all supported.
-const ID_AA64MMFR0: u64 = 0x0000_0000_1022_0002;
+/// ID_AA64MMFR0_EL1: PARange 40-bit (2) and all three granules supported —
+/// 4 KiB (TGran4=0), 16 KiB (TGran16=1) and 64 KiB (TGran64=0) — but **without**
+/// the 52-bit (LPA2) variants (TGran4=1 / TGran16=2), which the MMU does not
+/// model. Advertising LPA2 made Linux build 52-bit page tables and fault.
+const ID_AA64MMFR0: u64 = 0x0000_0000_0010_0002;
 /// ID_AA64PFR0_EL1: EL0 and EL1 at AArch64 only, FP and AdvSIMD present, no SVE.
 const ID_AA64PFR0: u64 = 0x0000_0000_0000_0011;
 /// ID_AA64DFR0_EL1: debug architecture v8, 6 breakpoints and 4 watchpoints,
