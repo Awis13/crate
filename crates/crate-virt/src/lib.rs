@@ -58,6 +58,10 @@ pub struct VirtConfig {
     /// Bytes of RAM, a multiple of 2 MiB.
     pub memory: u64,
     pub kernel: PathBuf,
+    /// Load the kernel as a raw, position-independent binary at 2 MiB into RAM
+    /// rather than parsing it as a Linux Image (for bare-metal payloads such as
+    /// kvm-unit-tests' `.flat` images).
+    pub raw_kernel: bool,
     pub initrd: Option<PathBuf>,
     pub cmdline: String,
     /// virtio block devices: vda, vdb, ... in this order.
@@ -122,7 +126,18 @@ impl VirtMachine {
             std::fs::read(path)
                 .map_err(|e| Error::io(format!("reading the {what} {}", path.display()), e))
         };
-        let kernel = boot::parse_image(read(&config.kernel, "kernel")?)?;
+        let kernel = if config.raw_kernel {
+            let data = read(&config.kernel, "kernel")?;
+            // A raw payload loads 2 MiB into RAM; it relocates itself and finds
+            // RAM and the device tree from x0 and the tree, so no header.
+            boot::KernelImage {
+                image_size: data.len() as u64,
+                text_offset: 2 << 20,
+                data,
+            }
+        } else {
+            boot::parse_image(read(&config.kernel, "kernel")?)?
+        };
         let initrd = config
             .initrd
             .as_ref()
@@ -543,6 +558,7 @@ mod tests {
     #[test]
     fn refuses_bad_configurations() {
         let config = |cpus, memory| VirtConfig {
+            raw_kernel: false,
             cpus,
             memory,
             kernel: "/nonexistent".into(),

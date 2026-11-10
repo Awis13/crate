@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate_core::board::Board;
 use crate_core::memory::GuestMemory;
 use crate_host::jit::JitRegion;
 
@@ -219,6 +220,22 @@ impl CodeCache {
                 }
             };
             let op = decode::decode(word, cur);
+            // A literal load is resolved here, where guest memory is reachable.
+            if let Op::LiteralLoad {
+                rt,
+                addr,
+                size,
+                signed,
+                vector,
+                prefetch,
+            } = op
+            {
+                if !t.emit_literal(mem, el, el1_regs, rt, addr, size, signed, vector, prefetch) {
+                    break; // a faulting or unsupported literal ended the block
+                }
+                cur = cur.wrapping_add(4);
+                continue;
+            }
             if t.emit(op, word, cur) {
                 break; // the instruction ended the block
             }
@@ -267,6 +284,59 @@ impl Block {
     fn exit(&mut self, code: u32, next: Next, info: ExitInfo) {
         emit::exit(&mut self.asm, self.save_stub_rel, code, next, info);
         self.terminated = true;
+    }
+
+    /// Materialises a PC-relative literal load. The literal is read now, from
+    /// guest memory through the MMU; self-modifying literals are milestone 3.
+    /// Returns false (ending the block with an exit) on a fault or an
+    /// unsupported SIMD literal.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_literal(
+        &mut self,
+        mem: &GuestMemory,
+        el: u32,
+        regs: &MmuRegs,
+        rt: u32,
+        addr: u64,
+        size: u32,
+        signed: bool,
+        vector: bool,
+        prefetch: bool,
+    ) -> bool {
+        if prefetch {
+            return true; // a hint; nothing to do
+        }
+        if vector {
+            // A SIMD literal load: raise undefined for now (very rare).
+            self.exit(
+                Exit::Undefined as u32,
+                Next::None,
+                ExitInfo {
+                    pc: Some(addr),
+                    ..Default::default()
+                },
+            );
+            return false;
+        }
+        let Ok(t) = mmu::translate(mem, regs, el, addr, Access::Read) else {
+            self.emit_fetch_fault(addr);
+            return false;
+        };
+        let mut buf = [0u8; 8];
+        if mem.read(t.pa, &mut buf[..1 << size]).is_err() {
+            self.emit_fetch_fault(addr);
+            return false;
+        }
+        let mut value = u64::from_le_bytes(buf);
+        if signed {
+            value = sign_extend(value, 8 << size);
+        } else if size < 3 {
+            value &= (1u64 << (8 << size)) - 1;
+        }
+        if rt != 31 {
+            self.asm.mov_imm(rt, value);
+        }
+        true
     }
 
     fn emit_fetch_fault(&mut self, pc: u64) {
@@ -325,6 +395,7 @@ impl Block {
                 self.emit_memory(m, word, pc);
                 false
             }
+            Op::LiteralLoad { .. } => unreachable!("literal loads are resolved in translate"),
             Op::Branch { link, target } => {
                 self.exit(
                     Exit::Branch as u32,
@@ -642,6 +713,14 @@ pub enum Stop {
 pub struct Cpu {
     pub state: Box<CpuState>,
     pub mem: Arc<GuestMemory>,
+    /// The board, for routing MMIO and reaching the interrupt controller,
+    /// PSCI and the run state. Null for the bare EL0 test runner. Valid for a
+    /// `dispatch` call's whole run.
+    board: *const Board,
+    /// Which CPU this is (its index into the board), for the GIC and PSCI.
+    cpu: usize,
+    /// The host counter value the guest's virtual counter is measured from.
+    timer_offset: u64,
 }
 
 impl Cpu {
@@ -649,11 +728,21 @@ impl Cpu {
         let mut cpu = Box::new(Cpu {
             state: CpuState::new(),
             mem,
+            board: std::ptr::null(),
+            cpu: 0,
+            timer_offset: 0,
         });
         cpu.state.epilogue = CodeCache::epilogue_addr();
         let ptr: *mut Cpu = &mut *cpu;
         cpu.state.cpu_ptr = ptr as u64;
         cpu
+    }
+
+    /// The board, while a `dispatch` call holds it.
+    fn board(&self) -> &Board {
+        // SAFETY: set non-null for the whole `dispatch` run, which outlives
+        // every helper call and block entry.
+        unsafe { &*self.board }
     }
 
     pub fn el(&self) -> u32 {
@@ -733,6 +822,7 @@ impl Cpu {
             MemKind::Gpr => {
                 let addr = self.effective_address(&m, base);
                 let n = 1u64 << m.size;
+                self.state.exception_far = addr;
                 let t = mmu::translate(
                     &self.mem,
                     &regs,
@@ -755,6 +845,7 @@ impl Cpu {
                 let n = 1u64 << m.size;
                 for (i, rt) in [m.rt, m.rt2].into_iter().enumerate() {
                     let ea = addr.wrapping_add(i as u64 * n);
+                    self.state.exception_far = ea;
                     let t = mmu::translate(
                         &self.mem,
                         &regs,
@@ -815,10 +906,16 @@ impl Cpu {
 
     fn read_phys(&self, pa: u64, size: u32) -> Result<u64, mmu::Fault> {
         let mut buf = [0u8; 8];
-        self.mem
-            .read(pa, &mut buf[..1 << size])
-            .map_err(|_| external_abort(false))?;
-        Ok(u64::from_le_bytes(buf))
+        if self.mem.read(pa, &mut buf[..1 << size]).is_ok() {
+            return Ok(u64::from_le_bytes(buf));
+        }
+        // Not RAM: a device, if the board has one here.
+        if !self.board.is_null() {
+            if let Some(v) = self.board().mmio.read(pa, size as u8) {
+                return Ok(v);
+            }
+        }
+        Err(external_abort(false))
     }
 
     /// Reads a load's value and extends it to the destination register width.
@@ -834,25 +931,115 @@ impl Cpu {
     }
 
     fn write_phys(&self, pa: u64, size: u32, value: u64) -> Result<(), mmu::Fault> {
-        self.mem
+        if self
+            .mem
             .write(pa, &value.to_le_bytes()[..1 << size])
-            .map_err(|_| external_abort(true))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if !self.board.is_null() && self.board().mmio.write(pa, size as u8, value) {
+            return Ok(());
+        }
+        Err(external_abort(true))
     }
 
+    /// SIMD loads and stores read and write the V spill slots, which the block
+    /// has saved before the call and reloads after.
     fn vec_access(
         &mut self,
-        _m: &Mem,
-        _base: u64,
-        _el: u32,
-        _regs: &MmuRegs,
+        m: &Mem,
+        base: u64,
+        el: u32,
+        regs: &MmuRegs,
     ) -> Result<(), mmu::Fault> {
-        // SIMD loads and stores are modelled by the slow helper reading and
-        // writing the V spill slots. Filled in once the GPR path is proven.
-        Err(external_abort(false))
+        let bytes = 1usize << m.size;
+        let regs_list: &[u32] = if m.kind == MemKind::VecPair {
+            &[m.rt, m.rt2]
+        } else {
+            &[m.rt]
+        };
+        let start = if m.kind == MemKind::VecPair {
+            self.pair_address(m, base)
+        } else {
+            self.effective_address(m, base)
+        };
+        for (i, &rt) in regs_list.iter().enumerate() {
+            let ea = start.wrapping_add((i * bytes) as u64);
+            self.state.exception_far = ea;
+            let t = mmu::translate(
+                &self.mem,
+                regs,
+                el,
+                ea,
+                if m.load { Access::Read } else { Access::Write },
+            )?;
+            if m.load {
+                let mut reg = [0u8; 16];
+                for (b, slot) in reg.iter_mut().take(bytes).enumerate() {
+                    *slot = self.read_phys(t.pa + b as u64, 0)? as u8;
+                }
+                self.state.v[rt as usize] = reg;
+            } else {
+                let reg = self.state.v[rt as usize];
+                for (b, &byte) in reg.iter().take(bytes).enumerate() {
+                    self.write_phys(t.pa + b as u64, 0, byte as u64)?;
+                }
+            }
+        }
+        self.apply_writeback(m, base);
+        Ok(())
     }
 
-    fn ordered_access(&mut self, _word: u32, _el: u32, _regs: &MmuRegs) -> Result<(), mmu::Fault> {
-        Err(external_abort(false))
+    /// Exclusive and ordered accesses (LDXR/STXR, LDAR/STLR, CAS). With one CPU
+    /// there is no other observer, so the exclusive monitor always succeeds and
+    /// the ordering is the host's own.
+    fn ordered_access(&mut self, word: u32, el: u32, regs: &MmuRegs) -> Result<(), mmu::Fault> {
+        let size = (word >> 30) & 3;
+        let o2 = word & (1 << 23) != 0;
+        let load = word & (1 << 22) != 0;
+        let o1 = word & (1 << 21) != 0;
+        let rs = (word >> 16) & 31;
+        let rn = (word >> 5) & 31;
+        let rt = word & 31;
+        let addr = self.xread(rn);
+        self.state.exception_far = addr;
+
+        if o1 && o2 {
+            // CAS: compare Rs with memory, store Rt if equal, Rs gets the old.
+            let t = mmu::translate(&self.mem, regs, el, addr, Access::Write)?;
+            let old = self.read_phys(t.pa, size)?;
+            let mask = if size >= 3 {
+                u64::MAX
+            } else {
+                (1u64 << (8 << size)) - 1
+            };
+            if old & mask == self.xread_z(rs) & mask {
+                self.write_phys(t.pa, size, self.xread_z(rt))?;
+            }
+            self.xwrite_z(rs, old & mask);
+            return Ok(());
+        }
+        if o1 {
+            // LDXP/STXP: a register pair, not needed yet.
+            return Err(external_abort(!load));
+        }
+        let access = if load { Access::Read } else { Access::Write };
+        let t = mmu::translate(&self.mem, regs, el, addr, access)?;
+        if load {
+            let mut value = self.read_phys(t.pa, size)?;
+            if size < 3 {
+                value &= (1u64 << (8 << size)) - 1;
+            }
+            self.xwrite_z(rt, value);
+        } else {
+            self.write_phys(t.pa, size, self.xread_z(rt))?;
+            if !o2 {
+                // Store-exclusive: report success in Rs.
+                self.xwrite_z(rs, 0);
+            }
+        }
+        Ok(())
     }
 
     fn take_data_abort(&mut self, fault: mmu::Fault) {
@@ -867,6 +1054,630 @@ const DATA_ABORT_KIND: u64 = 1;
 
 fn external_abort(write: bool) -> mmu::Fault {
     mmu::Fault { fsc: 0x10, write }
+}
+
+// ---------------------------------------------------------------- the EL1 machine
+
+use crate_core::cpu::SysReg;
+use crate_core::psci::Effect;
+use crate_core::run::StopReason;
+
+/// PSTATE bits the translator tracks in `state.pstate`.
+const PSTATE_SPSEL: u64 = 1 << 0;
+const PSTATE_EL_SHIFT: u64 = 2;
+const PSTATE_F: u64 = 1 << 6;
+const PSTATE_I: u64 = 1 << 7;
+const PSTATE_A: u64 = 1 << 8;
+const PSTATE_D: u64 = 1 << 9;
+const PSTATE_DAIF: u64 = PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F;
+
+/// Exception classes (ESR_EL1.EC) the machine raises.
+const EC_UNKNOWN: u64 = 0x00;
+const EC_SVC64: u64 = 0x15;
+const EC_MSR_MRS: u64 = 0x18;
+const EC_INSN_ABORT_LOWER: u64 = 0x20;
+const EC_INSN_ABORT_SAME: u64 = 0x21;
+const EC_DATA_ABORT_LOWER: u64 = 0x24;
+const EC_DATA_ABORT_SAME: u64 = 0x25;
+const EC_BRK: u64 = 0x3c;
+
+impl Cpu {
+    /// Builds a CPU for `board`, starting the boot CPU at its reset state
+    /// (EL1h, MMU off, interrupts masked). Only the boot CPU runs under this
+    /// milestone; the others need the cross-CPU work of milestone 3.
+    fn for_board(board: &Board, cpu: usize) -> Box<Self> {
+        let mut c = Cpu::new(board.memory.clone());
+        c.board = board as *const Board;
+        c.cpu = cpu;
+        c.state.pstate = (1 << PSTATE_EL_SHIFT) | PSTATE_SPSEL | PSTATE_DAIF; // EL1h, masked
+        c
+    }
+
+    fn set_el(&mut self, el: u32) {
+        self.state.pstate = (self.state.pstate & !(3 << PSTATE_EL_SHIFT)) | ((el as u64) << 2);
+    }
+
+    /// Runs the boot CPU until the machine stops.
+    fn dispatch(&mut self, board: &Board, cache: &mut CodeCache) {
+        self.timer_offset = crate_host::jit::counter::now();
+        let mem = self.mem.clone();
+        loop {
+            if board.run.is_stopped() {
+                return;
+            }
+            self.service_timer(board);
+            if self.take_pending_interrupt(board) {
+                continue;
+            }
+            let pc = self.state.pc;
+            let el = self.el();
+            let regs = self.state.mmu;
+            self.state.dispatch_target = cache.block(pc, &mem, el, &regs);
+            // SAFETY: the state is a stable heap box for the whole dispatch run.
+            let code = unsafe { crate_jit_enter(&mut *self.state) } as u32;
+            match Exit::from_u32(code) {
+                Some(Exit::Branch) => self.state.pc = self.state.next_pc,
+                Some(Exit::WaitForInterrupt) => {
+                    self.state.pc = self.state.next_pc;
+                    self.wait_for_interrupt(board);
+                }
+                Some(Exit::WaitForEvent) => {
+                    self.state.pc = self.state.next_pc;
+                    std::thread::yield_now();
+                }
+                Some(Exit::Sysreg) => self.handle_sysreg(board),
+                Some(Exit::Call) => self.handle_call(board),
+                Some(Exit::Exception) => self.handle_exception_exit(),
+                Some(Exit::Undefined) => {
+                    let pc = self.state.pc;
+                    self.take_exception(EC_UNKNOWN, 0, None, pc);
+                }
+                None => {
+                    board
+                        .run
+                        .stop(StopReason::Error(format!("unknown exit {code}")));
+                    return;
+                }
+            }
+        }
+    }
+
+    // ---- interrupts ----
+
+    fn take_pending_interrupt(&mut self, board: &Board) -> bool {
+        let pstate = self.state.pstate;
+        if pstate & PSTATE_I == 0 && board.interrupts.irq_pending(self.cpu) {
+            let pc = self.state.pc;
+            self.take_exception_kind(ExcKind::Irq, 0, None, pc);
+            return true;
+        }
+        if pstate & PSTATE_F == 0 && board.interrupts.fiq_pending(self.cpu) {
+            let pc = self.state.pc;
+            self.take_exception_kind(ExcKind::Fiq, 0, None, pc);
+            return true;
+        }
+        false
+    }
+
+    fn wait_for_interrupt(&mut self, board: &Board) {
+        // Sleep until an interrupt could be taken or the timer would fire.
+        loop {
+            if board.run.is_stopped() {
+                return;
+            }
+            self.service_timer(board);
+            if board.interrupts.irq_pending(self.cpu) || board.interrupts.fiq_pending(self.cpu) {
+                return;
+            }
+            match self.timer_deadline() {
+                Some(d) => {
+                    let now = crate_host::jit::counter::now();
+                    if now >= d {
+                        continue;
+                    }
+                    let ticks = d - now;
+                    let nanos = ticks as u128 * 1_000_000_000
+                        / crate_host::jit::counter::frequency() as u128;
+                    std::thread::sleep(std::time::Duration::from_nanos(
+                        (nanos as u64).clamp(1, 1_000_000),
+                    ));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+    }
+
+    // ---- calls (SVC / HVC / SMC / BRK) ----
+
+    fn handle_call(&mut self, board: &Board) {
+        let syn = self.state.exception_syndrome;
+        let imm = (syn & 0xffff) as u32;
+        let pc = self.state.pc; // the call instruction
+        match (syn >> 16) & 0xff {
+            0 => self.take_exception(EC_SVC64, imm as u64, None, pc.wrapping_add(4)), // SVC
+            1 | 2 => {
+                // HVC or SMC: the PSCI conduit.
+                let args = [
+                    self.state.x[0],
+                    self.state.x[1],
+                    self.state.x[2],
+                    self.state.x[3],
+                ];
+                let (ret, effect) = board.psci.call(self.cpu, args);
+                self.state.x[0] = ret;
+                match effect {
+                    Effect::Stop => {}
+                    _ => self.state.pc = self.state.next_pc,
+                }
+            }
+            _ => self.take_exception(EC_BRK, imm as u64, None, pc), // BRK
+        }
+    }
+
+    // ---- an exception reported by a block (fetch fault / data abort / ERET) ----
+
+    fn handle_exception_exit(&mut self) {
+        let syn = self.state.exception_syndrome;
+        let pc = self.state.pc;
+        if syn & ERET_MARKER != 0 {
+            self.eret();
+            return;
+        }
+        if syn & FETCH_ABORT != 0 {
+            let ec = if self.el() == 0 {
+                EC_INSN_ABORT_LOWER
+            } else {
+                EC_INSN_ABORT_SAME
+            };
+            // IFSC 0x10 (external) for a fetch that missed RAM, else the walk's.
+            self.take_exception(ec, 0x10, Some(pc), pc);
+            return;
+        }
+        // A data abort the memory helper reported.
+        let ec = if self.el() == 0 {
+            EC_DATA_ABORT_LOWER
+        } else {
+            EC_DATA_ABORT_SAME
+        };
+        let far = self.state.exception_far;
+        // ISS: ISV=0, so just the fault status and the write bit the helper set.
+        let iss = self.state.exception_syndrome & 0x7f;
+        self.take_exception(ec, iss, Some(far), pc);
+    }
+
+    // ---- exceptions ----
+
+    fn take_exception(&mut self, ec: u64, iss: u64, far: Option<u64>, elr: u64) {
+        self.state.banked.esr_el1 = (ec << 26) | (1 << 25) | (iss & 0x1ff_ffff);
+        self.take_exception_kind(ExcKind::Sync, iss, far, elr);
+    }
+
+    fn take_exception_kind(&mut self, kind: ExcKind, _iss: u64, far: Option<u64>, elr: u64) {
+        let from_el = self.el();
+        if let Some(f) = far {
+            self.state.banked.far_el1 = f;
+        }
+        self.state.banked.elr_el1 = elr;
+        self.state.banked.spsr_el1 = self.pack_spsr();
+
+        // Bank the stack pointer when coming from EL0.
+        if from_el == 0 {
+            self.state.banked.sp_el0 = self.state.sp;
+            self.state.sp = self.state.banked.sp_el1;
+        }
+        self.set_el(1);
+        self.state.pstate |= PSTATE_SPSEL | PSTATE_DAIF; // EL1h, all masked
+
+        let base = self.state.banked.vbar_el1 & !0x7ff;
+        let origin = if from_el == 0 { 0x400 } else { 0x200 };
+        let category = match kind {
+            ExcKind::Sync => 0x000,
+            ExcKind::Irq => 0x080,
+            ExcKind::Fiq => 0x100,
+        };
+        self.state.pc = base + origin + category;
+    }
+
+    fn eret(&mut self) {
+        let spsr = self.state.banked.spsr_el1;
+        let target_el = ((spsr >> 2) & 3) as u32;
+        let from_el = self.el();
+        // Unbank the stack pointer when returning to EL0.
+        if target_el == 0 && from_el == 1 {
+            self.state.banked.sp_el1 = self.state.sp;
+            self.state.sp = self.state.banked.sp_el0;
+        }
+        self.state.nzcv = spsr & 0xf000_0000;
+        self.state.pstate = (spsr & (0xf << 6)) // DAIF
+            | (((spsr >> 2) & 3) << PSTATE_EL_SHIFT)
+            | (spsr & PSTATE_SPSEL);
+        self.state.pc = self.state.banked.elr_el1;
+    }
+
+    fn pack_spsr(&self) -> u64 {
+        let m = ((self.el() as u64) << 2) | (self.state.pstate & PSTATE_SPSEL);
+        (self.state.nzcv & 0xf000_0000) | (self.state.pstate & (0xf << 6)) | m
+    }
+
+    // ---- the generic timer ----
+
+    fn guest_counter(&self) -> u64 {
+        crate_host::jit::counter::now().wrapping_sub(self.timer_offset)
+    }
+
+    /// When the virtual timer would next fire, in host counter ticks, if armed.
+    fn timer_deadline(&self) -> Option<u64> {
+        let ctl = self.state.banked.cntv_ctl;
+        if ctl & 1 == 0 || ctl & 2 != 0 {
+            return None; // disabled or masked
+        }
+        Some(self.timer_offset.wrapping_add(self.state.banked.cntv_cval))
+    }
+
+    /// Raises or lowers the virtual timer's interrupt from its compare value.
+    fn service_timer(&mut self, board: &Board) {
+        let ctl = self.state.banked.cntv_ctl;
+        let fired = ctl & 1 != 0 && self.guest_counter() >= self.state.banked.cntv_cval;
+        // ISTATUS (bit 2) reads as the raw condition; the line is gated by IMASK.
+        if fired {
+            self.state.banked.cntv_ctl |= 1 << 2;
+        } else {
+            self.state.banked.cntv_ctl &= !(1 << 2);
+        }
+        let asserted = fired && ctl & 2 == 0;
+        board.lines.set_ppi(self.cpu, board.vtimer_ppi, asserted);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExcKind {
+    Sync,
+    Irq,
+    Fiq,
+}
+
+/// The CPU backend: runs a board's boot CPU on the translator.
+pub struct Jit {
+    jit_bytes: usize,
+}
+
+impl Jit {
+    pub fn new() -> Self {
+        Jit {
+            jit_bytes: 64 << 20,
+        }
+    }
+}
+
+impl Default for Jit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate_core::board::CpuBackend for Jit {
+    fn name(&self) -> &'static str {
+        "jit"
+    }
+
+    fn run(&self, board: &Board) -> crate_core::Result<StopReason> {
+        let mut cpu = Cpu::for_board(board, 0);
+        cpu.state.pc = board.boot.pc;
+        cpu.state.x[0] = board.boot.x[0];
+        cpu.state.x[1] = board.boot.x[1];
+        cpu.state.x[2] = board.boot.x[2];
+        cpu.state.x[3] = board.boot.x[3];
+        let mut cache = CodeCache::new(self.jit_bytes)?;
+        // The interrupt controller wakes a sleeping CPU through this; with one
+        // CPU the dispatcher already re-checks, so a no-op waker suffices.
+        board.interrupts.set_waker(Arc::new(NoopWaker));
+        cpu.dispatch(board, &mut cache);
+        Ok(board.run.reason().unwrap_or(StopReason::Killed))
+    }
+}
+
+struct NoopWaker;
+impl crate_core::cpu::CpuWaker for NoopWaker {
+    fn wake(&self, _cpu: usize) {}
+}
+
+/// System-register reads and writes the translator traps.
+impl Cpu {
+    fn handle_sysreg(&mut self, board: &Board) {
+        let reg = SysReg(self.state.sysreg as u16);
+        let rt = self.state.sysreg_rt;
+        let read = self.state.sysreg_read != 0;
+        let next = self.state.next_pc;
+
+        if self.state.sysreg as u16 == SYSTEM_WORD_MARKER {
+            // An MSR-immediate or a maintenance op, the whole word in syndrome.
+            let word = self.state.exception_syndrome as u32;
+            self.handle_system_word(word);
+            self.state.pc = next;
+            return;
+        }
+
+        if read {
+            match self.read_sysreg(board, reg) {
+                Some(v) => {
+                    if rt != 31 {
+                        self.state.x[rt as usize] = v;
+                    }
+                    self.state.pc = next;
+                }
+                None => {
+                    let pc = self.state.pc;
+                    self.take_exception(EC_MSR_MRS, 0, None, pc);
+                }
+            }
+        } else {
+            let value = if rt == 31 {
+                0
+            } else {
+                self.state.x[rt as usize]
+            };
+            if self.write_sysreg(board, reg, value) {
+                self.state.pc = next;
+            } else {
+                let pc = self.state.pc;
+                self.take_exception(EC_MSR_MRS, 0, None, pc);
+            }
+        }
+    }
+
+    fn handle_system_word(&mut self, word: u32) {
+        // MSR (immediate): CRm holds the value, op1:op2 the field.
+        if (word >> 19) & 3 == 0 && (word >> 12) & 0xf == 0b0100 {
+            let op1 = (word >> 16) & 7;
+            let op2 = (word >> 5) & 7;
+            let crm = (word >> 8) & 0xf;
+            match (op1, op2) {
+                (0b000, 0b101) => {
+                    // SPSel.
+                    self.state.pstate =
+                        (self.state.pstate & !PSTATE_SPSEL) | ((crm as u64 & 1) * PSTATE_SPSEL);
+                }
+                (0b011, 0b110) => self.set_daif(crm, true), // DAIFSet
+                (0b011, 0b111) => self.set_daif(crm, false), // DAIFClr
+                _ => {}
+            }
+            return;
+        }
+        // A cache or TLB maintenance op (CRn 7 or 8): invalidate our caches.
+        let crn = (word >> 12) & 0xf;
+        if crn == 0b1000 {
+            // A TLBI: drop the software TLBs the fast path would keep (none yet).
+            self.state.clear_tlbs();
+        }
+        // IC/DC by address: our translated code reads guest memory afresh each
+        // block, and self-modifying code is milestone 3, so these are no-ops.
+    }
+
+    fn set_daif(&mut self, crm: u32, set: bool) {
+        // DAIF immediate uses bit3=D, bit2=A, bit1=I, bit0=F, each at CRm.
+        let mask = (((crm >> 3) & 1) as u64) << 9
+            | (((crm >> 2) & 1) as u64) << 8
+            | (((crm >> 1) & 1) as u64) << 7
+            | ((crm & 1) as u64) << 6;
+        if set {
+            self.state.pstate |= mask;
+        } else {
+            self.state.pstate &= !mask;
+        }
+    }
+
+    /// Reads a system register, `None` if it is not one the machine implements
+    /// (which the caller turns into an undefined-instruction exception).
+    fn read_sysreg(&mut self, board: &Board, reg: SysReg) -> Option<u64> {
+        // The GIC's CPU interface owns the ICC_* registers.
+        if let Some(v) = board.interrupts.read_sysreg(self.cpu, reg) {
+            return Some(v);
+        }
+        let b = &self.state.banked;
+        Some(match reg {
+            r if r == sr::SCTLR_EL1 => self.state.mmu.sctlr_el1,
+            r if r == sr::TTBR0_EL1 => self.state.mmu.ttbr0_el1,
+            r if r == sr::TTBR1_EL1 => self.state.mmu.ttbr1_el1,
+            r if r == sr::TCR_EL1 => self.state.mmu.tcr_el1,
+            r if r == sr::MAIR_EL1 => self.state.mmu.mair_el1,
+            r if r == sr::AMAIR_EL1 => self.state.mmu.amair_el1,
+            r if r == sr::CONTEXTIDR_EL1 => self.state.mmu.contextidr_el1,
+            r if r == sr::VBAR_EL1 => b.vbar_el1,
+            r if r == sr::ELR_EL1 => b.elr_el1,
+            r if r == sr::SPSR_EL1 => b.spsr_el1,
+            r if r == sr::ESR_EL1 => b.esr_el1,
+            r if r == sr::FAR_EL1 => b.far_el1,
+            r if r == sr::SP_EL0 => b.sp_el0,
+            r if r == sr::SP_EL1 => b.sp_el1,
+            r if r == sr::TPIDR_EL0 => b.tpidr_el0,
+            r if r == sr::TPIDRRO_EL0 => b.tpidrro_el0,
+            r if r == sr::TPIDR_EL1 => b.tpidr_el1,
+            r if r == sr::CPACR_EL1 => b.cpacr_el1,
+            r if r == sr::MDSCR_EL1 => b.mdscr_el1,
+            r if r == sr::ACTLR_EL1 => b.actlr_el1,
+            r if r == sr::CNTKCTL_EL1 => b.cntkctl_el1,
+            r if r == sr::CNTFRQ_EL0 => crate_host::jit::counter::frequency(),
+            r if r == sr::CNTVCT_EL0 || r == sr::CNTPCT_EL0 => self.guest_counter(),
+            r if r == sr::CNTV_CTL_EL0 => self.state.banked.cntv_ctl,
+            r if r == sr::CNTV_CVAL_EL0 => self.state.banked.cntv_cval,
+            r if r == sr::CNTV_TVAL_EL0 => {
+                (self
+                    .state
+                    .banked
+                    .cntv_cval
+                    .wrapping_sub(self.guest_counter()))
+                    & 0xffff_ffff
+            }
+            r if r == sr::CNTP_CTL_EL0 => self.state.banked.cntp_ctl,
+            r if r == sr::CNTP_CVAL_EL0 => self.state.banked.cntp_cval,
+            r if r == sr::CNTP_TVAL_EL0 => {
+                (self
+                    .state
+                    .banked
+                    .cntp_cval
+                    .wrapping_sub(self.guest_counter()))
+                    & 0xffff_ffff
+            }
+            r if r == sr::NZCV => self.state.nzcv,
+            r if r == sr::DAIF => self.state.pstate & (0xf << 6),
+            r if r == sr::FPCR => self.state.fpcr,
+            r if r == sr::FPSR => self.state.fpsr,
+            r if r == sr::CURRENT_EL => (self.el() as u64) << 2,
+            r if r == sr::SPSEL => self.state.pstate & PSTATE_SPSEL,
+            r if r == sr::MPIDR_EL1 => board.mpidrs[self.cpu],
+            r if r == sr::MIDR_EL1 => 0x410f_d080, // a generic Cortex-A
+            r if r == sr::CTR_EL0 => CTR_EL0,
+            r if r == sr::DCZID_EL0 => 0x4, // 64-byte zero block, DC ZVA allowed
+            r if r == sr::CLIDR_EL1 => 0,   // no cache levels advertised
+            r if r == sr::ID_AA64MMFR0_EL1 => ID_AA64MMFR0,
+            r if r == sr::ID_AA64PFR0_EL1 => ID_AA64PFR0,
+            r if r == sr::ID_AA64DFR0_EL1 => ID_AA64DFR0,
+            // The rest of the ID register space reads as zero (RAZ).
+            r if is_id_space(r) => 0,
+            // Debug breakpoint/watchpoint and OS-lock registers: quiet.
+            r if is_quiet(r) => 0,
+            _ => return None,
+        })
+    }
+
+    /// Writes a system register, `false` if it is not one the machine knows.
+    fn write_sysreg(&mut self, board: &Board, reg: SysReg, value: u64) -> bool {
+        if board.interrupts.write_sysreg(self.cpu, reg, value) {
+            return true;
+        }
+        match reg {
+            r if r == sr::SCTLR_EL1 => self.state.mmu.sctlr_el1 = value,
+            r if r == sr::TTBR0_EL1 => self.state.mmu.ttbr0_el1 = value,
+            r if r == sr::TTBR1_EL1 => self.state.mmu.ttbr1_el1 = value,
+            r if r == sr::TCR_EL1 => self.state.mmu.tcr_el1 = value,
+            r if r == sr::MAIR_EL1 => self.state.mmu.mair_el1 = value,
+            r if r == sr::AMAIR_EL1 => self.state.mmu.amair_el1 = value,
+            r if r == sr::CONTEXTIDR_EL1 => self.state.mmu.contextidr_el1 = value,
+            r if r == sr::VBAR_EL1 => self.state.banked.vbar_el1 = value,
+            r if r == sr::ELR_EL1 => self.state.banked.elr_el1 = value,
+            r if r == sr::SPSR_EL1 => self.state.banked.spsr_el1 = value,
+            r if r == sr::ESR_EL1 => self.state.banked.esr_el1 = value,
+            r if r == sr::FAR_EL1 => self.state.banked.far_el1 = value,
+            r if r == sr::SP_EL0 => self.state.banked.sp_el0 = value,
+            r if r == sr::SP_EL1 => self.state.banked.sp_el1 = value,
+            r if r == sr::TPIDR_EL0 => self.state.banked.tpidr_el0 = value,
+            r if r == sr::TPIDRRO_EL0 => self.state.banked.tpidrro_el0 = value,
+            r if r == sr::TPIDR_EL1 => self.state.banked.tpidr_el1 = value,
+            r if r == sr::CPACR_EL1 => self.state.banked.cpacr_el1 = value,
+            r if r == sr::MDSCR_EL1 => self.state.banked.mdscr_el1 = value,
+            r if r == sr::ACTLR_EL1 => self.state.banked.actlr_el1 = value,
+            r if r == sr::CNTKCTL_EL1 => self.state.banked.cntkctl_el1 = value,
+            r if r == sr::CNTV_CTL_EL0 => {
+                self.state.banked.cntv_ctl = value & 0x3;
+                self.service_timer(board);
+            }
+            r if r == sr::CNTV_CVAL_EL0 => {
+                self.state.banked.cntv_cval = value;
+                self.service_timer(board);
+            }
+            r if r == sr::CNTV_TVAL_EL0 => {
+                self.state.banked.cntv_cval = self
+                    .guest_counter()
+                    .wrapping_add(value as i32 as i64 as u64);
+                self.service_timer(board);
+            }
+            r if r == sr::CNTP_CTL_EL0 => self.state.banked.cntp_ctl = value & 0x3,
+            r if r == sr::CNTP_CVAL_EL0 => self.state.banked.cntp_cval = value,
+            r if r == sr::CNTP_TVAL_EL0 => {
+                self.state.banked.cntp_cval = self
+                    .guest_counter()
+                    .wrapping_add(value as i32 as i64 as u64)
+            }
+            r if r == sr::NZCV => self.state.nzcv = value & 0xf000_0000,
+            r if r == sr::DAIF => {
+                self.state.pstate = (self.state.pstate & !(0xf << 6)) | (value & (0xf << 6))
+            }
+            r if r == sr::FPCR => self.state.fpcr = value,
+            r if r == sr::FPSR => self.state.fpsr = value,
+            r if r == sr::SPSEL => {
+                self.state.pstate = (self.state.pstate & !PSTATE_SPSEL) | (value & PSTATE_SPSEL)
+            }
+            // Cache-size selection and the OS lock: accepted, no effect here.
+            r if r == sr::CSSELR_EL1 || is_quiet(r) => {}
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// CTR_EL0: 16-byte I- and D-cache lines, IDC and DIC set so no cache
+/// maintenance is needed for the data path (our translator reads memory afresh).
+const CTR_EL0: u64 = (1 << 28) | (1 << 29) | (2 << 16) | 2 | (3 << 24);
+/// ID_AA64MMFR0_EL1: PARange 40-bit (2), 4 KiB (TGran4=0), 16 KiB (TGran16=2)
+/// and 64 KiB (TGran64=0) granules all supported.
+const ID_AA64MMFR0: u64 = 0x0000_0000_1022_0002;
+/// ID_AA64PFR0_EL1: EL0 and EL1 at AArch64 only, FP and AdvSIMD present, no SVE.
+const ID_AA64PFR0: u64 = 0x0000_0000_0000_0011;
+/// ID_AA64DFR0_EL1: debug architecture v8, 6 breakpoints and 4 watchpoints,
+/// PMUVer 0 (so the PMU tests skip rather than fail).
+const ID_AA64DFR0: u64 = 0x0000_0000_1035_0006;
+
+fn is_id_space(r: SysReg) -> bool {
+    r.op0() == 3 && r.op1() == 0 && r.crn() == 0 && (0..8).contains(&r.crm())
+}
+
+/// Debug breakpoint/watchpoint registers and the OS lock, kept quiet during
+/// bring-up (CRn 0 with op1 0 overlaps the ID space, which is handled first).
+fn is_quiet(r: SysReg) -> bool {
+    // OSLAR_EL1, OSLSR_EL1, OSDLR_EL1, DBGPRCR, and the DBGB/DBGW banks (CRn 0,
+    // op1 0, CRm 0..15, with op2 selecting the register) at the debug op0 2.
+    r.op0() == 2
+}
+
+/// System-register encodings the machine implements, by their packed form.
+#[rustfmt::skip]
+mod sr {
+    use super::SysReg;
+    pub const SCTLR_EL1: SysReg = SysReg::new(3, 0, 1, 0, 0);
+    pub const CPACR_EL1: SysReg = SysReg::new(3, 0, 1, 0, 2);
+    pub const ACTLR_EL1: SysReg = SysReg::new(3, 0, 1, 0, 1);
+    pub const TTBR0_EL1: SysReg = SysReg::new(3, 0, 2, 0, 0);
+    pub const TTBR1_EL1: SysReg = SysReg::new(3, 0, 2, 0, 1);
+    pub const TCR_EL1: SysReg = SysReg::new(3, 0, 2, 0, 2);
+    pub const MAIR_EL1: SysReg = SysReg::new(3, 0, 10, 2, 0);
+    pub const AMAIR_EL1: SysReg = SysReg::new(3, 0, 10, 3, 0);
+    pub const CONTEXTIDR_EL1: SysReg = SysReg::new(3, 0, 13, 0, 1);
+    pub const VBAR_EL1: SysReg = SysReg::new(3, 0, 12, 0, 0);
+    pub const ELR_EL1: SysReg = SysReg::new(3, 0, 4, 0, 1);
+    pub const SPSR_EL1: SysReg = SysReg::new(3, 0, 4, 0, 0);
+    pub const ESR_EL1: SysReg = SysReg::new(3, 0, 5, 2, 0);
+    pub const FAR_EL1: SysReg = SysReg::new(3, 0, 6, 0, 0);
+    pub const SP_EL0: SysReg = SysReg::new(3, 0, 4, 1, 0);
+    pub const SP_EL1: SysReg = SysReg::new(3, 4, 4, 1, 0);
+    pub const SPSEL: SysReg = SysReg::new(3, 0, 4, 2, 0);
+    pub const DAIF: SysReg = SysReg::new(3, 3, 4, 2, 1);
+    pub const NZCV: SysReg = SysReg::new(3, 3, 4, 2, 0);
+    pub const FPCR: SysReg = SysReg::new(3, 3, 4, 4, 0);
+    pub const FPSR: SysReg = SysReg::new(3, 3, 4, 4, 1);
+    pub const CURRENT_EL: SysReg = SysReg::new(3, 0, 4, 2, 2);
+    pub const TPIDR_EL0: SysReg = SysReg::new(3, 3, 13, 0, 2);
+    pub const TPIDRRO_EL0: SysReg = SysReg::new(3, 3, 13, 0, 3);
+    pub const TPIDR_EL1: SysReg = SysReg::new(3, 0, 13, 0, 4);
+    pub const MPIDR_EL1: SysReg = SysReg::new(3, 0, 0, 0, 5);
+    pub const MIDR_EL1: SysReg = SysReg::new(3, 0, 0, 0, 0);
+    pub const CTR_EL0: SysReg = SysReg::new(3, 3, 0, 0, 1);
+    pub const DCZID_EL0: SysReg = SysReg::new(3, 3, 0, 0, 7);
+    pub const CLIDR_EL1: SysReg = SysReg::new(3, 1, 0, 0, 1);
+    pub const CSSELR_EL1: SysReg = SysReg::new(3, 2, 0, 0, 0);
+    pub const ID_AA64PFR0_EL1: SysReg = SysReg::new(3, 0, 0, 4, 0);
+    pub const ID_AA64DFR0_EL1: SysReg = SysReg::new(3, 0, 0, 5, 0);
+    pub const ID_AA64MMFR0_EL1: SysReg = SysReg::new(3, 0, 0, 7, 0);
+    pub const MDSCR_EL1: SysReg = SysReg::new(2, 0, 0, 2, 2);
+    pub const CNTFRQ_EL0: SysReg = SysReg::new(3, 3, 14, 0, 0);
+    pub const CNTPCT_EL0: SysReg = SysReg::new(3, 3, 14, 0, 1);
+    pub const CNTVCT_EL0: SysReg = SysReg::new(3, 3, 14, 0, 2);
+    pub const CNTKCTL_EL1: SysReg = SysReg::new(3, 0, 14, 1, 0);
+    pub const CNTP_TVAL_EL0: SysReg = SysReg::new(3, 3, 14, 2, 0);
+    pub const CNTP_CTL_EL0: SysReg = SysReg::new(3, 3, 14, 2, 1);
+    pub const CNTP_CVAL_EL0: SysReg = SysReg::new(3, 3, 14, 2, 2);
+    pub const CNTV_TVAL_EL0: SysReg = SysReg::new(3, 3, 14, 3, 0);
+    pub const CNTV_CTL_EL0: SysReg = SysReg::new(3, 3, 14, 3, 1);
+    pub const CNTV_CVAL_EL0: SysReg = SysReg::new(3, 3, 14, 3, 2);
 }
 
 fn sign_extend(value: u64, bits: u32) -> u64 {

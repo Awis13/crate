@@ -61,6 +61,7 @@ dependencies = [
  "crate-core",
  "crate-host",
  "crate-hvf",
+ "crate-jit",
  "crate-virt",
  "libc",
 ]

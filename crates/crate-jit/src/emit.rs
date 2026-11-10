@@ -152,7 +152,11 @@ pub fn call_mem(asm: &mut Asm, helper: u64, word: u32) {
     asm.emit(ldr_imm(3, 9, SP, offsets::HOST_SP));
     asm.emit(mov_sp(SP, 9)); // SP = host stack
     asm.emit(str_imm_pre(3, 2, SP, -16)); // push &state
-    asm.bl_abs(helper);
+    // The helper is in the main binary, too far for a relative BL, so call it
+    // through a register. X16/X17 (the intra-procedure scratch) are free: the
+    // guest's values are already in the state and the reload restores them.
+    asm.mov_imm(16, helper);
+    asm.emit(blr(16));
     // x0 = result; recover &state and SP.
     asm.emit(mov(3, 0)); // x3 = result
     asm.emit(ldr_imm_post(3, 2, SP, 16)); // x2 = &state

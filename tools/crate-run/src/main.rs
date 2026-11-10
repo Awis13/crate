@@ -54,6 +54,16 @@ struct Args {
     virtio_console: Option<PathBuf>,
     dump_dtb: Option<PathBuf>,
     log: Level,
+    raw: bool,
+    backend: Backend,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// Apple's Hypervisor framework (macOS, the default there).
+    Hvf,
+    /// The translator.
+    Jit,
 }
 
 fn parse_forward(spec: &str) -> std::result::Result<PortForward, String> {
@@ -99,6 +109,12 @@ fn parse(mut it: impl Iterator<Item = String>) -> std::result::Result<Args, Stri
         virtio_console: None,
         dump_dtb: None,
         log: Level::Info,
+        raw: false,
+        backend: if cfg!(target_os = "macos") {
+            Backend::Hvf
+        } else {
+            Backend::Jit
+        },
     };
     let mut kernel = None;
     while let Some(flag) = it.next() {
@@ -121,6 +137,14 @@ fn parse(mut it: impl Iterator<Item = String>) -> std::result::Result<Args, Stri
                     .map_err(|_| "--memory needs a number of MiB")?
             }
             "--net" => args.net = true,
+            "--raw" => args.raw = true,
+            "--backend" => {
+                args.backend = match value()?.as_str() {
+                    "hvf" => Backend::Hvf,
+                    "jit" => Backend::Jit,
+                    other => return Err(format!("--backend {other}: expected hvf or jit")),
+                }
+            }
             "--forward" => args.forwards.push(parse_forward(&value()?)?),
             "--virtio-console" => args.virtio_console = Some(value()?.into()),
             "--dump-dtb" => args.dump_dtb = Some(value()?.into()),
@@ -291,6 +315,7 @@ fn run(args: Args) -> Result<StopReason> {
         cpus: args.cpus,
         memory: args.memory_mib << 20,
         kernel: args.kernel.clone(),
+        raw_kernel: args.raw,
         initrd: args.initrd.clone(),
         cmdline: args.cmdline.clone(),
         disks,
@@ -323,23 +348,24 @@ fn run(args: Args) -> Result<StopReason> {
         std::thread::spawn(move || stdin_thread(machine));
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        use crate_core::board::CpuBackend;
-        let backend = crate_hvf::Hvf::new();
-        crate_core::info!(
-            "{} CPUs, {} MiB, on {}",
-            args.cpus,
-            args.memory_mib,
-            backend.name()
-        );
-        machine.run(&backend)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        drop(machine);
-        Err(Error::Unsupported("no CPU backend on this host yet".into()))
-    }
+    use crate_core::board::CpuBackend;
+    let backend: Box<dyn CpuBackend> = match args.backend {
+        #[cfg(target_os = "macos")]
+        Backend::Hvf => Box::new(crate_hvf::Hvf::new()),
+        #[cfg(not(target_os = "macos"))]
+        Backend::Hvf => {
+            drop(machine);
+            return Err(Error::Unsupported("hvf is macOS only".into()));
+        }
+        Backend::Jit => Box::new(crate_jit::backend::Jit::new()),
+    };
+    crate_core::info!(
+        "{} CPUs, {} MiB, on {}",
+        args.cpus,
+        args.memory_mib,
+        backend.name()
+    );
+    machine.run(backend.as_ref())
 }
 
 fn main() {

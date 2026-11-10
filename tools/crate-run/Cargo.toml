@@ -12,6 +12,7 @@ publish.workspace = true
 crate-core.workspace = true
 crate-host.workspace = true
 crate-virt.workspace = true
+crate-jit.workspace = true
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

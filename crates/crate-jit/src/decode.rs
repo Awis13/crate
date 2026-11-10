@@ -68,6 +68,19 @@ pub enum Op {
     System { word: u32 },
     /// An exception-returning instruction (ERET).
     Eret,
+    /// A PC-relative literal load (LDR/LDRSW literal). The value lives at a
+    /// known guest address; the translator reads it and materialises it.
+    LiteralLoad {
+        rt: u32,
+        addr: u64,
+        /// log2 of the access size in bytes (2 or 3 for general registers).
+        size: u32,
+        signed: bool,
+        /// A SIMD/FP destination (not yet handled).
+        vector: bool,
+        /// PRFM (a hint); do nothing.
+        prefetch: bool,
+    },
     /// Not understood; raise an Undefined-instruction exception.
     Undefined,
 }
@@ -159,7 +172,7 @@ pub fn decode(word: u32, pc: u64) -> Op {
         // Branches, exception generating and system.
         0b1010 | 0b1011 => decode_branch_system(word, pc),
         // Loads and stores.
-        0b0100 | 0b0110 | 0b1100 | 0b1110 => decode_load_store(word),
+        0b0100 | 0b0110 | 0b1100 | 0b1110 => decode_load_store(word, pc),
         // Data processing -- register.
         0b0101 | 0b1101 => decode_data_reg(word),
         // Data processing -- SIMD and floating point.
@@ -415,11 +428,36 @@ pub fn sysreg_encoding(word: u32) -> u16 {
         | (op2 as u16 & 7)
 }
 
-fn decode_load_store(word: u32) -> Op {
+fn decode_load_store(word: u32, pc: u64) -> Op {
     // The load/store encoding group, split by bits 29:28 (op0's low part is in
     // the dispatcher) and 26 (V, a SIMD transfer) and 24.
     let op0 = (word >> 28) & 0xf;
     let v = word & (1 << 26) != 0;
+
+    // Load register (literal): bits 29:27 == 0b011, 25:24 == 0b00.
+    if (word >> 27) & 0x7 == 0b011 && (word >> 24) & 0x3 == 0 {
+        let opc = (word >> 30) & 0x3;
+        let imm = sign_extend(((word >> 5) & 0x7ffff) as u64, 19) * 4;
+        let addr = pc.wrapping_add(imm as u64);
+        let (size, signed, prefetch) = if v {
+            (2 + opc, false, false) // S/D/Q
+        } else {
+            match opc {
+                0b00 => (2, false, false), // LDR (32-bit)
+                0b01 => (3, false, false), // LDR (64-bit)
+                0b10 => (2, true, false),  // LDRSW
+                _ => (3, false, true),     // PRFM (literal)
+            }
+        };
+        return Op::LiteralLoad {
+            rt: word & 31,
+            addr,
+            size,
+            signed,
+            vector: v,
+            prefetch,
+        };
+    }
 
     // Load/store register pair (op0 x0x0 with bit 25 == 0, selected here by the
     // 101x0 shape at bits 29:27 == 0b101).

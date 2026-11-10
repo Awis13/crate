@@ -86,6 +86,17 @@ pub struct Banked {
     pub tpidr_el0: u64,
     pub tpidrro_el0: u64,
     pub tpidr_el1: u64,
+    /// The generic timer's control and compare values (virtual and physical).
+    pub cntv_ctl: u64,
+    pub cntv_cval: u64,
+    pub cntp_ctl: u64,
+    pub cntp_cval: u64,
+    pub cntkctl_el1: u64,
+    /// Registers the guest writes that the engine keeps but does not act on:
+    /// CPACR (FP is always on here), the debug monitor control, and ACTLR.
+    pub cpacr_el1: u64,
+    pub mdscr_el1: u64,
+    pub actlr_el1: u64,
 }
 
 /// The translation and memory system registers the MMU reads.
