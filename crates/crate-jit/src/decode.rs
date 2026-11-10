@@ -399,8 +399,13 @@ fn decode_system(word: u32) -> Op {
             };
         }
         if crn == 0b0011 {
-            // Barriers (DSB, DMB, ISB) and CLREX: let them run on the host.
-            return Op::Copy;
+            // CLREX (op2 == 2) clears the guest's exclusive monitor, so it goes
+            // to the helper; the barriers (DSB, DMB, ISB) run on the host.
+            return if op2 == 0b010 {
+                Op::System { word }
+            } else {
+                Op::Copy
+            };
         }
         return Op::System { word };
     }

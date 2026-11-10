@@ -204,6 +204,17 @@ pub struct CpuState {
     pub dispatch_target: u64,
     /// The host address the exit stub returns through (`crate_jit_epilogue`).
     pub epilogue: u64,
+    /// Set when the guest invalidated the instruction cache, so the dispatcher
+    /// throws its translations away (the guest changed code it may re-run). A
+    /// coarse stand-in for the fine-grained self-modifying-code support of M3.
+    pub flush_cache: u32,
+    pub _pad2: u32,
+    /// The local exclusive monitor: the address a load-exclusive reserved, with
+    /// the low bit set to mark it valid (so address 0 is distinguishable). Zero
+    /// means no reservation. A store-exclusive succeeds only while it is set for
+    /// the same address; a load-exclusive sets it, and an exception, a CLREX or
+    /// a failed store clears it.
+    pub monitor: u64,
 
     /// Scratch the memory fast path spills victim registers to.
     pub scratch: [u64; 4],

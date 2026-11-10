@@ -192,6 +192,14 @@ impl CodeCache {
         self.emit_save_stub();
     }
 
+    /// Discards every translation after the guest invalidated the instruction
+    /// cache (it may re-run code it changed). Coarse; fine-grained invalidation
+    /// is milestone 3. Safe only between block runs, where the dispatcher calls
+    /// it.
+    pub fn flush(&mut self) {
+        self.reset();
+    }
+
     fn translate(
         &mut self,
         pc: u64,
@@ -1047,9 +1055,11 @@ impl Cpu {
         Ok(())
     }
 
-    /// Exclusive and ordered accesses (LDXR/STXR, LDAR/STLR, CAS). With one CPU
-    /// there is no other observer, so the exclusive monitor always succeeds and
-    /// the ordering is the host's own.
+    /// Exclusive and ordered accesses (LDXR/STXR, LDAR/STLR, CAS). On one CPU
+    /// the ordering is the host's own; the local monitor (set by a
+    /// load-exclusive, cleared by a store-exclusive, a CLREX or an exception)
+    /// still matters because an interrupt between the LDXR and the STXR must
+    /// make the STXR fail so the guest's retry loop runs.
     fn ordered_access(&mut self, word: u32, el: u32, regs: &MmuRegs) -> Result<(), mmu::Fault> {
         let size = (word >> 30) & 3;
         let o2 = word & (1 << 23) != 0;
@@ -1090,14 +1100,21 @@ impl Cpu {
             self.state.exception_far = addr.wrapping_add(n);
             let t1 = mmu::translate(&self.mem, regs, el, addr.wrapping_add(n), acc)?;
             if word & (1 << 31) != 0 {
-                // LDXP / STXP: a 32- or 64-bit register pair.
+                // LDXP / STXP: an exclusive 32- or 64-bit register pair.
                 if load {
                     self.xwrite_z(rt, self.read_phys(t0.pa, elem)? & m);
                     self.xwrite_z(rt2, self.read_phys(t1.pa, elem)? & m);
+                    self.state.monitor = addr | 1;
                 } else {
-                    self.write_phys(t0.pa, elem, self.xread_z(rt))?;
-                    self.write_phys(t1.pa, elem, self.xread_z(rt2))?;
-                    self.xwrite_z(rs, 0); // the monitor always succeeds on one CPU
+                    let reserved = self.state.monitor;
+                    self.state.monitor = 0;
+                    if reserved == addr | 1 {
+                        self.write_phys(t0.pa, elem, self.xread_z(rt))?;
+                        self.write_phys(t1.pa, elem, self.xread_z(rt2))?;
+                        self.xwrite_z(rs, 0); // success
+                    } else {
+                        self.xwrite_z(rs, 1); // the reservation was lost
+                    }
                 }
             } else {
                 // CASP: a compare-and-swap of a register pair. Rs is the even
@@ -1122,12 +1139,24 @@ impl Cpu {
                 value &= (1u64 << (8 << size)) - 1;
             }
             self.xwrite_z(rt, value);
-        } else {
-            self.write_phys(t.pa, size, self.xread_z(rt))?;
             if !o2 {
-                // Store-exclusive: report success in Rs.
-                self.xwrite_z(rs, 0);
+                // A load-exclusive (LDXR/LDAXR) reserves; LDAR (o2) does not.
+                self.state.monitor = addr | 1;
             }
+        } else if !o2 {
+            // A store-exclusive (STXR/STLXR) succeeds only while the monitor
+            // still holds this address, and always clears it.
+            let reserved = self.state.monitor;
+            self.state.monitor = 0;
+            if reserved == addr | 1 {
+                self.write_phys(t.pa, size, self.xread_z(rt))?;
+                self.xwrite_z(rs, 0);
+            } else {
+                self.xwrite_z(rs, 1);
+            }
+        } else {
+            // STLR: a plain store-release.
+            self.write_phys(t.pa, size, self.xread_z(rt))?;
         }
         Ok(())
     }
@@ -1244,7 +1273,13 @@ impl Cpu {
                     self.state.pc = self.state.next_pc;
                     std::thread::yield_now();
                 }
-                Some(Exit::Sysreg) => self.handle_sysreg(board),
+                Some(Exit::Sysreg) => {
+                    self.handle_sysreg(board);
+                    if self.state.flush_cache != 0 {
+                        self.state.flush_cache = 0;
+                        cache.flush();
+                    }
+                }
                 Some(Exit::Call) => self.handle_call(board),
                 Some(Exit::Exception) => self.handle_exception_exit(),
                 Some(Exit::Undefined) => {
@@ -1373,6 +1408,8 @@ impl Cpu {
 
     fn take_exception_kind(&mut self, kind: ExcKind, _iss: u64, far: Option<u64>, elr: u64) {
         let from_el = self.el();
+        // Taking an exception clears the local exclusive monitor.
+        self.state.monitor = 0;
         if let Some(f) = far {
             self.state.banked.far_el1 = f;
         }
@@ -1564,15 +1601,23 @@ impl Cpu {
         }
         let crn = (word >> 12) & 0xf;
         let crm = (word >> 8) & 0xf;
-        if crn == 0b1000 {
+        if crn == 0b0011 {
+            // CLREX: clear the exclusive monitor.
+            self.state.monitor = 0;
+        } else if crn == 0b1000 {
             // A TLBI: drop the software TLBs the fast path would keep (none yet).
             self.state.clear_tlbs();
-        } else if crn == 0b0111 && crm == 0b1000 {
-            // AT (address translation): translate Rt's VA and set PAR_EL1.
-            self.address_translate(word);
+        } else if crn == 0b0111 {
+            match crm {
+                // AT (address translation): translate Rt's VA, set PAR_EL1.
+                0b1000 => self.address_translate(word),
+                // IC IALLU(IS) / IC IVAU (CRm 1 or 5): the guest changed code it
+                // may re-run, so drop every translation. DC (data cache) is a
+                // no-op since the helper reads memory afresh.
+                0b0001 | 0b0101 => self.state.flush_cache = 1,
+                _ => {}
+            }
         }
-        // IC/DC by address: our translated code reads guest memory afresh each
-        // block, and self-modifying code is milestone 3, so these are no-ops.
     }
 
     /// AT S1E{0,1}{R,W}: do a stage-1 translation of the VA in Rt and record
@@ -1749,8 +1794,11 @@ impl Cpu {
 }
 
 /// CTR_EL0: 16-byte I- and D-cache lines, IDC and DIC set so no cache
-/// maintenance is needed for the data path (our translator reads memory afresh).
-const CTR_EL0: u64 = (1 << 28) | (1 << 29) | (2 << 16) | 2 | (3 << 24);
+/// maintenance is needed for the data path (the translator reads memory afresh).
+/// DIC is left 0 so the guest issues IC after writing code, which the dispatcher
+/// honours by dropping its translations; without that, rewritten code would run
+/// the stale translation.
+const CTR_EL0: u64 = (1 << 28) | (2 << 16) | 2 | (3 << 24);
 /// ID_AA64MMFR0_EL1: PARange 40-bit (2) and all three granules supported —
 /// 4 KiB (TGran4=0), 16 KiB (TGran16=1) and 64 KiB (TGran64=0) — but **without**
 /// the 52-bit (LPA2) variants (TGran4=1 / TGran16=2), which the MMU does not
