@@ -315,7 +315,9 @@ mod tests {
             16 => 1,
             _ => unreachable!(),
         };
-        let tcr = SCTLR_M * 0 | 16 | (tg0 << 14);
+        // TCR for the test map: T0SZ = 16 (a 48-bit input) and this granule's
+        // TG0; the MMU is turned on through SCTLR in `regs`, not here.
+        let tcr = 16 | (tg0 << 14);
         (tcr, tables[0])
     }
 

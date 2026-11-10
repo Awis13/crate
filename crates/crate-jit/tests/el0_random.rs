@@ -674,6 +674,7 @@ struct ExternalRam {
 // SAFETY: the mapping outlives the GuestMemory; guest memory is shared by
 // design and reached only through raw pointers.
 unsafe impl Send for ExternalRam {}
+// SAFETY: as for Send.
 unsafe impl Sync for ExternalRam {}
 // SAFETY: `ptr` is valid for `len` bytes for the block's whole life and page
 // aligned (mmap result).
@@ -705,7 +706,7 @@ fn random_streams_match_the_cpu() {
         init.x[18] = 0;
         // SP: aligned, inside the scratch area so stack adjustments stay sane.
         init.sp = shared.addr() + (STACK_OFF + STACK_LEN * 3 / 4) as u64;
-        init.nzcv = (rng.next() & 0xf000_0000) as u64;
+        init.nzcv = rng.next() & 0xf000_0000;
 
         // Lay the code into guest RAM (so the translated run reads it) and into
         // an executable region (so the child runs it natively).
