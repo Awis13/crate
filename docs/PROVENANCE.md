@@ -29,9 +29,20 @@ device (how Linux drives a PL011, say). It is never copied.
 ## Dependencies
 
 Libraries are used as dependencies, through their published interfaces, and
-listed with their licenses in each crate's `Cargo.toml`. Only licenses that
+listed with their licenses in the workspace `Cargo.toml`. Only licenses that
 combine with MPL-2.0 and with GPL-2.0-or-later are accepted (MIT, BSD,
 Apache-2.0 OR BSD-3-Clause dual licenses, MPL-2.0, ISC, zlib).
+
+Today:
+
+| Dependency | License | For |
+|---|---|---|
+| libc | MIT OR Apache-2.0 | system calls |
+| flate2, miniz_oxide, adler2, crc32fast, simd-adler32, cfg-if | MIT, or MIT among their choices | gzip-compressed kernels |
+| libslirp (system library, linked dynamically) | BSD-3-Clause | user-mode networking |
+
+libslirp in turn links GLib (LGPL-2.1-or-later). Both stay separate dynamic
+libraries, which the LGPL allows; crate's own code does not call GLib.
 
 ## Checking
 

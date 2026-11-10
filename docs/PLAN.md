@@ -60,6 +60,10 @@ Each ends in something that runs.
 | 7 | Ready to publish: device and machine interfaces frozen as v1, documentation, a minimal sample app | the owner decides to open the repository |
 | later | Other guests (macOS) as machines of their own | |
 
+Milestone 1 was reached on 2026-11-10: aTerm's Debian 13 image boots to a root
+prompt under `crate-run` on an M3 in about 1.2 s, with 4 CPUs, its disk, user
+networking, SSH through a port forward, and serial and virtio consoles.
+
 ## How aTerm adopts it
 
 aTerm already chooses an engine at launch. crate becomes another choice beside

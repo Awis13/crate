@@ -10,3 +10,9 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+crate-core.workspace = true
+crate-devices.workspace = true
+crate-host.workspace = true
+flate2.workspace = true

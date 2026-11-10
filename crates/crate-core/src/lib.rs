@@ -5,3 +5,17 @@
 //! The machine model every part of crate shares: guest memory, CPUs, buses and
 //! interrupts, and the traits that machines, devices, CPU backends and host
 //! backends implement. Nothing here knows which guest runs.
+
+pub mod block;
+pub mod board;
+pub mod bus;
+pub mod cpu;
+pub mod error;
+pub mod irq;
+pub mod log;
+pub mod memory;
+pub mod net;
+pub mod psci;
+pub mod run;
+
+pub use error::{Error, Result};

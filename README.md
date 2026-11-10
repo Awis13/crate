@@ -15,7 +15,10 @@ engine never assumes what the app looks like. The first app built on it is
 [aTerm](https://github.com/oneamendez/aterm-ios), a terminal for a local Linux
 machine.
 
-Status: early. Nothing runs yet; see [docs/PLAN.md](docs/PLAN.md).
+Status: early. The `virt` machine boots Debian to a shell on a Mac through
+Apple's Hypervisor framework (milestone 1); the translator does not exist
+yet. See [docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
+[docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
 
@@ -38,18 +41,37 @@ Status: early. Nothing runs yet; see [docs/PLAN.md](docs/PLAN.md).
       crate-core        machine model: guest memory, CPUs, buses, interrupts, traits
       crate-jit         the translator (CPU backend for hosts without a hypervisor)
       crate-hvf         CPU backend on Apple's Hypervisor framework (macOS)
-      crate-devices     interrupt controller, timer, UART, RTC, PCIe, virtio
+      crate-devices     GICv3, UART, RTC, virtio (block, network, console)
       crate-virt        the virt machine: memory map, device tree, Linux boot
       crate-host        executable memory, guest RAM, disks, network, GPU
       crate-ffi         the C API's implementation (libcrate)
     tools/crate-run     command-line runner for development
-    docs/               plan, provenance
+    docs/               plan, design, provenance
 
 ## Building
 
-Needs Rust 1.85 or later.
+Needs Rust 1.85 or later, and libslirp for user-mode networking
+(`brew install libslirp`; another location can be given in `SLIRP_LIB_DIR`).
 
     cargo build
+    cargo test
+
+## Running a guest on a Mac
+
+`crate-run` needs Apple's `com.apple.security.hypervisor` entitlement, so build
+it with the script that signs it (ad hoc), which prints the binary's path:
+
+    tools/crate-run/build.sh
+
+Then, for example, a Debian image with four CPUs, its disk, the network and
+SSH forwarded from port 2230:
+
+    target/debug/crate-run --kernel vmlinuz --initrd initrd.img \
+        --cmdline "console=ttyAMA0 root=/dev/vda rw" \
+        --disk rootfs.img --cpus 4 --memory 2048 --forward 2230:22
+
+The terminal is the guest's serial console; Ctrl-A x stops the machine.
+`crate-run --help` lists the rest.
 
 ## License
 

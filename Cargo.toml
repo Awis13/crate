@@ -10,6 +10,17 @@ license = "MPL-2.0"
 repository = "https://github.com/oneamendez/crate"
 publish = false
 
+# Third-party crates, with their licenses (docs/PROVENANCE.md, "Dependencies").
+[workspace.dependencies]
+libc = "0.2" # MIT OR Apache-2.0
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] } # MIT OR Apache-2.0; miniz_oxide: MIT OR Zlib OR Apache-2.0
+
+crate-core = { path = "crates/crate-core" }
+crate-devices = { path = "crates/crate-devices" }
+crate-host = { path = "crates/crate-host" }
+crate-hvf = { path = "crates/crate-hvf" }
+crate-virt = { path = "crates/crate-virt" }
+
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
