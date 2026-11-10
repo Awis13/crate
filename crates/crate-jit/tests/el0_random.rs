@@ -97,6 +97,7 @@ struct Captured {
     nzcv: u64,
     done: u64,
     sig: u64,
+    v: [[u8; 16]; 32],
 }
 
 /// macOS arm64 machine context, from <mach/arm/_structs.h>, enough to read the
@@ -148,6 +149,7 @@ extern "C" fn on_brk(sig: i32, _info: *mut libc::siginfo_t, ucontext: *mut libc:
         out.sp = ss.sp;
         out.pc = ss.pc;
         out.nzcv = (ss.cpsr as u64) & 0xf000_0000;
+        out.v = (*mc).ns.v;
         out.done = 1;
         out.sig = sig as u64;
         libc::_exit(0);
@@ -289,9 +291,15 @@ fn generate(rng: &mut Rng, count: usize, ram_base: u64) -> Program {
     // x0 = &Captured at entry. Load NZCV and SP first (using x1 as scratch),
     // then x2..x30, then x1, then x0.
     use asm::*;
-    // Offsets into `Captured`: x[31] at 0, sp at 248, pc at 256, nzcv at 264.
+    // Offsets into `Captured`: x[31] at 0, sp 248, pc 256, nzcv 264, done 272,
+    // sig 280, v at 288.
     let nzcv_off = (33 * 8) as u32;
     let sp_off = (31 * 8) as u32;
+    let v_off = 288u32;
+    // Load V0..V31 from init while x0 still holds the pointer.
+    for i in 0..32u32 {
+        tramp.emit(ldr_q(i, 0, v_off + i * 16));
+    }
     tramp.emit(ldr_imm(3, 1, 0, nzcv_off));
     tramp.emit(msr(NZCV, 1));
     tramp.emit(ldr_imm(3, 1, 0, sp_off));
@@ -331,7 +339,7 @@ fn emit_random(rng: &mut Rng, out: &mut Vec<u32>, scratch: u64) {
     let immr = rng.bits(5) & 31;
     let imms = rng.bits(5) & 31;
     let cond = rng.bits(4);
-    match rng.next() % 44 {
+    match rng.next() % 52 {
         0 => out.push(add_reg(sf, rd, rn, rm, arith_shift, amount)),
         1 => out.push(adds_reg(sf, rd, rn, rm, arith_shift, amount)),
         2 => out.push(sub_reg(sf, rd, rn, rm, arith_shift, amount)),
@@ -451,6 +459,29 @@ fn emit_random(rng: &mut Rng, out: &mut Vec<u32>, scratch: u64) {
             out.push(str_reg(size, rng.reg(), base, idx));
             out.push(ldrs64(size, rng.reg(), base)); // signed load to 64 bits
         }
+        40 => out.push(neon3(
+            rng.next() as u32 % 6,
+            vreg(rng),
+            vreg(rng),
+            vreg(rng),
+        )),
+        41 => out.push(fmov_d_x(vreg(rng), rng.reg())),
+        42 => out.push(fmov_x_d(rng.reg(), vreg(rng))),
+        43 => out.push(dup_2d(vreg(rng), rng.reg())),
+        44 => out.push(ins_d1(vreg(rng), rng.reg())),
+        45 => out.push(umov_d0(rng.reg(), vreg(rng))),
+        46 | 47 => {
+            // A SIMD load and store to the data region, exercising vec_access
+            // and the V spill. size picks q/d/s.
+            let base = rng.reg().max(1);
+            let slot = (rng.next() as usize % (DATA_LEN / 16 - 1)) * 16;
+            for w in mov_imm(base, scratch + slot as u64) {
+                out.push(w);
+            }
+            let sz = rng.next() as u32 % 3; // 0 s, 1 d, 2 q
+            out.push(simd_str(sz, vreg(rng), base));
+            out.push(simd_ldr(sz, vreg(rng), base));
+        }
         _ => {
             // An LSE atomic read-modify-write to the data region. Rs and Rt must
             // differ from the base; a 32- or 64-bit op.
@@ -470,6 +501,11 @@ fn emit_random(rng: &mut Rng, out: &mut Vec<u32>, scratch: u64) {
 /// The widest bit index for a bitfield at this register width.
 fn bw(sf: bool) -> u32 {
     if sf { 63 } else { 31 }
+}
+
+/// A random SIMD register 0..31.
+fn vreg(rng: &mut Rng) -> u32 {
+    (rng.next() % 32) as u32
 }
 
 /// A random register not in `avoid` (for writeback bases and paired targets).
@@ -613,6 +649,51 @@ mod extra {
     pub fn ldrs64(size: u32, rt: Reg, rn: Reg) -> u32 {
         size << 30 | 0x3980_0000 | rn << 5 | rt
     }
+    // SIMD loads and stores (unsigned offset 0): q, d or s by `sz` (2, 1, 0).
+    pub fn ldr_q(rt: Reg, rn: Reg, off: u32) -> u32 {
+        0x3dc0_0000 | (off / 16) << 10 | rn << 5 | rt
+    }
+    pub fn simd_ldr(sz: u32, rt: Reg, rn: Reg) -> u32 {
+        match sz {
+            0 => 0xbd40_0000 | rn << 5 | rt, // ldr s
+            1 => 0xfd40_0000 | rn << 5 | rt, // ldr d
+            _ => 0x3dc0_0000 | rn << 5 | rt, // ldr q
+        }
+    }
+    pub fn simd_str(sz: u32, rt: Reg, rn: Reg) -> u32 {
+        match sz {
+            0 => 0xbd00_0000 | rn << 5 | rt, // str s
+            1 => 0xfd00_0000 | rn << 5 | rt, // str d
+            _ => 0x3d80_0000 | rn << 5 | rt, // str q
+        }
+    }
+    /// Integer NEON 3-same on .16b/.4s: ADD, SUB, AND, ORR, EOR, MUL.
+    pub fn neon3(op: u32, vd: Reg, vn: Reg, vm: Reg) -> u32 {
+        let base = match op {
+            0 => 0x4e20_8400, // add .16b
+            1 => 0x6e20_8400, // sub .16b
+            2 => 0x4e20_1c00, // and .16b
+            3 => 0x4ea0_1c00, // orr .16b
+            4 => 0x6e20_1c00, // eor .16b
+            _ => 0x4eb0_9c00, // mul .4s
+        };
+        base | vm << 16 | vn << 5 | vd
+    }
+    pub fn fmov_d_x(vd: Reg, xn: Reg) -> u32 {
+        0x9e67_0000 | xn << 5 | vd
+    }
+    pub fn fmov_x_d(xd: Reg, vn: Reg) -> u32 {
+        0x9e66_0000 | vn << 5 | xd
+    }
+    pub fn dup_2d(vd: Reg, xn: Reg) -> u32 {
+        0x4e08_0c00 | xn << 5 | vd
+    }
+    pub fn ins_d1(vd: Reg, xn: Reg) -> u32 {
+        0x4e18_1c00 | xn << 5 | vd
+    }
+    pub fn umov_d0(xd: Reg, vn: Reg) -> u32 {
+        0x4e08_3c00 | vn << 5 | xd
+    }
     /// An LSE atomic (LDADD/LDCLR/.../SWP). `op` 0..7 picks the operation; `swp`
     /// makes it SWP. Non-acquire, non-release.
     pub fn lse_atomic(size: u32, op: u32, swp: bool, rs: Reg, rt: Reg, rn: Reg) -> u32 {
@@ -639,6 +720,7 @@ fn run_translated(shared: &Shared, prog: &Program, init: &Captured) -> Captured 
     cpu.state.x[..31].copy_from_slice(&init.x);
     cpu.state.sp = init.sp;
     cpu.state.nzcv = init.nzcv;
+    cpu.state.v = init.v;
     cpu.state.pc = prog.guest_pc;
     let mut cache = CodeCache::new(4 << 20).unwrap();
     let stop = cpu.run(&mut cache);
@@ -662,6 +744,7 @@ fn run_translated(shared: &Shared, prog: &Program, init: &Captured) -> Captured 
     out.sp = cpu.state.sp;
     out.pc = cpu.state.pc;
     out.nzcv = cpu.state.nzcv & 0xf000_0000;
+    out.v = cpu.state.v;
     out.done = 1;
     out
 }
@@ -704,6 +787,11 @@ fn random_streams_match_the_cpu() {
             *x = rng.next();
         }
         init.x[18] = 0;
+        for lane in init.v.iter_mut() {
+            for b in lane.iter_mut() {
+                *b = rng.next() as u8;
+            }
+        }
         // SP: aligned, inside the scratch area so stack adjustments stay sane.
         init.sp = shared.addr() + (STACK_OFF + STACK_LEN * 3 / 4) as u64;
         init.nzcv = rng.next() & 0xf000_0000;
@@ -792,6 +880,14 @@ fn report_divergence(
             "  nzcv: native {:#x} jit {:#x}",
             native.nzcv, translated.nzcv
         );
+    }
+    for i in 0..32 {
+        if native.v[i] != translated.v[i] {
+            eprintln!(
+                "  v{i}: native {:02x?} jit {:02x?}",
+                native.v[i], translated.v[i]
+            );
+        }
     }
     if native.pc != translated.pc {
         eprintln!("  pc: native {:#x} jit {:#x}", native.pc, translated.pc);

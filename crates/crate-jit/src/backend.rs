@@ -1162,6 +1162,9 @@ impl Cpu {
                 continue;
             }
             let pc = self.state.pc;
+            if std::env::var_os("CRATE_TRACE_PC").is_some() {
+                crate_core::debug!("block pc={pc:#x} el={}", self.el());
+            }
             let el = self.el();
             let regs = self.state.mmu;
             self.state.dispatch_target = cache.block(pc, &mem, el, &regs);
