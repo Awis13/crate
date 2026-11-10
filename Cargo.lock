@@ -51,6 +51,7 @@ dependencies = [
  "crate-core",
  "crate-devices",
  "crate-host",
+ "libc",
 ]
 
 [[package]]
