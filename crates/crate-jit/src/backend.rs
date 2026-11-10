@@ -226,6 +226,7 @@ impl CodeCache {
             asm: Asm::new(),
             save_stub_rel,
             terminated: false,
+            fetch_faulted: false,
         };
         emit::block_dispatch_prologue(&mut t.asm);
 
@@ -233,10 +234,12 @@ impl CodeCache {
         for _ in 0..limit {
             let word = match read_insn(mem, el, el1_regs, cur) {
                 Ok(w) => w,
-                Err(_) => {
+                Err(f) => {
                     // The fetch itself faulted: end the block with an
-                    // instruction-abort exit.
-                    t.emit_fetch_fault(cur);
+                    // instruction-abort exit, carrying the fault status so a
+                    // demand-paging translation fault is not reported to the
+                    // guest as an unrecoverable external abort.
+                    t.emit_fetch_fault(cur, f.fsc);
                     break;
                 }
             };
@@ -274,7 +277,11 @@ impl CodeCache {
         }
         let off = self.cursor;
         self.put(&words);
-        self.blocks.insert(pc, off);
+        // A block that ended on a fetch fault is run once but never cached, so
+        // the guest's demand-paging retry re-translates the mapped instruction.
+        if !t.fetch_faulted {
+            self.blocks.insert(pc, off);
+        }
         Ok(off)
     }
 
@@ -287,7 +294,7 @@ impl CodeCache {
 fn read_insn(mem: &GuestMemory, el: u32, regs: &MmuRegs, pc: u64) -> Result<u32, mmu::Fault> {
     let t = mmu::translate(mem, regs, el, pc, Access::Execute)?;
     mem.read_u32(t.pa).map_err(|_| mmu::Fault {
-        fsc: 0x10, // a synchronous external abort on the fetch
+        fsc: 0x10, // a synchronous external abort on the fetch missed RAM
         write: false,
     })
 }
@@ -298,6 +305,11 @@ struct Block {
     /// Offset of the save stub relative to the start of this block.
     save_stub_rel: i64,
     terminated: bool,
+    /// The block ended because an instruction fetch faulted, so it must not be
+    /// cached: once the guest handles the abort (demand-paging the code) and
+    /// retries, the dispatcher has to re-translate the now-mapped instruction
+    /// rather than re-run this abort forever.
+    fetch_faulted: bool,
 }
 
 impl Block {
@@ -339,13 +351,16 @@ impl Block {
             );
             return false;
         }
-        let Ok(t) = mmu::translate(mem, regs, el, addr, Access::Read) else {
-            self.emit_fetch_fault(addr);
-            return false;
+        let t = match mmu::translate(mem, regs, el, addr, Access::Read) {
+            Ok(t) => t,
+            Err(f) => {
+                self.emit_fetch_fault(addr, f.fsc);
+                return false;
+            }
         };
         let mut buf = [0u8; 8];
         if mem.read(t.pa, &mut buf[..1 << size]).is_err() {
-            self.emit_fetch_fault(addr);
+            self.emit_fetch_fault(addr, 0x10);
             return false;
         }
         let mut value = u64::from_le_bytes(buf);
@@ -360,15 +375,17 @@ impl Block {
         true
     }
 
-    fn emit_fetch_fault(&mut self, pc: u64) {
+    fn emit_fetch_fault(&mut self, pc: u64, fsc: u8) {
         // An instruction abort: EC 0x21 (from a lower EL) or 0x20; the
-        // dispatcher builds ESR from the kind. Record the faulting PC.
+        // dispatcher builds ESR from the kind. Record the faulting PC and carry
+        // the fault status (IFSC) in the syndrome's low bits.
+        self.fetch_faulted = true;
         self.exit(
             Exit::Exception as u32,
             Next::None,
             ExitInfo {
                 pc: Some(pc),
-                syndrome: Some(FETCH_ABORT),
+                syndrome: Some(FETCH_ABORT | (fsc as u64 & 0x3f)),
                 ..Default::default()
             },
         );
@@ -1606,8 +1623,11 @@ impl Cpu {
             } else {
                 EC_INSN_ABORT_SAME
             };
-            // IFSC 0x10 (external) for a fetch that missed RAM, else the walk's.
-            self.take_exception(ec, 0x10, Some(pc), pc);
+            // The IFSC the fetch recorded: a translation/permission/access fault
+            // so the guest can demand-page or signal, or 0x10 (external) when the
+            // fetch translated but missed RAM. FAR is the faulting PC.
+            let ifsc = syn & 0x3f;
+            self.take_exception(ec, ifsc, Some(pc), pc);
             return;
         }
         if self.state.exception_kind == WATCHPOINT_KIND {
