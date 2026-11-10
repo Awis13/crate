@@ -8,5 +8,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+crate-core.workspace = true
+crate-devices.workspace = true
+crate-host.workspace = true
+
 [lints]
 workspace = true
