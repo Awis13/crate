@@ -126,6 +126,9 @@ pub enum MemKind {
     VecPair,
     /// Exclusive or acquire/release; handled by the helper conservatively.
     Ordered,
+    /// An LSE atomic read-modify-write (LDADD, SWP, ...) or CAS, done by the
+    /// helper as a single-CPU read-modify-write.
+    Atomic,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -548,6 +551,27 @@ fn decode_single(word: u32, v: bool) -> Op {
         (size_field, load, signed, reg64)
     };
     let kind = if v { MemKind::Vec } else { MemKind::Gpr };
+
+    // Atomic memory operations (LSE: LDADD, SWP, ...) and LDAPR share the
+    // register group but set bit 21 with bits 11:10 == 0b00. Hand the whole
+    // word to the helper, which does a single-CPU read-modify-write.
+    if !v && word & (1 << 24) == 0 && word & (1 << 21) != 0 && (word >> 10) & 3 == 0 {
+        return Op::Memory(Mem {
+            word,
+            kind: MemKind::Atomic,
+            size,
+            signed: false,
+            reg64: size == 3,
+            load: true,
+            rn,
+            rt,
+            rt2: (word >> 16) & 31, // Rs
+            offset: 0,
+            writeback: false,
+            pre: true,
+            index_reg: None,
+        });
+    }
 
     // Unsigned immediate: bit 24 set.
     if word & (1 << 24) != 0 {

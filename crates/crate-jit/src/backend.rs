@@ -866,7 +866,58 @@ impl Cpu {
             }
             MemKind::Vec | MemKind::VecPair => self.vec_access(&m, base, el, &regs),
             MemKind::Ordered => self.ordered_access(word, el, &regs),
+            MemKind::Atomic => self.atomic_access(word, el, &regs),
         }
+    }
+
+    /// An LSE atomic (LDADD, LDCLR, LDEOR, LDSET, LDSMAX/MIN, LDUMAX/MIN, SWP)
+    /// or LDAPR, as a single-CPU read-modify-write: the only observer is this
+    /// CPU, so plain accesses with the host's ordering suffice.
+    fn atomic_access(&mut self, word: u32, el: u32, regs: &MmuRegs) -> Result<(), mmu::Fault> {
+        let size = (word >> 30) & 3;
+        let rs = (word >> 16) & 31;
+        let rn = (word >> 5) & 31;
+        let rt = word & 31;
+        let o3 = (word >> 15) & 1;
+        let opc = (word >> 12) & 7;
+        let addr = self.xread(rn);
+        self.state.exception_far = addr;
+        let mask = if size >= 3 {
+            u64::MAX
+        } else {
+            (1u64 << (8 << size)) - 1
+        };
+
+        // LDAPR (an acquiring load, no modify) is o3==1, opc==0b100.
+        if o3 == 1 && opc == 0b100 {
+            let t = mmu::translate(&self.mem, regs, el, addr, Access::Read)?;
+            let old = self.read_phys(t.pa, size)? & mask;
+            self.xwrite_z(rt, old);
+            return Ok(());
+        }
+        let t = mmu::translate(&self.mem, regs, el, addr, Access::Write)?;
+        let old = self.read_phys(t.pa, size)?;
+        let rs_val = self.xread_z(rs);
+        let new = if o3 == 1 {
+            rs_val // SWP
+        } else {
+            match opc {
+                0b000 => old.wrapping_add(rs_val),                // LDADD
+                0b001 => old & !rs_val,                           // LDCLR
+                0b010 => old ^ rs_val,                            // LDEOR
+                0b011 => old | rs_val,                            // LDSET
+                0b100 => signed_minmax(old, rs_val, size, true),  // LDSMAX
+                0b101 => signed_minmax(old, rs_val, size, false), // LDSMIN
+                0b110 => (old & mask).max(rs_val & mask),         // LDUMAX
+                0b111 => (old & mask).min(rs_val & mask),         // LDUMIN
+                _ => unreachable!(),
+            }
+        };
+        self.write_phys(t.pa, size, new & mask)?;
+        // The return register gets the old value; Rt 31 is a store-form with no
+        // return (ST<op>).
+        self.xwrite_z(rt, old & mask);
+        Ok(())
     }
 
     fn effective_address(&self, m: &Mem, base: u64) -> u64 {
@@ -1685,6 +1736,15 @@ mod sr {
 fn sign_extend(value: u64, bits: u32) -> u64 {
     let shift = 64 - bits;
     (((value << shift) as i64) >> shift) as u64
+}
+
+/// The signed maximum or minimum of two values at a given access size, for the
+/// LDSMAX/LDSMIN atomics.
+fn signed_minmax(a: u64, b: u64, size: u32, max: bool) -> u64 {
+    let bits = 8 << size;
+    let sa = sign_extend(a, bits) as i64;
+    let sb = sign_extend(b, bits) as i64;
+    (if max { sa.max(sb) } else { sa.min(sb) }) as u64
 }
 
 /// Applies an extend-and-shift (the option field of an extended register) to a

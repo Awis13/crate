@@ -331,7 +331,7 @@ fn emit_random(rng: &mut Rng, out: &mut Vec<u32>, scratch: u64) {
     let immr = rng.bits(5) & 31;
     let imms = rng.bits(5) & 31;
     let cond = rng.bits(4);
-    match rng.next() % 40 {
+    match rng.next() % 44 {
         0 => out.push(add_reg(sf, rd, rn, rm, arith_shift, amount)),
         1 => out.push(adds_reg(sf, rd, rn, rm, arith_shift, amount)),
         2 => out.push(sub_reg(sf, rd, rn, rm, arith_shift, amount)),
@@ -437,7 +437,7 @@ fn emit_random(rng: &mut Rng, out: &mut Vec<u32>, scratch: u64) {
             let t2 = reg_not(rng, &[base, t1]);
             out.push(ldp(t1, t2, base, 16));
         }
-        _ => {
+        39 => {
             // A signed byte/half load and a register-offset access at a zero
             // index, covering sign-extension and the indexed addressing mode.
             let base = rng.reg().max(1);
@@ -450,6 +450,19 @@ fn emit_random(rng: &mut Rng, out: &mut Vec<u32>, scratch: u64) {
             let size = (rng.bits(2)).min(2); // signed loads are byte/half/word
             out.push(str_reg(size, rng.reg(), base, idx));
             out.push(ldrs64(size, rng.reg(), base)); // signed load to 64 bits
+        }
+        _ => {
+            // An LSE atomic read-modify-write to the data region. Rs and Rt must
+            // differ from the base; a 32- or 64-bit op.
+            let base = rng.reg().max(1);
+            let slot = (rng.next() as usize % (DATA_LEN / 8 - 1)) * 8;
+            for w in mov_imm(base, scratch + slot as u64) {
+                out.push(w);
+            }
+            let rs = reg_not(rng, &[base]);
+            let rt = reg_not(rng, &[base]);
+            let size = 2 + rng.bits(1); // 4 or 8 bytes
+            out.push(lse_atomic(size, rng.bits(3), rng.bool(), rs, rt, base));
         }
     }
 }
@@ -599,6 +612,17 @@ mod extra {
     /// A signed load to a 64-bit register (unsigned offset 0), size 0..2.
     pub fn ldrs64(size: u32, rt: Reg, rn: Reg) -> u32 {
         size << 30 | 0x3980_0000 | rn << 5 | rt
+    }
+    /// An LSE atomic (LDADD/LDCLR/.../SWP). `op` 0..7 picks the operation; `swp`
+    /// makes it SWP. Non-acquire, non-release.
+    pub fn lse_atomic(size: u32, op: u32, swp: bool, rs: Reg, rt: Reg, rn: Reg) -> u32 {
+        if swp {
+            // SWP: 00 111000 0 01 1 Rs 1 00000 Rn Rt  (o3=1, opc=000 base 0x20_8000)
+            size << 30 | 0x3820_8000 | rs << 16 | rn << 5 | rt
+        } else {
+            // LD<op>: 00 111000 0 01 1 Rs 0 ooo 00 Rn Rt  (opc in bits 14:12)
+            size << 30 | 0x3820_0000 | rs << 16 | (op & 7) << 12 | rn << 5 | rt
+        }
     }
 }
 use extra::*;
