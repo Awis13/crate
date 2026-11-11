@@ -82,8 +82,11 @@ pub fn call_kind_code(kind: CallKind) -> u32 {
     }
 }
 
-/// A load or store's out-of-line call into the slow path.
+/// A load or store's out-of-line call into the slow path, in the cold
+/// section; the fast path branches to it through `tramp`, a branch after the
+/// block's code (a conditional branch reaches only 1 MiB).
 struct SlowSite {
+    tramp: Label,
     label: Label,
     resume: Label,
     word: u32,
@@ -315,8 +318,8 @@ pub struct Block {
     pub fetch_faulted: bool,
     slow: Vec<SlowSite>,
     /// The slow-path literals (the instruction word, and its offset in the
-    /// page), placed after the code.
-    literals: Vec<(Label, u32, u64)>,
+    /// page), placed after the code of the section that uses them.
+    literals: Vec<(Label, u32, u64, bool)>,
     cache: RegCache,
     /// For each instruction of the block, from what follows it: the registers
     /// named again, and the ones written whole before they are next read.
@@ -633,6 +636,20 @@ impl Block {
         self.cache.borrowed = 0;
     }
 
+    /// One of X15..X17 not in `avoid`, free for a short sequence (stored
+    /// first if the block changed it), or None if the instruction names all
+    /// three.
+    fn temp(&mut self, avoid: u32) -> Option<Reg> {
+        let r = [16, 17, 15].into_iter().find(|&r| avoid & 1 << r == 0)?;
+        let bit = 1 << r;
+        if self.cache.dirty & bit != 0 {
+            self.asm.emit(str_imm(3, r, SP, offsets::x(r)));
+        }
+        self.cache.loaded &= !bit;
+        self.cache.dirty &= !bit;
+        Some(r)
+    }
+
     /// Three host registers for a fast path to compute with, none of them in
     /// `avoid` (which needs not name X18, X30 or SP): X16, X17 and X15 when
     /// free (a dirty one is stored first), then registers the block already
@@ -702,18 +719,14 @@ impl Block {
         match rd {
             31 => {}
             18 => {
-                let v = Self::victim(&[]);
-                let t = Self::victim(&[v]);
-                self.asm.emit(stp(v, t, SP, offsets::scratch(0) as i32));
+                let v = self.temp(0).unwrap();
+                let t = self.temp(1 << v).unwrap();
                 emit::guest_va(&mut self.asm, v, va, page, t);
                 self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
-                self.asm.emit(ldp(v, t, SP, offsets::scratch(0) as i32));
             }
             r if far => {
-                let t = Self::victim(&[r]);
-                self.asm.emit(str_imm(3, t, SP, offsets::scratch(0)));
+                let t = self.temp(1 << r).unwrap();
                 emit::guest_va(&mut self.asm, r, va, page, t);
-                self.asm.emit(ldr_imm(3, t, SP, offsets::scratch(0)));
             }
             r => emit::guest_va(&mut self.asm, r, va, page, 31),
         }
@@ -723,11 +736,9 @@ impl Block {
     fn set_reg_const(&mut self, rd: u32, value: u64) {
         self.need(rd, false, true);
         if rd == 18 {
-            let v = Self::victim(&[]);
-            self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
+            let v = self.temp(0).unwrap();
             self.asm.mov_imm(v, value);
             self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
-            self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
         } else if rd != 31 {
             self.asm.mov_imm(rd, value);
         }
@@ -762,8 +773,12 @@ impl Block {
         for (i, &p) in cands.iter().enumerate() {
             avoid[i] = (word >> p) & 0x1f;
         }
-        let v = Self::victim(&avoid[..cands.len()]);
-        self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
+        let named = avoid[..cands.len()].iter().fold(0u32, |m, &r| m | 1 << r);
+        let free = self.temp(named);
+        let v = free.unwrap_or_else(|| Self::victim(&avoid[..cands.len()]));
+        if free.is_none() {
+            self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
+        }
         self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
         let mut w = word;
         let mut writes_x18 = false;
@@ -777,7 +792,9 @@ impl Block {
         if writes_x18 {
             self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
         }
-        self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+        if free.is_none() {
+            self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -794,53 +811,58 @@ impl Block {
         let discard = rd == 31 && set_flags;
         self.need(rn, true, false);
         self.need(rd, false, true);
-        let v = Self::victim(&[rd, rn]);
-        self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
-        // Load the source (SP and X18 both live in the state block, not a host
-        // register).
-        if rn == 31 {
-            self.asm.emit(ldr_imm(3, v, SP, offsets::SP));
-        } else if rn == 18 {
-            self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
+        // Compute in Rd when it is a general register, else in a free one of
+        // X15..X17. SP and X18 live in the state.
+        let real = |r: u32| r != 31 && r != 18;
+        let t = if real(rd) {
+            rd
         } else {
-            self.asm.emit(mov(v, rn));
-        }
-        // Compute into v, setting host flags when asked.
-        let op = match (sub, set_flags) {
-            (false, false) => add_imm(sf, v, v, imm12, shift12),
-            (true, false) => sub_imm(sf, v, v, imm12, shift12),
-            (false, true) => adds_imm(sf, v, v, imm12, shift12),
-            (true, true) => subs_imm(sf, v, v, imm12, shift12),
+            self.temp(1 << rn).unwrap()
         };
-        self.asm.emit(op);
-        if !discard {
-            if rd == 31 {
-                self.asm.emit(str_imm(3, v, SP, offsets::SP));
-            } else if rd == 18 {
-                self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
-            } else {
-                self.asm.emit(mov(rd, v));
+        let src = match rn {
+            31 | 18 => {
+                let slot = if rn == 31 {
+                    offsets::SP
+                } else {
+                    offsets::x(18)
+                };
+                self.asm.emit(ldr_imm(3, t, SP, slot));
+                t
             }
+            r => r,
+        };
+        if imm12 != 0 || set_flags || src != t {
+            self.asm.emit(match (sub, set_flags) {
+                (false, false) => add_imm(sf, t, src, imm12, shift12),
+                (true, false) => sub_imm(sf, t, src, imm12, shift12),
+                (false, true) => adds_imm(sf, t, src, imm12, shift12),
+                (true, true) => subs_imm(sf, t, src, imm12, shift12),
+            });
         }
-        self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+        if !discard && !real(rd) {
+            let slot = if rd == 31 {
+                offsets::SP
+            } else {
+                offsets::x(18)
+            };
+            self.asm.emit(str_imm(3, t, SP, slot));
+        }
     }
 
     /// AND, ORR or EOR (immediate) into the guest's SP: the same instruction
-    /// into a borrowed register, stored to the state's SP. A 32-bit form's
+    /// into a free register, stored to the state's SP. A 32-bit form's
     /// result is zero-extended, as a write of WSP is.
     fn emit_logical_sp(&mut self, word: u32) {
         let rn = (word >> 5) & 31;
         self.need(rn, true, false);
-        let v = Self::victim(&[rn]);
-        self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
-        let mut w = (word & !31) | v;
+        let t = self.temp(1 << rn).unwrap();
+        let mut w = (word & !31) | t;
         if rn == 18 {
-            self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
-            w = (w & !(31 << 5)) | (v << 5);
+            self.asm.emit(ldr_imm(3, t, SP, offsets::x(18)));
+            w = (w & !(31 << 5)) | (t << 5);
         }
         self.asm.emit(w);
-        self.asm.emit(str_imm(3, v, SP, offsets::SP));
-        self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+        self.asm.emit(str_imm(3, t, SP, offsets::SP));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -859,44 +881,44 @@ impl Block {
         self.need(rn, true, false);
         self.need(rm, true, false);
         self.need(rd, false, true);
-        let v = Self::victim(&[rd, rn, rm]);
-        let vm = Self::victim(&[rd, rn, rm, v]);
-        self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
-        self.asm.emit(str_imm(3, vm, SP, offsets::SCRATCH + 8));
-        if rn == 31 {
-            self.asm.emit(ldr_imm(3, v, SP, offsets::SP));
-        } else if rn == 18 {
-            self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
-        } else {
-            self.asm.emit(mov(v, rn));
-        }
-        // rm is never SP (register 31 there is the zero register), but may be X18.
-        if rm == 31 {
-            self.asm.emit(movz(true, vm, 0, 0));
-        } else if rm == 18 {
-            self.asm.emit(ldr_imm(3, vm, SP, offsets::x(18)));
-        } else {
-            self.asm.emit(mov(vm, rm));
-        }
-        let op = match (sub, set_flags) {
-            (false, false) => add_ext(v, v, vm, option, amount),
-            (true, false) => sub_ext(v, v, vm, option, amount),
-            (false, true) => adds_ext(v, v, vm, option, amount),
-            (true, true) => subs_ext(v, v, vm, option, amount),
+        // One of Rd and Rn is SP, so at least one of X15..X17 is free.
+        let mask = |r: u32| if r < 31 { 1u32 << r } else { 0 };
+        let t = self.temp(mask(rd) | mask(rn) | mask(rm)).unwrap();
+        let src = match rn {
+            31 => {
+                self.asm.emit(ldr_imm(3, t, SP, offsets::SP));
+                t
+            }
+            18 => {
+                self.asm.emit(ldr_imm(3, t, SP, offsets::x(18)));
+                t
+            }
+            r => r,
         };
+        // Rm is never SP (register 31 there is the zero register), but may be
+        // X18; then a second one of X15..X17 is free, since Rd or Rn is SP.
+        let m = if rm == 18 {
+            let u = self.temp(mask(rd) | mask(rn) | 1 << t).unwrap();
+            self.asm.emit(ldr_imm(3, u, SP, offsets::x(18)));
+            u
+        } else {
+            rm
+        };
+        let dst = if rd != 31 && rd != 18 { rd } else { t };
         let _ = sf; // extended-register add/sub here is always 64-bit (SP form)
-        self.asm.emit(op);
+        self.asm.emit(match (sub, set_flags) {
+            (false, false) => add_ext(dst, src, m, option, amount),
+            (true, false) => sub_ext(dst, src, m, option, amount),
+            (false, true) => adds_ext(dst, src, m, option, amount),
+            (true, true) => subs_ext(dst, src, m, option, amount),
+        });
         if !discard {
-            if rd == 31 {
-                self.asm.emit(str_imm(3, v, SP, offsets::SP));
-            } else if rd == 18 {
-                self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
-            } else {
-                self.asm.emit(mov(rd, v));
+            match rd {
+                31 => self.asm.emit(str_imm(3, t, SP, offsets::SP)),
+                18 => self.asm.emit(str_imm(3, t, SP, offsets::x(18))),
+                _ => {}
             }
         }
-        self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
-        self.asm.emit(ldr_imm(3, vm, SP, offsets::SCRATCH + 8));
     }
 
     // ------------------------------------------------------------ memory
@@ -1009,13 +1031,14 @@ impl Block {
         }
         let [a, b, c] = self.scratch(ops.mask());
         let cache = self.cache;
+        let tramp = self.asm.label();
         let slow = self.asm.label();
         let resume = self.asm.label();
 
         let va = self.emit_va(&m, literal, a, c);
         if m.align > 1 {
             self.asm.emit(and_imm(true, c, va, (m.align - 1) as u64));
-            self.asm.cbnz(true, c, slow);
+            self.asm.cbnz(true, c, tramp);
         }
         let el = if m.unprivileged { 0 } else { self.ctx.el };
         let kind = if m.load
@@ -1028,32 +1051,25 @@ impl Block {
             TlbKind::Store
         };
         let crosses = m.total > 1 && m.align < m.total;
-        self.emit_tlb_check(m.total, crosses, tlb_index(el, kind), va, b, c, slow);
-        // The host address of the base: the delta plus the base register's
-        // value, so the access keeps its own offset and addressing mode.
-        let va_is_base = literal.is_some() || (m.index_reg.is_none() && !(m.pre && m.offset != 0));
-        match m.rn {
-            r if r != 31 && r != 18 && literal.is_none() => {
-                self.asm.emit(add_reg(true, b, b, r, LSL, 0));
-            }
-            _ if va_is_base => self.asm.emit(add_reg(true, b, b, va, LSL, 0)),
-            r => {
-                let slot = if r == 31 { offsets::SP } else { offsets::x(18) };
-                self.asm.emit(ldr_imm(3, c, SP, slot));
-                self.asm.emit(add_reg(true, b, b, c, LSL, 0));
-            }
-        }
-        // `a` holds the address only while an exclusive still needs it.
-        let free = if va == a && matches!(m.kind, MemKind::LoadExclusive | MemKind::StoreExclusive)
+        self.emit_tlb_check(m.total, crosses, tlb_index(el, kind), va, b, c, tramp);
+        // The host address of the access; the host does it at that address
+        // with no offset.
+        self.asm.emit(add_reg(true, b, b, va, LSL, 0));
+        // `a` is free unless it holds the address an exclusive still needs or
+        // a writeback starts from.
+        let free = if va == a
+            && (matches!(m.kind, MemKind::LoadExclusive | MemKind::StoreExclusive)
+                || (m.writeback && (m.rn == 31 || m.rn == 18)))
         {
             None
         } else {
             Some(a)
         };
-        self.emit_access(&m, literal.is_some(), va, b, c, free);
-        self.emit_writeback(&m, a, c);
+        self.emit_access(&m, va, b, c, free);
+        self.emit_writeback(&m, va, c, free);
         self.asm.bind(resume);
         self.slow.push(SlowSite {
+            tramp,
             label: slow,
             resume,
             word,
@@ -1131,53 +1147,33 @@ impl Block {
         self.asm.cbnz(true, c, slow);
     }
 
-    /// The access itself, at the host address of the base in `b` (the host
-    /// runs the guest's instruction with its base replaced). `c`, and `free`
-    /// when there is one, are scratch for X18 data or index registers.
-    fn emit_access(&mut self, m: &Mem, literal: bool, va: Reg, b: Reg, c: Reg, free: Option<Reg>) {
-        let with_base = |w: u32| (w & !(0x1f << 5)) | b << 5;
+    /// The access itself, at the host address in `b`: the guest's own
+    /// instruction with that as its base and no offset (the writeback is done
+    /// apart). `c` is scratch for X18 data, and `free`, when there is one, for
+    /// a store-exclusive.
+    fn emit_access(&mut self, m: &Mem, va: Reg, b: Reg, c: Reg, free: Option<Reg>) {
         match m.kind {
             MemKind::Gpr | MemKind::Vec | MemKind::Pair | MemKind::VecPair => {
                 let gpr = matches!(m.kind, MemKind::Gpr | MemKind::Pair);
                 let pair = matches!(m.kind, MemKind::Pair | MemKind::VecPair);
-                let mut w = if literal {
-                    // LDR (immediate, unsigned offset) of the same size at [b].
-                    (m.word & 0xc4c0_0000) | 0x3900_0000 | b << 5 | m.rt
+                // Guest X18 as data goes through `c` (both of a pair's
+                // registers, if both are X18: they are the same value).
+                let x18 = (gpr && m.rt == 18) || (gpr && pair && m.rt2 == 18);
+                let sub = |r: u32| if gpr && r == 18 { c } else { r };
+                let (rt, rt2) = (sub(m.rt), sub(m.rt2));
+                let w = if pair {
+                    // LDP/STP (signed offset) of the same kind, at [b].
+                    (m.word & 0xc440_0000) | 0x2900_0000 | rt2 << 10 | b << 5 | rt
                 } else {
-                    with_base(m.word)
+                    // LDUR/STUR of the same size and kind, at [b].
+                    (m.word & 0xc4c0_0000) | 0x3800_0000 | b << 5 | rt
                 };
-                if let Some((18, _, _)) = m.index_reg {
+                if x18 && !m.load {
                     self.asm.emit(ldr_imm(3, c, SP, offsets::x(18)));
-                    w = (w & !(0x1f << 16)) | c << 16;
-                }
-                // Guest X18 as data goes through a scratch register: `c`
-                // for Rt (which already holds X18 if the index was X18 too),
-                // the other for Rt2.
-                let rt18 = gpr && m.rt == 18;
-                let rt2_18 = gpr && pair && m.rt2 == 18;
-                let other = free.expect("a second scratch register");
-                if rt18 {
-                    w = (w & !0x1f) | c;
-                }
-                if rt2_18 {
-                    w = (w & !(0x1f << 10)) | other << 10;
-                }
-                if !m.load {
-                    if rt18 {
-                        self.asm.emit(ldr_imm(3, c, SP, offsets::x(18)));
-                    }
-                    if rt2_18 {
-                        self.asm.emit(ldr_imm(3, other, SP, offsets::x(18)));
-                    }
                 }
                 self.asm.emit(w);
-                if m.load {
-                    if rt18 {
-                        self.asm.emit(str_imm(3, c, SP, offsets::x(18)));
-                    }
-                    if rt2_18 {
-                        self.asm.emit(str_imm(3, other, SP, offsets::x(18)));
-                    }
+                if x18 && m.load {
+                    self.asm.emit(str_imm(3, c, SP, offsets::x(18)));
                 }
             }
             MemKind::VecStruct => {
@@ -1233,41 +1229,49 @@ impl Block {
             }
             MemKind::Cas | MemKind::CasPair | MemKind::Atomic => {
                 // The host's own instruction on the host address.
-                self.asm.emit(with_base(m.word));
+                self.asm.emit((m.word & !(0x1f << 5)) | b << 5);
             }
         }
     }
 
     /// The base register's update of a pre- or post-indexed access: the base
-    /// plus the offset or the register (pre-indexed, that is the address).
-    /// `a` and `c` are free.
-    fn emit_writeback(&mut self, m: &Mem, a: Reg, c: Reg) {
+    /// plus the offset or the register (pre-indexed, that is the address). For
+    /// SP and X18 it starts from `va`, which `emit_memory_with` keeps for it
+    /// (the address, or the base itself when post-indexed); `c` and `free`
+    /// are scratch.
+    fn emit_writeback(&mut self, m: &Mem, va: Reg, c: Reg, free: Option<Reg>) {
         if !m.writeback {
             return;
         }
         let slot = match m.rn {
-            31 => Some(offsets::SP),
-            18 => Some(offsets::x(18)),
-            _ => None,
-        };
-        let target = match slot {
-            Some(off) => {
-                self.asm.emit(ldr_imm(3, c, SP, off));
-                c
+            31 => offsets::SP,
+            18 => offsets::x(18),
+            rn => {
+                match m.wb_reg {
+                    Some(18) => {
+                        self.asm.emit(ldr_imm(3, c, SP, offsets::x(18)));
+                        self.asm.emit(add_reg(true, rn, rn, c, LSL, 0));
+                    }
+                    Some(rm) => self.asm.emit(add_reg(true, rn, rn, rm, LSL, 0)),
+                    None => self.asm.emit_all(add_const(rn, rn, m.offset, c)),
+                }
+                return;
             }
-            None => m.rn,
         };
+        if m.pre {
+            self.asm.emit(str_imm(3, va, SP, slot));
+            return;
+        }
+        let tmp = free.unwrap_or(c);
         match m.wb_reg {
             Some(18) => {
-                self.asm.emit(ldr_imm(3, a, SP, offsets::x(18)));
-                self.asm.emit(add_reg(true, target, target, a, LSL, 0));
+                self.asm.emit(ldr_imm(3, c, SP, offsets::x(18)));
+                self.asm.emit(add_reg(true, c, va, c, LSL, 0));
             }
-            Some(rm) => self.asm.emit(add_reg(true, target, target, rm, LSL, 0)),
-            None => self.asm.emit_all(add_const(target, target, m.offset, a)),
+            Some(rm) => self.asm.emit(add_reg(true, c, va, rm, LSL, 0)),
+            None => self.asm.emit_all(add_const(c, va, m.offset, tmp)),
         }
-        if let Some(off) = slot {
-            self.asm.emit(str_imm(3, c, SP, off));
-        }
+        self.asm.emit(str_imm(3, c, SP, slot));
     }
 
     fn emit_dc_zva(&mut self, word: u32, rt: u32, pc: u64) {
@@ -1283,6 +1287,7 @@ impl Block {
         let avoid = if rt < 31 { 1 << rt } else { 0 };
         let [a, b, c] = self.scratch(avoid);
         let cache = self.cache;
+        let tramp = self.asm.label();
         let slow = self.asm.label();
         let resume = self.asm.label();
         match rt {
@@ -1295,13 +1300,14 @@ impl Block {
         }
         // A 64-byte aligned block never crosses a page.
         let tlb = tlb_index(self.ctx.el, TlbKind::Store);
-        self.emit_tlb_check(64, false, tlb, a, b, c, slow);
+        self.emit_tlb_check(64, false, tlb, a, b, c, tramp);
         self.asm.emit(add_reg(true, b, b, a, LSL, 0));
         for off in [0, 16, 32, 48] {
             self.asm.emit(stp(XZR, XZR, b, off));
         }
         self.asm.bind(resume);
         self.slow.push(SlowSite {
+            tramp,
             label: slow,
             resume,
             word,
@@ -1322,8 +1328,8 @@ impl Block {
         }
         self.asm.emit(str_imm(3, 30, SP, offsets::x(30)));
         let literal = self.asm.label();
-        self.literals
-            .push((literal, word, pc.wrapping_sub(self.page << 12)));
+        let off = pc.wrapping_sub(self.page << 12);
+        self.literals.push((literal, word, off, self.asm.is_cold()));
         self.asm.adr(17, literal);
         self.asm.bl_abs(self.ctx.stubs.mem);
         for &r in regs {
@@ -1337,10 +1343,17 @@ impl Block {
         self.cache.loaded = 0;
     }
 
-    /// The out-of-line slow paths of the block's fast loads and stores, after
-    /// its code, then the literals of every slow-path call.
+    /// The out-of-line slow paths of the block's fast loads and stores, in
+    /// the cold section, reached through branches after the block's code;
+    /// then the literals of every slow-path call, in the section of the call.
     fn emit_slow_sites(&mut self) {
-        for site in std::mem::take(&mut self.slow) {
+        let sites = std::mem::take(&mut self.slow);
+        for site in &sites {
+            self.asm.bind(site.tramp);
+            self.asm.b(site.label);
+        }
+        self.asm.set_cold(true);
+        for site in sites {
             self.asm.bind(site.label);
             emit_sync(&mut self.asm, site.cache);
             self.emit_slow_call(site.word, site.pc, site.regs.as_slice());
@@ -1355,10 +1368,14 @@ impl Block {
             });
             self.asm.b(site.resume);
         }
-        for (label, word, off) in std::mem::take(&mut self.literals) {
-            self.asm.bind(label);
-            self.asm.emit_all([word, 0, off as u32, (off >> 32) as u32]);
+        for cold in [true, false] {
+            self.asm.set_cold(cold);
+            for &(label, word, off, _) in self.literals.iter().filter(|l| l.3 == cold) {
+                self.asm.bind(label);
+                self.asm.emit_all([word, 0, off as u32, (off >> 32) as u32]);
+            }
         }
+        self.literals.clear();
     }
 
     // ------------------------------------------------------------ branches
@@ -1407,38 +1424,33 @@ impl Block {
         if target >> 12 == self.page && target & 3 == 0 {
             // Same page: a branch the dispatcher can patch to the target block.
             let exit = self.asm.label();
+            let site = self.asm.label();
             if target <= pc {
                 // Backward: a chained loop must still let the CPU leave.
                 let kicked = self.asm.label();
                 self.asm.emit(ldr_imm(2, 16, SP, offsets::EXIT_REQUEST));
                 self.asm.cbnz(false, 16, kicked);
-                let site = self.asm.label();
                 self.asm.bind(site);
                 self.asm.b(exit);
                 self.asm.bind(kicked);
-                self.asm.bind(exit);
-                self.exit(
-                    Exit::Branch as u32,
-                    Next::Const(target),
-                    ExitInfo {
-                        chain_site: Some(site),
-                        ..Default::default()
-                    },
-                );
+                self.asm.b(exit);
             } else {
-                let site = self.asm.label();
                 self.asm.bind(site);
                 self.asm.b(exit);
-                self.asm.bind(exit);
-                self.exit(
-                    Exit::Branch as u32,
-                    Next::Const(target),
-                    ExitInfo {
-                        chain_site: Some(site),
-                        ..Default::default()
-                    },
-                );
             }
+            // The exit runs until the site is patched: it goes in the cold
+            // section.
+            self.asm.set_cold(true);
+            self.asm.bind(exit);
+            self.exit(
+                Exit::Branch as u32,
+                Next::Const(target),
+                ExitInfo {
+                    chain_site: Some(site),
+                    ..Default::default()
+                },
+            );
+            self.asm.set_cold(false);
             return;
         }
         // Another page: through the jump cache.

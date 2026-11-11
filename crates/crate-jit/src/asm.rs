@@ -463,22 +463,45 @@ enum Fixup {
     Adr,
 }
 
-/// A block of host code being put together. Offsets are in bytes from the
-/// block's start; targets outside the block are absolute addresses where the
-/// code will run, resolved once that address is known.
+/// A block of host code being put together, in two sections: the code that
+/// runs, and cold code (slow paths, exits taken once) that a code cache may
+/// place elsewhere, away from the code that runs. Offsets are in bytes from
+/// the start of their section; targets outside the block are absolute
+/// addresses where the code will run, resolved once that address is known.
+/// Only B and BL may cross from one section to the other.
 #[derive(Default)]
 pub struct Asm {
     pub words: Vec<u32>,
-    labels: Vec<Option<u32>>,
-    fixups: Vec<(u32, Fixup, Label)>,
-    external: Vec<(u32, Fixup, u64)>,
-    literals: Vec<(Label, Vec<u64>)>,
+    cold: Vec<u32>,
+    in_cold: bool,
+    labels: Vec<Option<(bool, u32)>>,
+    fixups: Vec<(bool, u32, Fixup, Label)>,
+    external: Vec<(bool, u32, Fixup, u64)>,
+    /// 64-bit words placed after the code of their section.
+    literals: Vec<(bool, Label, Literal)>,
+}
+
+enum Literal {
+    Values(Vec<u64>),
+    /// The absolute address of a label.
+    Address(Label),
+}
+
+impl Literal {
+    fn len(&self) -> usize {
+        match self {
+            Literal::Values(v) => v.len(),
+            Literal::Address(_) => 1,
+        }
+    }
 }
 
 impl Asm {
     pub fn new() -> Self {
         Asm {
             words: Vec::with_capacity(4096),
+            cold: Vec::new(),
+            in_cold: false,
             labels: Vec::with_capacity(256),
             fixups: Vec::with_capacity(256),
             external: Vec::with_capacity(64),
@@ -486,24 +509,64 @@ impl Asm {
         }
     }
 
-    /// The offset of the next instruction.
-    /// The most bytes `finish` can make of this code: its words, an
-    /// alignment word and the literals.
-    pub fn size_bound(&self) -> usize {
-        let literals: usize = self.literals.iter().map(|(_, v)| v.len() * 8).sum();
-        (self.words.len() + 1) * 4 + literals
+    fn literal_bytes(&self, cold: bool) -> usize {
+        let words: usize = self
+            .literals
+            .iter()
+            .filter(|l| l.0 == cold)
+            .map(|l| l.2.len())
+            .sum();
+        words * 8
     }
 
+    /// The most bytes `finish` can make of the code section: its words, an
+    /// alignment word and the literals.
+    pub fn size_bound(&self) -> usize {
+        (self.words.len() + 1) * 4 + self.literal_bytes(false)
+    }
+
+    /// The most bytes `finish_split` can make of the cold section.
+    pub fn cold_size(&self) -> usize {
+        if self.cold.is_empty() && self.literal_bytes(true) == 0 {
+            return 0;
+        }
+        (self.cold.len() + 1) * 4 + self.literal_bytes(true)
+    }
+
+    /// Makes what is emitted next go to the cold section (or back).
+    pub fn set_cold(&mut self, cold: bool) {
+        self.in_cold = cold;
+    }
+
+    pub fn is_cold(&self) -> bool {
+        self.in_cold
+    }
+
+    fn section(&mut self) -> &mut Vec<u32> {
+        if self.in_cold {
+            &mut self.cold
+        } else {
+            &mut self.words
+        }
+    }
+
+    /// The offset of the next instruction in the current section.
     pub fn here(&self) -> u32 {
-        (self.words.len() * 4) as u32
+        (if self.in_cold {
+            &self.cold
+        } else {
+            &self.words
+        }
+        .len()
+            * 4) as u32
     }
 
     pub fn emit(&mut self, word: u32) {
-        self.words.push(word);
+        self.section().push(word);
     }
 
     pub fn emit_all(&mut self, words: impl IntoIterator<Item = u32>) {
-        self.words.extend(words);
+        self.section().extend(words);
     }
 
     pub fn label(&mut self) -> Label {
@@ -513,19 +576,23 @@ impl Asm {
 
     pub fn bind(&mut self, label: Label) {
         assert!(self.labels[label.0 as usize].is_none(), "label bound twice");
-        self.labels[label.0 as usize] = Some(self.here());
+        self.labels[label.0 as usize] = Some((self.in_cold, self.here()));
     }
 
     pub fn is_bound(&self, label: Label) -> bool {
         self.labels[label.0 as usize].is_some()
     }
 
+    /// A label's offset in the code section.
     pub fn offset_of(&self, label: Label) -> u32 {
-        self.labels[label.0 as usize].expect("label not bound")
+        match self.labels[label.0 as usize].expect("label not bound") {
+            (false, off) => off,
+            (true, _) => panic!("label in the cold section"),
+        }
     }
 
     fn emit_fixup(&mut self, word: u32, kind: Fixup, label: Label) {
-        self.fixups.push((self.here(), kind, label));
+        self.fixups.push((self.in_cold, self.here(), kind, label));
         self.emit(word);
     }
 
@@ -577,20 +644,32 @@ impl Asm {
 
     /// B or BL to an absolute address where code runs.
     pub fn b_abs(&mut self, target: u64) {
-        self.external.push((self.here(), Fixup::Branch26, target));
+        self.external
+            .push((self.in_cold, self.here(), Fixup::Branch26, target));
         self.emit(0x1400_0000);
     }
 
     pub fn bl_abs(&mut self, target: u64) {
-        self.external.push((self.here(), Fixup::Branch26, target));
+        self.external
+            .push((self.in_cold, self.here(), Fixup::Branch26, target));
         self.emit(0x9400_0000);
     }
 
-    /// 64-bit words placed after the code, 8-byte aligned; the label marks
-    /// the first.
+    /// 64-bit words placed after the code of the current section, 8-byte
+    /// aligned; the label marks the first.
     pub fn literal(&mut self, values: &[u64]) -> Label {
         let label = self.label();
-        self.literals.push((label, values.to_vec()));
+        self.literals
+            .push((self.in_cold, label, Literal::Values(values.to_vec())));
+        label
+    }
+
+    /// A 64-bit word after the code of the current section holding the
+    /// address where `of` will run.
+    pub fn address_literal(&mut self, of: Label) -> Label {
+        let label = self.label();
+        self.literals
+            .push((self.in_cold, label, Literal::Address(of)));
         label
     }
 
@@ -617,31 +696,75 @@ impl Asm {
     }
 
     /// Lays out the literals and resolves every branch for code that will
-    /// run at `base`.
-    pub fn finish(mut self, base: u64) -> Vec<u32> {
-        if !self.literals.is_empty() {
-            if self.words.len() % 2 != 0 {
-                self.emit(brk(0));
-            }
-            for (label, values) in std::mem::take(&mut self.literals) {
-                self.bind(label);
-                for v in values {
-                    self.emit(v as u32);
-                    self.emit((v >> 32) as u32);
+    /// run at `base`, which has no cold section.
+    pub fn finish(self, base: u64) -> Vec<u32> {
+        assert!(self.cold.is_empty(), "cold code with nowhere to go");
+        self.finish_split(base, 0).0
+    }
+
+    /// Lays out the literals and resolves every branch for a code section
+    /// that will run at `base` and a cold section at `cold_base`.
+    pub fn finish_split(mut self, base: u64, cold_base: u64) -> (Vec<u32>, Vec<u32>) {
+        let literals = std::mem::take(&mut self.literals);
+        let mut addresses = Vec::new();
+        for cold in [false, true] {
+            self.in_cold = cold;
+            let mut first = true;
+            for (_, label, literal) in literals.iter().filter(|l| l.0 == cold) {
+                if first && self.here() % 8 != 0 {
+                    self.emit(brk(0));
+                }
+                first = false;
+                self.bind(*label);
+                match literal {
+                    Literal::Values(values) => {
+                        for &v in values {
+                            self.emit(v as u32);
+                            self.emit((v >> 32) as u32);
+                        }
+                    }
+                    Literal::Address(of) => {
+                        addresses.push((cold, self.here(), *of));
+                        self.emit_all([0, 0]);
+                    }
                 }
             }
         }
-        for &(at, kind, label) in &self.fixups {
-            let target = self.labels[label.0 as usize].expect("label never bound");
+        let addr = |cold: bool, off: u32| if cold { cold_base } else { base } + off as u64;
+        for (cold, at, of) in addresses {
+            let (to_cold, to) = self.labels[of.0 as usize].expect("label never bound");
+            let value = addr(to_cold, to);
+            let words = if cold {
+                &mut self.cold
+            } else {
+                &mut self.words
+            };
             let i = at as usize / 4;
-            self.words[i] = Self::patch(self.words[i], kind, target as i64 - at as i64);
+            words[i] = value as u32;
+            words[i + 1] = (value >> 32) as u32;
         }
-        for &(at, kind, target) in &self.external {
+        for &(cold, at, kind, label) in &self.fixups {
+            let (to_cold, to) = self.labels[label.0 as usize].expect("label never bound");
+            let delta = addr(to_cold, to).wrapping_sub(addr(cold, at)) as i64;
+            let words = if cold {
+                &mut self.cold
+            } else {
+                &mut self.words
+            };
             let i = at as usize / 4;
-            let delta = target.wrapping_sub(base + at as u64) as i64;
-            self.words[i] = Self::patch(self.words[i], kind, delta);
+            words[i] = Self::patch(words[i], kind, delta);
         }
-        self.words
+        for &(cold, at, kind, target) in &self.external {
+            let delta = target.wrapping_sub(addr(cold, at)) as i64;
+            let words = if cold {
+                &mut self.cold
+            } else {
+                &mut self.words
+            };
+            let i = at as usize / 4;
+            words[i] = Self::patch(words[i], kind, delta);
+        }
+        (self.words, self.cold)
     }
 }
 
@@ -707,6 +830,26 @@ mod tests {
             vec![movz(true, 3, 2, 0), movk(true, 3, 1, 2)]
         );
         assert_eq!(mov_imm(3, 0xffff_8000_0000_0000).len(), 1);
+    }
+
+    #[test]
+    fn cold_code_and_address_literals() {
+        let mut a = Asm::new();
+        let slow = a.label();
+        let back = a.label();
+        a.b(slow);
+        a.bind(back);
+        a.emit(ret());
+        a.set_cold(true);
+        a.bind(slow);
+        let lit = a.address_literal(back);
+        a.ldr_literal(0, lit);
+        a.b(back);
+        let (hot, cold) = a.finish_split(0x1000, 0x8000);
+        assert_eq!(hot, vec![b(0x8000 - 0x1000), ret()]);
+        assert_eq!(cold[0], ldr_literal(0, 8));
+        assert_eq!(cold[1], b(0x1004 - 0x8004));
+        assert_eq!(cold[2] as u64 | (cold[3] as u64) << 32, 0x1004);
     }
 
     #[test]

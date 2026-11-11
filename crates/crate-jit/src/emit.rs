@@ -293,7 +293,9 @@ pub fn exit(asm: &mut Asm, save: u64, page: u64, code: u32, next: Next, info: Ex
         asm.emit(str_imm(3, SCRATCH0, SP, offsets::EXCEPTION_SYNDROME));
     }
     if let Some(site) = info.chain_site {
-        asm.adr(SCRATCH0, site);
+        // An address literal: the site may be in the other section.
+        let literal = asm.address_literal(site);
+        asm.ldr_literal(SCRATCH0, literal);
         asm.emit(str_imm(3, SCRATCH0, SP, offsets::CHAIN_SITE));
     }
     asm.emit(movz(true, SCRATCH0, code, 0));

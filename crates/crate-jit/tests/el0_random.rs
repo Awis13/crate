@@ -524,15 +524,11 @@ impl Gen<'_> {
                 out.push(ldr_imm(size, rt2, base, 0));
             }
             23 => {
-                // A stack-pointer adjustment and read-back.
-                out.push(sub_imm(
-                    true,
-                    SP,
-                    SP,
-                    (self.rng.bits(9) & 0x1f0) + 16,
-                    false,
-                ));
+                // A stack-pointer adjustment, a read-back, and SP put back.
+                let n = (self.rng.bits(9) & 0x1f0) + 16;
+                out.push(sub_imm(true, SP, SP, n, false));
                 out.push(add_imm(true, if rd == 0 { 1 } else { rd }, SP, 0, false));
+                out.push(add_imm(true, SP, SP, n, false));
             }
             24 => out.push(ubfm(sf, rd, rn, immr & bw(sf), imms & bw(sf))),
             25 => out.push(sbfm(sf, rd, rn, immr & bw(sf), imms & bw(sf))),
@@ -767,6 +763,28 @@ impl Gen<'_> {
                     out.push(msr(NZCV, rn));
                 }
             }
+            62 => {
+                // A push and pop through SP: a pre-indexed pair store, a load
+                // and a store at offsets, then a post-indexed pair load that
+                // puts SP back.
+                let (a, b2, c2, d2) = (self.reg(), self.reg(), self.reg(), self.reg());
+                let e = self.reg_not(&[0]);
+                let f = self.reg_not(&[0, e]);
+                out.push(stp_pre(a, b2, SP, -16));
+                out.push(ldr_imm(3, c2, SP, 8));
+                out.push(str_imm(3, d2, SP, 0));
+                out.push(ldp_post(e, f, SP, 16));
+            }
+            63 => {
+                // SP and an extended register: SP minus it, SP plus it into a
+                // register, and SP put back.
+                let k = self.reg_not(&[0]);
+                let r = self.reg_not(&[0, k]);
+                out.push(movz(true, k, 1 + self.rng.bits(4), 0));
+                out.push(sub_ext(SP, SP, k, EXT_UXTX, 4));
+                out.push(add_ext(r, SP, k, EXT_UXTX, 4));
+                out.push(add_ext(SP, SP, k, EXT_UXTX, 4));
+            }
             _ => out.push(add_reg(sf, rd, rn, rm, arith_shift, amount)),
         }
     }
@@ -986,6 +1004,13 @@ mod extra {
         (q as u32) << 30 | 0x0d40_c000 | size << 10 | rn << 5 | rt
     }
     /// LDP/STP of S (opc 0), D (1) or Q (2) registers, signed offset 0.
+    /// STP (pre-index) and LDP (post-index) of X registers.
+    pub fn stp_pre(rt: Reg, rt2: Reg, rn: Reg, imm: i32) -> u32 {
+        0xa980_0000 | ((imm / 8) as u32 & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
+    }
+    pub fn ldp_post(rt: Reg, rt2: Reg, rn: Reg, imm: i32) -> u32 {
+        0xa8c0_0000 | ((imm / 8) as u32 & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
+    }
     pub fn simd_pair(opc: u32, load: bool, rt: Reg, rt2: Reg, rn: Reg) -> u32 {
         opc << 30 | 0x2d00_0000 | (load as u32) << 22 | rt2 << 10 | rn << 5 | rt
     }

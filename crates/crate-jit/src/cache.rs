@@ -3,7 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Translated code: one region of executable memory per CPU, the shared stubs
-//! at its start, and the blocks after them.
+//! at its start, and the blocks after them. Each block's cold code (its slow
+//! paths and the exits it takes until a chain is patched) goes at the far end
+//! of the region instead, which fills downwards, so the code that runs is
+//! packed together for the CPU's instruction cache.
 //!
 //! A block is found by the physical address its guest PC translated to and
 //! the mode it was translated for (its exception level, and whether debug
@@ -72,8 +75,13 @@ pub struct CodeCache {
     region: JitRegion,
     /// How much of the region is used: all of it up to `MAX_REGION`.
     capacity: usize,
-    /// Next free byte in the region.
+    /// Next free byte in the region for the code that runs, which grows up
+    /// from the stubs.
     cursor: usize,
+    /// Where the cold code (slow paths, exits taken once) starts: it grows
+    /// down from the end of the capacity, so it stays out of the way of the
+    /// code that runs and within reach of the stubs.
+    cold: usize,
     /// Every live block, by key, to the offset of its entry.
     blocks: FastMap<BlockKey, usize>,
     /// The keys of the live blocks translated from each physical page.
@@ -101,6 +109,7 @@ impl CodeCache {
             capacity: region.len().min(MAX_REGION),
             region,
             cursor: 0,
+            cold: 0,
             blocks: FastMap::default(),
             pages: FastMap::default(),
             stubs: Stubs::default(),
@@ -108,6 +117,7 @@ impl CodeCache {
             fast,
             epoch: 0,
         };
+        cache.cold = cache.capacity;
         cache.emit_stubs();
         cache
     }
@@ -153,7 +163,7 @@ impl CodeCache {
 
     fn put(&mut self, words: &[u32]) {
         let bytes = std::mem::size_of_val(words);
-        assert!(self.cursor + bytes <= self.capacity, "code region full");
+        assert!(self.cursor + bytes <= self.cold, "code region full");
         let mut w = self.region.writer();
         w.write_words(self.cursor, words);
         drop(w);
@@ -221,12 +231,20 @@ impl CodeCache {
     ) -> Result<u64, TranslateError> {
         // Before resolving the block's branches: one to the stubs from past
         // the end of the capacity would not reach them.
-        if self.cursor + block.asm.size_bound() + 16 > self.capacity {
+        let cold = self.cold.saturating_sub(block.asm.cold_size()) & !15;
+        if self.cursor + block.asm.size_bound() + 16 > cold {
             return Err(TranslateError::OutOfSpace);
         }
         let base = self.exec(self.cursor);
         let fetch_faulted = block.fetch_faulted;
-        let words = block.asm.finish(base);
+        let (words, cold_words) = block.asm.finish_split(base, self.exec(cold));
+        if !cold_words.is_empty() {
+            let mut w = self.region.writer();
+            w.write_words(cold, &cold_words);
+            drop(w);
+            self.region.flush(cold, cold_words.len() * 4);
+            self.cold = cold;
+        }
         let off = self.cursor;
         self.put(&words);
         if !fetch_faulted {
@@ -280,6 +298,7 @@ impl CodeCache {
     /// Empties the cache. Safe only between block runs.
     pub fn reset(&mut self) {
         self.cursor = 0;
+        self.cold = self.capacity;
         self.blocks.clear();
         self.pages.clear();
         self.epoch += 1;
@@ -292,7 +311,7 @@ impl CodeCache {
 
     /// Bytes of code in use.
     pub fn used(&self) -> usize {
-        self.cursor
+        self.cursor + (self.capacity - self.cold)
     }
 }
 
