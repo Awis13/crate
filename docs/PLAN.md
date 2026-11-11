@@ -87,6 +87,18 @@ launches, the debugger's authorization of the 384 MiB code region included
 runs, and poweroff and relaunch work. The desktop, resolution changes and the
 Omarchy guest wait for milestone 4.
 
+Milestone 4 was reached on 2026-11-11: a virtio-gpu with virgl (virglrenderer
+over ANGLE on Vulkan, OpenGL ES 3.1 in the guest), a keyboard and a tablet,
+the display and input calls of the C API, and an optional VNC server. Under
+`crate-run` on an M3, on `jit` and on `hvf`, aTerm's Debian runs all three
+desktop styles (Xfce, simple, Hyprland) on the GPU, with clicks, right clicks,
+the wheel and the keyboard working and `aterm-resolution` changing modes;
+Chrome composites, rasterizes and runs WebGL and WebGPU on the GPU, and Claude
+Code runs in a terminal on the desktop. On `jit` Chrome starts and shows a page
+in 3.1-4.3 s (hvf 0.8 s) and loads a 2000-row page with script in 1.4-1.5 s
+(hvf 0.12 s); a WebGL canvas runs at 60 frames a second on both. An idle Xfce
+desktop costs 1.2-1.5% of a host core on `jit` and 0.4% on `hvf`.
+
 ## How aTerm adopts it
 
 aTerm already chooses an engine at launch. crate becomes another choice beside

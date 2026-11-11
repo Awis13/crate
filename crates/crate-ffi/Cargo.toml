@@ -13,9 +13,11 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 crate-core.workspace = true
+crate-devices.workspace = true
 crate-host.workspace = true
 crate-jit.workspace = true
 crate-virt.workspace = true
+crate-vnc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crate-hvf.workspace = true

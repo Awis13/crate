@@ -1,7 +1,7 @@
 # Design
 
 How the pieces in [PLAN.md](PLAN.md)'s diagram meet in code, as of
-milestone 3 and the first part of milestone 5 (the C API and iOS).
+milestones 3 and 4 and the first part of milestone 5 (the C API and iOS).
 
 ## The board and the CPU backend
 
@@ -83,6 +83,73 @@ the vCPU that submitted them. Network frames go to libslirp, which runs on its
 own thread because it is not thread-safe; frames the guest has posted no
 buffers for wait in a small backlog. No offloads are offered yet, so TCP
 moves about 20 MB/s.
+
+## The GPU, the display and input
+
+**virtio-gpu** (crate-devices, `virtio::gpu`) has one scanout. Every command
+runs on the device's own thread, `crate-gpu`: a vCPU's notify only wakes it,
+and the thread owns the 3D renderer, since a GL context is current on one
+thread at a time. 2D resources are the device's: their pixels live in host
+memory, filled from the guest's backing by TRANSFER_TO_HOST_2D. 3D resources
+are the renderer's (`crate_core::gpu::Renderer`, virglrenderer in practice):
+capability sets, contexts, 3D resources, transfers and command submission go
+to it. A command with a fence is answered when the renderer retires its fence;
+with a renderer every fence goes through it, because Linux takes an answered
+fence as every earlier one done. Fences are polled every half millisecond while
+some are outstanding, and not at all otherwise. No blob resources yet.
+
+**Modes** are a list the app gives, preferred first: GET_DISPLAY_INFO reports
+the first, and the EDID (VESA E-EDID 1.4) carries each as a detailed timing
+with CVT timings at 60 Hz (reduced blanking when the CRT timing's clock is too
+fast for a descriptor), three in the base block beside a monitor name and six
+in each CTA-861 extension block. Linux lists exactly those modes, and the guest
+changes between them itself; the app can offer new ones while it runs, which
+raises a display event.
+
+**Frames** go to a `DisplaySink` as R, G, B, A, with the cursor drawn in (from
+UPDATE_CURSOR's resource; the fourth byte is read as alpha even when the
+resource says X, because Linux makes every dumb buffer XRGB). A
+RESOURCE_FLUSH updates the device's copy of the screen in the flushed
+rectangle only, so a blinking cursor costs a few pixels; for a 3D resource that
+is a GL readback. Nothing is read back while the sink is not active: the
+device remembers the screen is stale and reads it whole at the next flush or
+when a viewer asks (`DisplayControl::refresh`).
+
+**virglrenderer** (crate-host, `virgl`) is loaded with dlopen when a machine
+asks for 3D, as is the EGL it runs on, so crate builds and runs without them
+and a GPU that cannot start is 2D. The contexts are crate's own, through
+virglrenderer's callbacks: ANGLE's display on Vulkan unless told otherwise
+(OpenGL ES 3.1 for the guest; Metal stops at 3.0 and the guest at 2.0),
+surfaceless contexts, every one sharing with a primary context. A scanout is
+read back by attaching the resource's texture to a framebuffer of the primary
+context and `glReadPixels` as RGBA (OpenGL ES cannot read BGRA). Two things
+virglrenderer needs from its host that its header does not say: whatever
+context was current goes back after a readback and after creating a guest
+context, because virglrenderer makes the new context current to set it up yet
+believes the earlier one still is; and its `virgl_box` is taken to be the
+virtio box (six 32-bit fields). `CRATE_GL_DEBUG=1` makes debug contexts and
+logs ANGLE's own messages, which name the failing call. Once started,
+virglrenderer stays for the life of the process, as the iOS code region does:
+`virgl_renderer_cleanup` waits for the thread of its render server, which the
+build crate uses starts even without venus and never finishes. A freed machine
+resets the renderer and releases its context, and the next one takes it up on
+its own GPU thread.
+
+**virtio-input** devices are a keyboard (every key code from KEY_ESC to
+KEY_MICMUTE, with EV_REP so the guest repeats held keys) and a tablet (ABS_X
+and ABS_Y from 0 to 32767, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, REL_WHEEL and
+REL_HWHEEL), each its own device on virtio-mmio. Events the guest has posted
+no buffers for wait in a backlog of 1024.
+
+**The VNC server** (crate-vnc) is a `DisplaySink` that keeps a copy of the
+screen and, per client, the part that changed since it was last sent. RFB 3.8
+(3.3 and 3.7 too), security None, Raw in any true-colour format the client
+sets, DesktopSize when the screen changes size. It is active only while a
+client is connected; the first client's answers wait up to half a second for
+the whole frame the server asks for. Each client has a thread reading its
+messages and one sending updates. Keysyms become the Linux key codes of a US
+keyboard, with Shift pressed around a symbol that needs it when the client
+holds none (aTerm sends capitals without Shift); RFB's wheel buttons scroll.
 
 ## The virt memory map
 
@@ -264,13 +331,22 @@ are checked, and a panic never crosses into C: a panic hook stops the machine
 with CRATE_STOP_ERROR, so the other CPUs leave guest code rather than run on
 without one. `CRATE_CPU_AUTO` probes hvf by making and dropping a VM.
 
+A display's frames reach the app's callback while it says the display is
+active, and its VNC servers (`crate_config_add_vnc`, a Unix socket or a TCP
+port) while they have clients; the GPU reads frames back only while one of
+them wants them. Input calls go straight to the keyboard and tablet devices.
+virgl's libraries are the app's to ship: an iOS app embeds the frameworks,
+which crate finds by their names.
+
 `tools/crate-boot` is a C program that boots a guest through the API the way
 an app does, optionally on executable memory it maps itself.
 
 ## Not yet
 
-- Displays, input devices, pause and resume, a power button and disk discard
-  are in crate.h but return CRATE_ERR_UNSUPPORTED.
+- Pause and resume, a power button and disk discard are in crate.h but return
+  CRATE_ERR_UNSUPPORTED.
+- No blob resources, so no zero-copy scanout: every frame shown is a GL
+  readback and a copy to the app.
 - The translator keeps no translations across launches and shares none
   between CPUs; each CPU has a code region of at most 128 MiB (a slice of one
   region through the C API). The guest's 16 KiB pages still take four 4 KiB

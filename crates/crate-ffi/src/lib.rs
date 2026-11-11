@@ -18,6 +18,7 @@ use crate_core::Error;
 use crate_core::log::Level;
 
 mod config;
+mod display;
 mod machine;
 
 /// Major version of the C API this library implements.

@@ -18,6 +18,8 @@ use std::sync::Arc;
 use crate_core::block::BlockBackend;
 use crate_core::board::{Board, BootState, CpuBackend};
 use crate_core::bus::MmioBus;
+use crate_core::display::{DisplaySink, InputSink, Mode};
+use crate_core::gpu::RendererFactory;
 use crate_core::irq::{InterruptController, IrqLine};
 use crate_core::memory::{GuestMemory, RamBlock};
 use crate_core::net::NetBackend;
@@ -26,6 +28,8 @@ use crate_core::run::{RunControl, StopReason};
 use crate_core::{Error, Result, debug};
 use crate_devices::gicv3::{self, GicV3};
 use crate_devices::virtio::console::{Console, ConsoleInput};
+use crate_devices::virtio::gpu::{Gpu, GpuConfig, GpuControl};
+use crate_devices::virtio::input::{Input, InputKind, Inputs};
 use crate_devices::virtio::mmio::VirtioMmio;
 use crate_devices::virtio::{VirtioDevice, block::Block, net::Net};
 use crate_devices::{pl011, pl011::Pl011, pl031, pl031::Pl031};
@@ -62,6 +66,31 @@ pub struct NetworkConfig {
     pub mac: Option<[u8; 6]>,
 }
 
+pub struct DisplayConfig {
+    /// Offered to the guest in this order; the first is the preferred size.
+    pub modes: Vec<Mode>,
+    pub sink: Arc<dyn DisplaySink>,
+    /// A 3D renderer for virgl; without one, or if it fails to start, the
+    /// GPU is 2D only.
+    pub renderer: Option<RendererFactory>,
+}
+
+/// Which input devices the machine has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InputConfig {
+    pub keyboard: bool,
+    /// An absolute pointer.
+    pub tablet: bool,
+}
+
+/// The modes a display offers unless told otherwise: the preferred first.
+pub const DEFAULT_MODES: [Mode; 4] = [
+    Mode::new(1024, 768),
+    Mode::new(640, 480),
+    Mode::new(800, 600),
+    Mode::new(1280, 960),
+];
+
 pub struct VirtConfig {
     pub cpus: usize,
     /// Bytes of RAM, a multiple of 2 MiB.
@@ -77,6 +106,9 @@ pub struct VirtConfig {
     pub disks: Vec<Arc<dyn BlockBackend>>,
     pub networks: Vec<NetworkConfig>,
     pub consoles: Vec<ConsoleConfig>,
+    /// virtio-gpu devices, each with one screen.
+    pub displays: Vec<DisplayConfig>,
+    pub input: InputConfig,
 }
 
 enum ConsoleHandle {
@@ -87,12 +119,14 @@ enum ConsoleHandle {
 pub struct VirtMachine {
     board: Board,
     consoles: Vec<ConsoleHandle>,
+    displays: Vec<GpuControl>,
+    input: Arc<Inputs>,
     dtb: Vec<u8>,
     _ram: Arc<dyn RamBlock>,
 }
 
 impl VirtMachine {
-    pub fn new(config: VirtConfig) -> Result<Self> {
+    pub fn new(mut config: VirtConfig) -> Result<Self> {
         if config.cpus == 0 || config.cpus > MAX_CPUS {
             return Err(Error::InvalidArgument(format!(
                 "{} CPUs; virt takes 1 to {MAX_CPUS}",
@@ -120,6 +154,9 @@ impl VirtMachine {
         }
         let slots = config.disks.len()
             + config.networks.len()
+            + config.displays.len()
+            + config.input.keyboard as usize
+            + config.input.tablet as usize
             + config
                 .consoles
                 .iter()
@@ -233,6 +270,28 @@ impl VirtMachine {
                 }
             }
         }
+        let mut displays = Vec::new();
+        for display in config.displays.drain(..) {
+            let gpu = Gpu::new(GpuConfig {
+                modes: display.modes,
+                sink: display.sink,
+                renderer: display.renderer,
+            })?;
+            displays.push(gpu.control());
+            devices.push(Box::new(gpu));
+        }
+        let mut keyboard = None;
+        if config.input.keyboard {
+            let device = Input::new(InputKind::Keyboard, "crate keyboard");
+            keyboard = Some(device.sender());
+            devices.push(Box::new(device));
+        }
+        let mut tablet = None;
+        if config.input.tablet {
+            let device = Input::new(InputKind::Tablet, "crate tablet");
+            tablet = Some(device.sender());
+            devices.push(Box::new(device));
+        }
         let virtio_count = devices.len();
         for (slot, device) in devices.into_iter().enumerate() {
             let irq = IrqLine::new(lines.clone(), VIRTIO_SPI_BASE + slot as u32);
@@ -283,6 +342,8 @@ impl VirtMachine {
         Ok(VirtMachine {
             board,
             consoles,
+            displays,
+            input: Arc::new(Inputs::new(keyboard, tablet)),
             dtb,
             _ram: ram,
         })
@@ -304,6 +365,17 @@ impl VirtMachine {
     /// Stops the machine at once, as pulling the plug does.
     pub fn kill(&self) {
         self.board.run.stop(StopReason::Killed);
+    }
+
+    /// Display `index`'s controls, in the order the config listed them.
+    pub fn display(&self, index: usize) -> Option<&GpuControl> {
+        self.displays.get(index)
+    }
+
+    /// The keyboard and tablet; input for devices the machine lacks goes
+    /// nowhere.
+    pub fn input(&self) -> Arc<dyn InputSink> {
+        self.input.clone()
     }
 
     /// Bytes for console `index` (in the order the config listed them) to
@@ -586,6 +658,8 @@ mod tests {
             disks: Vec::new(),
             networks: Vec::new(),
             consoles: Vec::new(),
+            displays: Vec::new(),
+            input: InputConfig::default(),
         };
         assert!(matches!(
             VirtMachine::new(config(0, 1 << 30)),

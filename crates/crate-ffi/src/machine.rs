@@ -18,11 +18,12 @@ use crate_host::disk::{FileDisk, Flush};
 use crate_host::jit::JitRegion;
 use crate_host::slirp::UserNet;
 use crate_jit::backend::Jit;
-use crate_virt::{ConsoleConfig, NetworkConfig, VirtConfig, VirtMachine};
+use crate_virt::{ConsoleConfig, InputConfig, NetworkConfig, VirtConfig, VirtMachine};
 
 use crate::config::{
     Backend, Config, DISK_FULL_FLUSH, DISK_NO_FLUSH, DISK_READ_ONLY, StateCallback,
 };
+use crate::display::{self, AppDisplay};
 use crate::{Status, fail, fail_with, guarded, panic_message};
 
 // crate_state
@@ -105,7 +106,8 @@ impl Shared {
 }
 
 pub struct Machine {
-    virt: Arc<VirtMachine>,
+    pub(crate) virt: Arc<VirtMachine>,
+    pub(crate) displays: Vec<Arc<AppDisplay>>,
     backend: Mutex<Option<Box<dyn CpuBackend + Send>>>,
     shared: Arc<Shared>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -166,7 +168,7 @@ fn backend(config: &Config) -> Result<Box<dyn CpuBackend + Send>, Status> {
     Ok(Box::new(Jit::new().in_region(region)))
 }
 
-fn build(config: &Config) -> Result<VirtMachine, Status> {
+fn build(config: &Config) -> Result<(VirtMachine, Vec<Arc<AppDisplay>>), Status> {
     let kernel = config
         .kernel
         .clone()
@@ -218,7 +220,8 @@ fn build(config: &Config) -> Result<VirtMachine, Status> {
             }
         })
         .collect();
-    VirtMachine::new(VirtConfig {
+    let (sinks, displays) = display::build(config);
+    let virt = VirtMachine::new(VirtConfig {
         cpus: config.cpus,
         memory: config.memory,
         kernel,
@@ -228,8 +231,15 @@ fn build(config: &Config) -> Result<VirtMachine, Status> {
         disks,
         networks,
         consoles,
+        displays,
+        input: InputConfig {
+            keyboard: config.input & display::INPUT_KEYBOARD != 0,
+            tablet: config.input & display::INPUT_TABLET != 0,
+        },
     })
-    .map_err(fail_with)
+    .map_err(fail_with)?;
+    display::serve(&sinks, &virt)?;
+    Ok((virt, sinks))
 }
 
 /// `crate_machine_create`.
@@ -255,7 +265,7 @@ pub unsafe extern "C" fn crate_machine_create(
         }
         install_panic_hook();
         let made = backend(config).and_then(|backend| Ok((backend, build(config)?)));
-        let (backend, virt) = match made {
+        let (backend, (virt, displays)) = match made {
             Ok(made) => made,
             Err(status) => {
                 EXISTS.store(false, Ordering::Release);
@@ -270,6 +280,7 @@ pub unsafe extern "C" fn crate_machine_create(
         );
         let built = Box::new(Machine {
             virt: Arc::new(virt),
+            displays,
             backend: Mutex::new(Some(backend)),
             shared: Arc::new(Shared {
                 status: Mutex::new(Current {
@@ -528,19 +539,3 @@ pub unsafe extern "C" fn crate_console_write(
     }))
     .unwrap_or(0)
 }
-
-/// `crate_display_set_active`: no displays yet.
-#[unsafe(no_mangle)]
-pub extern "C" fn crate_display_set_active(_machine: *mut Machine, _display: u32, _active: bool) {}
-
-/// `crate_input_key`: no input devices yet.
-#[unsafe(no_mangle)]
-pub extern "C" fn crate_input_key(_machine: *mut Machine, _code: u16, _down: bool) {}
-
-/// `crate_input_pointer`: no input devices yet.
-#[unsafe(no_mangle)]
-pub extern "C" fn crate_input_pointer(_machine: *mut Machine, _x: u32, _y: u32, _buttons: u32) {}
-
-/// `crate_input_scroll`: no input devices yet.
-#[unsafe(no_mangle)]
-pub extern "C" fn crate_input_scroll(_machine: *mut Machine, _dx: i32, _dy: i32) {}

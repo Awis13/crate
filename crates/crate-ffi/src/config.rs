@@ -90,6 +90,9 @@ pub struct Config {
     pub(crate) disks: Vec<Disk>,
     pub(crate) networks: Vec<Network>,
     pub(crate) consoles: Vec<Console>,
+    pub(crate) displays: Vec<crate::display::Display>,
+    /// CRATE_INPUT_* bits.
+    pub(crate) input: u32,
     pub(crate) state: Option<StateCallback>,
 }
 
@@ -136,7 +139,7 @@ unsafe fn path(s: *const c_char, what: &str) -> Result<PathBuf, Status> {
 /// # Safety
 ///
 /// As for `config_mut`.
-unsafe fn with(config: *mut Config, body: impl FnOnce(&mut Config) -> Status) -> Status {
+pub(crate) unsafe fn with(config: *mut Config, body: impl FnOnce(&mut Config) -> Status) -> Status {
     guarded(|| {
         // SAFETY: the caller's contract.
         match unsafe { config_mut(config) } {
@@ -180,6 +183,8 @@ pub unsafe extern "C" fn crate_config_new(machine: *const c_char) -> *mut Config
         disks: Vec::new(),
         networks: Vec::new(),
         consoles: Vec::new(),
+        displays: Vec::new(),
+        input: 0,
         state: None,
     }))
 }
@@ -654,41 +659,6 @@ pub unsafe extern "C" fn crate_config_set_state_callback(
                 context: Context(context),
             });
             Status::Ok
-        })
-    }
-}
-
-/// `crate_config_add_display`: virtio-gpu is milestone 4.
-///
-/// # Safety
-///
-/// As for `crate_config_free`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn crate_config_add_display(
-    config: *mut Config,
-    _gpu: c_int,
-    _callbacks: *const c_void,
-    _index: *mut u32,
-) -> Status {
-    // SAFETY: the caller's contract.
-    unsafe {
-        with(config, |_| {
-            fail(Status::Unsupported, "no displays in this build yet")
-        })
-    }
-}
-
-/// `crate_config_add_input`: needs a display first.
-///
-/// # Safety
-///
-/// As for `crate_config_free`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn crate_config_add_input(config: *mut Config, _devices: u32) -> Status {
-    // SAFETY: the caller's contract.
-    unsafe {
-        with(config, |_| {
-            fail(Status::Unsupported, "no input devices in this build yet")
         })
     }
 }

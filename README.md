@@ -19,7 +19,9 @@ Status: early. The `virt` machine boots Debian to a shell on a Mac through
 Apple's Hypervisor framework (milestone 1) and through the translator, on one
 to four CPUs, faster than QEMU's TCG (milestone 3). The C API is implemented
 and aTerm runs Debian on crate on an iPhone, with executable memory from an
-attached debugger (the first part of milestone 5). There is no GPU yet. See
+attached debugger (the first part of milestone 5). A virtio-gpu with virgl
+(virglrenderer over ANGLE) and a keyboard and tablet run aTerm's desktops and
+Chrome with hardware compositing on a Mac, on both backends (milestone 4). See
 [docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
 [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -47,8 +49,10 @@ attached debugger (the first part of milestone 5). There is no GPU yet. See
       crate-devices     GICv3, UART, RTC, virtio (block, network, console)
       crate-virt        the virt machine: memory map, device tree, Linux boot
       crate-host        executable memory, guest RAM, disks, network, GPU
+      crate-vnc         an optional VNC server for a display
       crate-ffi         the C API's implementation (libcrate)
     tools/crate-run     command-line runner for development
+    tools/vnc.py        screenshots and input through a VNC server
     docs/               plan, design, provenance
 
 ## Building
@@ -90,6 +94,18 @@ SSH forwarded from port 2230:
 
 The terminal is the guest's serial console; Ctrl-A x stops the machine.
 `crate-run --help` lists the rest.
+
+A screen, keyboard and tablet come with `--display 2d` or `--display virgl`,
+seen through a VNC server (`--vnc vnc.sock`, `--vnc-tcp 127.0.0.1:5905`).
+virgl needs virglrenderer and ANGLE, which crate loads when the machine starts,
+found through dyld's paths. Set them in a script that runs crate-run itself:
+macOS drops `DYLD_*` variables on the way through system binaries such as
+`nohup` or `perl`.
+
+    export DYLD_FRAMEWORK_PATH=$GPU/angle          # ANGLE's EGL.framework
+    export DYLD_LIBRARY_PATH=$GPU/lib:/opt/homebrew/opt/molten-vk/lib
+    target/release/crate-run ... --display virgl --vnc vnc.sock
+    tools/vnc.py vnc.sock shot screen.png
 
 ## License
 

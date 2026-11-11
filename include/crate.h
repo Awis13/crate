@@ -227,11 +227,21 @@ typedef enum crate_gpu {
                         log message, when that cannot start */
 } crate_gpu;
 
+/* virgl loads virglrenderer and EGL when the machine is created rather than
+   linking them, so an app without them still runs, in 2D. They are found by
+   name: the frameworks an iOS app embeds (virglrenderer.1.framework,
+   EGL.framework), or on a Mac libvirglrenderer.1.dylib and ANGLE's
+   EGL.framework through DYLD_LIBRARY_PATH and DYLD_FRAMEWORK_PATH. The
+   environment variables CRATE_VIRGLRENDERER and CRATE_EGL name others.
+   ANGLE runs on Vulkan (CRATE_ANGLE_PLATFORM=metal or default to change it),
+   which gives the guest OpenGL ES 3.1. */
+
 typedef struct crate_frame {
     uint32_t width;
     uint32_t height;
     uint32_t stride;       /* bytes per row */
-    const uint8_t *pixels; /* 4 bytes a pixel: red, green, blue, unused */
+    const uint8_t *pixels; /* 4 bytes a pixel: red, green, blue, unused; the
+                              guest's cursor drawn in */
     /* The part that changed since the previous frame. */
     uint32_t dirty_x;
     uint32_t dirty_y;
@@ -242,25 +252,57 @@ typedef struct crate_frame {
 typedef struct crate_display_callbacks {
     size_t size; /* sizeof(crate_display_callbacks) */
     void *context;
-    /* A new frame, its pixels valid only during the call. */
+    /* A new frame, its pixels valid only during the call, on the GPU's
+       thread. */
     void (*frame)(void *context, uint32_t display, const crate_frame *frame);
 } crate_display_callbacks;
 
-/* Not in this build yet: CRATE_ERR_UNSUPPORTED. */
+/* A virtio-gpu with one screen. `index` receives the display's number. The
+   callbacks may be NULL for a display only a VNC server shows. */
 crate_status crate_config_add_display(crate_config *config, crate_gpu gpu,
                                       const crate_display_callbacks *callbacks, uint32_t *index);
 
+typedef struct crate_display_mode {
+    uint32_t width;
+    uint32_t height;
+} crate_display_mode;
+
+/* The sizes the guest is offered, in its EDID, the first one preferred: what
+   the guest's console starts at, and what a desktop starts at unless it picks
+   another. 1 to 45 of them, 16 to 4095 pixels a side; by default 1024x768,
+   640x480, 800x600 and 1280x960. The guest changes between them itself (on
+   Linux through its KMS driver, xrandr or wlr-randr). */
+crate_status crate_config_set_display_modes(crate_config *config, uint32_t display,
+                                            const crate_display_mode *modes, size_t count);
+
+/* An optional VNC server for the display (RFB 3.8, no authentication, Raw
+   encoding, DesktopSize), with the machine's input devices behind it:
+   "unix:PATH" for a Unix socket only this user may connect to, or
+   "tcp:HOST:PORT" (keep that on 127.0.0.1). It makes frames only while a
+   client is connected. May be given more than once. A server that cannot
+   listen fails crate_machine_create with CRATE_ERR_IO. */
+crate_status crate_config_add_vnc(crate_config *config, uint32_t display, const char *address);
+
 /* Frames cost a copy out of the GPU, so they are made only while the display
-   is active: an app turns it off while nothing shows it. Off at start. Handing
-   the GPU's own surface to the app, with no copy, is planned. */
+   is active: an app turns it off while nothing shows it. Off at start; turning
+   it on makes a whole frame soon after. Handing the GPU's own surface to the
+   app, with no copy, is planned. */
 void crate_display_set_active(crate_machine *machine, uint32_t display, bool active);
+
+/* Offers the guest new modes while it runs, as crate_config_set_display_modes
+   does, and tells it the display changed. The guest decides whether to change
+   to the new preferred mode. */
+crate_status crate_display_set_modes(crate_machine *machine, uint32_t display,
+                                     const crate_display_mode *modes, size_t count);
 
 /* ---------------------------------------------------------------- input */
 
 #define CRATE_INPUT_KEYBOARD (1u << 0)
 #define CRATE_INPUT_TABLET (1u << 1) /* an absolute pointer: positions, not movements */
 
-/* Not in this build yet: CRATE_ERR_UNSUPPORTED. */
+/* virtio-input devices: a keyboard and a tablet with three buttons and a
+   wheel each way, each its own device. A machine with a display wants both:
+   without input devices the guest ignores the app. */
 crate_status crate_config_add_input(crate_config *config, uint32_t devices);
 
 /* Keys are Linux input event codes (KEY_A is 30), the guest's own names for them. */
@@ -269,6 +311,7 @@ void crate_input_key(crate_machine *machine, uint16_t code, bool down);
 /* x and y from 0 to 32767 across the display; buttons: bit 0 left, bit 1
    right, bit 2 middle. */
 void crate_input_pointer(crate_machine *machine, uint32_t x, uint32_t y, uint32_t buttons);
+/* Wheel notches: positive dy scrolls down, positive dx right. */
 void crate_input_scroll(crate_machine *machine, int32_t dx, int32_t dy);
 
 /* ---------------------------------------------------------------- running it */
@@ -327,8 +370,8 @@ void crate_machine_free(crate_machine *machine);
 
 /*
  * Not in v0, planned: devices written by the app (an MMIO or PCI device
- * interface; the Rust API has it first), shared folders, display modes,
- * snapshots, statistics.
+ * interface; the Rust API has it first), shared folders, snapshots,
+ * statistics.
  */
 
 #ifdef __cplusplus
