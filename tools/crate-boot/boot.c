@@ -10,6 +10,9 @@
  * shell prompt ("root@...#"), the time since start goes to stderr. With
  * --app-region the executable memory is the app's own, mapped twice here as
  * an iOS app would, and handed over with crate_config_set_jit_region.
+ *
+ * --display adds a screen with a keyboard and a tablet, seen through --vnc;
+ * with --frames the app's own callback takes frames too, and counts them.
  */
 #include <errno.h>
 #include <pthread.h>
@@ -68,6 +71,20 @@ static void output(void *context, uint32_t console, const uint8_t *bytes, size_t
     fwrite(bytes, 1, length, stdout);
     fflush(stdout);
     watch(bytes, length);
+}
+
+static unsigned long frames;
+static uint32_t frame_width, frame_height;
+
+static void frame(void *context, uint32_t display, const crate_frame *f) {
+    (void)context;
+    frames++;
+    if (f->width != frame_width || f->height != frame_height || frames <= 1) {
+        fprintf(stderr, "\ncrate-boot: display %u: %ux%u (frame %lu, %u bytes a row)\n",
+                display, f->width, f->height, frames, f->stride);
+        frame_width = f->width;
+        frame_height = f->height;
+    }
 }
 
 static void input_ready(void *context, uint32_t console) {
@@ -165,7 +182,8 @@ static const char usage[] =
     "usage: crate-boot --kernel PATH [--initrd PATH] [--disk PATH] [--cmdline S]\n"
     "                  [--cpus N] [--memory MIB] [--forward HOSTPORT:GUESTPORT]...\n"
     "                  [--backend auto|jit|hvf] [--jit-size MIB] [--app-region MIB]\n"
-    "                  [--virtio-console]\n";
+    "                  [--virtio-console] [--display 2d|virgl [--modes WxH,...]\n"
+    "                  [--vnc unix:PATH|tcp:HOST:PORT] [--frames]]\n";
 
 int main(int argc, char **argv) {
     const char *kernel = NULL, *initrd = NULL, *cmdline = "console=ttyAMA0";
@@ -173,12 +191,17 @@ int main(int argc, char **argv) {
     int ndisks = 0;
     unsigned forwards[8][2];
     int nforwards = 0;
-    unsigned cpus = 1, memory = 1024, jit_size = 0, region = 0, virtio = 0;
+    unsigned cpus = 1, memory = 1024, jit_size = 0, region = 0, virtio = 0, own_frames = 0;
+    const char *display = NULL, *modes = NULL, *vnc = NULL;
     crate_cpu_backend backend = CRATE_CPU_AUTO;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--virtio-console")) {
             virtio = 1;
+            continue;
+        }
+        if (!strcmp(a, "--frames")) {
+            own_frames = 1;
             continue;
         }
         if (!v) {
@@ -197,6 +220,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--forward") && nforwards < 8 &&
                  sscanf(v, "%u:%u", &forwards[nforwards][0], &forwards[nforwards][1]) == 2)
             nforwards++;
+        else if (!strcmp(a, "--display")) display = v;
+        else if (!strcmp(a, "--modes")) modes = v;
+        else if (!strcmp(a, "--vnc")) vnc = v;
         else if (!strcmp(a, "--backend"))
             backend = !strcmp(v, "jit") ? CRATE_CPU_JIT
                       : !strcmp(v, "hvf") ? CRATE_CPU_HVF
@@ -257,18 +283,37 @@ int main(int argc, char **argv) {
         check(crate_config_add_console(config, CRATE_CONSOLE_VIRTIO, &callbacks, &console),
               "virtio console");
     }
+    if (display) {
+        crate_display_callbacks screen = {.size = sizeof screen, .frame = frame};
+        uint32_t index;
+        check(crate_config_add_display(config,
+                                       !strcmp(display, "virgl") ? CRATE_GPU_VIRGL : CRATE_GPU_2D,
+                                       &screen, &index),
+              "display");
+        if (modes) {
+            crate_display_mode list[45];
+            size_t count = 0;
+            for (const char *m = modes; m && count < 45; m = strchr(m, ',') ? strchr(m, ',') + 1 : NULL)
+                if (sscanf(m, "%ux%u", &list[count].width, &list[count].height) == 2) count++;
+            check(crate_config_set_display_modes(config, index, list, count), "modes");
+        }
+        if (vnc) check(crate_config_add_vnc(config, index, vnc), "vnc");
+        check(crate_config_add_input(config, CRATE_INPUT_KEYBOARD | CRATE_INPUT_TABLET), "input");
+    }
     check(crate_config_set_state_callback(config, state_changed, NULL), "state callback");
 
     check(crate_machine_create(config, &machine), "create");
     crate_config_free(config);
     fprintf(stderr, "crate-boot: created in %.2f s\n", now() - started);
     check(crate_machine_start(machine), "start");
+    if (display && own_frames) crate_display_set_active(machine, 0, true);
 
     pthread_t feeder;
     pthread_create(&feeder, NULL, feed, NULL);
     pthread_detach(feeder);
 
     check(crate_machine_wait(machine, -1), "wait");
+    if (display) fprintf(stderr, "crate-boot: %lu frames to the app\n", frames);
     /* The state callback has reported the stop by the time wait returns. */
     crate_machine_free(machine);
     switch (stop_reason) {

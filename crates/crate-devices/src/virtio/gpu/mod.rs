@@ -224,6 +224,7 @@ impl Gpu {
                     bytes_2d: 0,
                     scanouts: vec![Scanout::default(); SCANOUTS as usize],
                     fenced: VecDeque::new(),
+                    trace: std::env::var_os("CRATE_GPU_TRACE").is_some(),
                 };
                 worker.run();
                 let mut w = thread_shared.work.lock().unwrap();
@@ -466,6 +467,8 @@ struct Worker {
     bytes_2d: usize,
     scanouts: Vec<Scanout>,
     fenced: VecDeque<Fenced>,
+    /// CRATE_GPU_TRACE: log every control command.
+    trace: bool,
 }
 
 impl Worker {
@@ -729,7 +732,7 @@ impl Worker {
 
     /// Runs one control command and returns its answer.
     fn command(&mut self, r: &Request) -> Vec<u8> {
-        if std::env::var_os("CRATE_GPU_TRACE").is_some() {
+        if self.trace {
             let words: Vec<u32> = (0..12).map(|i| r.u32(4 * i)).collect();
             info!(
                 "gpu: {:#x} ctx {} fence {} {:?}",
