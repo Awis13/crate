@@ -21,6 +21,8 @@ pub enum Error {
     },
     /// The kernel or another guest file is unusable.
     Guest(String),
+    /// No executable memory could be had for the translator.
+    Jit(String),
     /// The CPU backend failed: a hypervisor call, say.
     Backend(String),
 }
@@ -44,6 +46,7 @@ impl fmt::Display for Error {
             Error::NoMemory(m) => write!(f, "out of memory: {m}"),
             Error::Io { context, source } => write!(f, "{context}: {source}"),
             Error::Guest(m) => write!(f, "guest: {m}"),
+            Error::Jit(m) => write!(f, "no executable memory: {m}"),
             Error::Backend(m) => write!(f, "CPU backend: {m}"),
         }
     }

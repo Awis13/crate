@@ -257,6 +257,10 @@ impl Block {
                 self.emit_sp_ext(sub, sf, set_flags, rd, rn, rm, option, amount);
                 false
             }
+            Op::LogicalSpImm { word } => {
+                self.emit_logical_sp(word);
+                false
+            }
             Op::Memory(m) => {
                 self.emit_memory(m, None, pc);
                 false
@@ -523,6 +527,23 @@ impl Block {
                 self.asm.emit(mov(rd, v));
             }
         }
+        self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
+    }
+
+    /// AND, ORR or EOR (immediate) into the guest's SP: the same instruction
+    /// into a borrowed register, stored to the state's SP. A 32-bit form's
+    /// result is zero-extended, as a write of WSP is.
+    fn emit_logical_sp(&mut self, word: u32) {
+        let rn = (word >> 5) & 31;
+        let v = Self::victim(&[rn]);
+        self.asm.emit(str_imm(3, v, SP, offsets::SCRATCH));
+        let mut w = (word & !31) | v;
+        if rn == 18 {
+            self.asm.emit(ldr_imm(3, v, SP, offsets::x(18)));
+            w = (w & !(31 << 5)) | (v << 5);
+        }
+        self.asm.emit(w);
+        self.asm.emit(str_imm(3, v, SP, offsets::SP));
         self.asm.emit(ldr_imm(3, v, SP, offsets::SCRATCH));
     }
 

@@ -170,6 +170,13 @@ impl CodeCache {
         ))
     }
 
+    /// A cache in `region` (a slice of a machine's shared region, say).
+    pub fn in_region(region: JitRegion, fast: bool) -> Self {
+        let helper: unsafe extern "C" fn(*mut Cpu, *const u8, *mut CpuState) -> u64 =
+            crate::mem::jit_mem;
+        CodeCache::with_region(region, helper as usize as u64, fast)
+    }
+
     pub fn epilogue_addr() -> u64 {
         epilogue_addr()
     }
@@ -1722,17 +1729,28 @@ fn install_dump_handler() {
     }
 }
 
+/// Where the CPUs' translated code goes.
+enum CodeMemory {
+    /// A region of this many bytes for each CPU, of its own.
+    PerCpu(usize),
+    /// One region for the machine, a slice of it for each CPU.
+    Shared(Arc<JitRegion>),
+}
+
+/// The least code region a CPU can work in: the stubs and the largest block.
+const MIN_CPU_REGION: usize = 1 << 20;
+
 /// The CPU backend: runs each of a board's CPUs on the translator, one host
 /// thread per CPU.
 pub struct Jit {
-    jit_bytes: usize,
+    memory: CodeMemory,
     fast: bool,
 }
 
 impl Jit {
     pub fn new() -> Self {
         Jit {
-            jit_bytes: 256 << 20,
+            memory: CodeMemory::PerCpu(crate::cache::MAX_REGION),
             fast: !slow_from_env(),
         }
     }
@@ -1742,6 +1760,52 @@ impl Jit {
         Jit {
             fast,
             ..Self::new()
+        }
+    }
+
+    /// Each CPU's code in a region of `bytes` of its own; a CPU uses at most
+    /// `cache::MAX_REGION` of it.
+    pub fn with_code_size(self, bytes: usize) -> Self {
+        Jit {
+            memory: CodeMemory::PerCpu(bytes),
+            ..self
+        }
+    }
+
+    /// Every CPU's code in an equal slice of `region` rather than in a region
+    /// of its own: how a host that grants one region a launch (iOS) runs
+    /// several CPUs. Each slice is at most `cache::MAX_REGION`.
+    pub fn in_region(self, region: Arc<JitRegion>) -> Self {
+        Jit {
+            memory: CodeMemory::Shared(region),
+            ..self
+        }
+    }
+
+    fn caches(&self, count: usize) -> crate_core::Result<Vec<CodeCache>> {
+        match &self.memory {
+            CodeMemory::PerCpu(bytes) => (0..count)
+                .map(|_| CodeCache::with_mode(*bytes, self.fast))
+                .collect(),
+            CodeMemory::Shared(region) => {
+                let slices = region.clone().split(count, crate::cache::MAX_REGION)?;
+                if slices[0].len() < MIN_CPU_REGION {
+                    return Err(crate_core::Error::Jit(format!(
+                        "{} KiB of code for each of {count} CPUs; each needs {} KiB",
+                        slices[0].len() >> 10,
+                        MIN_CPU_REGION >> 10
+                    )));
+                }
+                crate_core::debug!(
+                    "{count} CPUs in {} MiB of code, {} KiB each",
+                    region.len() >> 20,
+                    slices[0].len() >> 10
+                );
+                Ok(slices
+                    .into_iter()
+                    .map(|slice| CodeCache::in_region(slice, self.fast))
+                    .collect())
+            }
         }
     }
 }
@@ -1761,10 +1825,7 @@ impl crate_core::board::CpuBackend for Jit {
         let count = board.cpu_count();
         let smp = Arc::new(Smp::new(count, board.run.clone()));
         let mut cpus: Vec<Box<Cpu>> = (0..count).map(|c| Cpu::for_board(board, &smp, c)).collect();
-        let mut caches = Vec::new();
-        for _ in 0..count {
-            caches.push(CodeCache::with_mode(self.jit_bytes, self.fast)?);
-        }
+        let caches = self.caches(count)?;
         for (c, cpu) in cpus.iter_mut().enumerate() {
             smp.attach(c, &mut *cpu.state);
         }

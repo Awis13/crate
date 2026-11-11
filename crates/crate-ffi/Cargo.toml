@@ -11,5 +11,14 @@ publish.workspace = true
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+[dependencies]
+crate-core.workspace = true
+crate-host.workspace = true
+crate-jit.workspace = true
+crate-virt.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+crate-hvf.workspace = true
+
 [lints]
 workspace = true

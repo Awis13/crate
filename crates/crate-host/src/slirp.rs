@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -56,11 +56,19 @@ impl Shared {
 pub struct UserNet {
     shared: Arc<Shared>,
     forwards: Vec<PortForward>,
+    ipv6: bool,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl UserNet {
     pub fn new(forwards: Vec<PortForward>) -> Result<Arc<Self>> {
+        Self::with_ipv6(forwards, false)
+    }
+
+    /// With `ipv6`, the guest also gets IPv6 beside IPv4: the network
+    /// fec0::/64, the host fec0::2 and the DNS forwarder fec0::3, the guest
+    /// configuring itself from router advertisements.
+    pub fn with_ipv6(forwards: Vec<PortForward>, ipv6: bool) -> Result<Arc<Self>> {
         let mut fds = [0; 2];
         // SAFETY: pipe writes two descriptors into the array.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -88,6 +96,7 @@ impl UserNet {
                 sink: OnceLock::new(),
             }),
             forwards,
+            ipv6,
             thread: Mutex::new(None),
         }))
     }
@@ -110,9 +119,10 @@ impl NetBackend for UserNet {
         }
         let shared = self.shared.clone();
         let forwards = self.forwards.clone();
+        let ipv6 = self.ipv6;
         let thread = std::thread::Builder::new()
             .name("crate-slirp".into())
-            .spawn(move || run(shared, forwards))
+            .spawn(move || run(shared, forwards, ipv6))
             .expect("spawning the slirp thread");
         *self.thread.lock().unwrap() = Some(thread);
     }
@@ -392,7 +402,12 @@ fn in_addr(a: Ipv4Addr) -> InAddr {
     InAddr(u32::from_ne_bytes(a.octets()))
 }
 
-fn run(shared: Arc<Shared>, forwards: Vec<PortForward>) {
+fn in6_addr(a: Ipv6Addr) -> In6Addr {
+    In6Addr(a.octets())
+}
+
+fn run(shared: Arc<Shared>, forwards: Vec<PortForward>, ipv6: bool) {
+    let prefix6 = Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0);
     let config = SlirpConfig {
         version: 4,
         restricted: 0,
@@ -400,17 +415,17 @@ fn run(shared: Arc<Shared>, forwards: Vec<PortForward>) {
         vnetwork: in_addr(Ipv4Addr::new(10, 0, 2, 0)),
         vnetmask: in_addr(Ipv4Addr::new(255, 255, 255, 0)),
         vhost: in_addr(Ipv4Addr::new(10, 0, 2, 2)),
-        in6_enabled: false,
-        vprefix_addr6: In6Addr([0; 16]),
-        vprefix_len: 0,
-        vhost6: In6Addr([0; 16]),
+        in6_enabled: ipv6,
+        vprefix_addr6: in6_addr(prefix6),
+        vprefix_len: 64,
+        vhost6: in6_addr(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 2)),
         vhostname: std::ptr::null(),
         tftp_server_name: std::ptr::null(),
         tftp_path: std::ptr::null(),
         bootfile: std::ptr::null(),
         vdhcp_start: in_addr(GUEST),
         vnameserver: in_addr(Ipv4Addr::new(10, 0, 2, 3)),
-        vnameserver6: In6Addr([0; 16]),
+        vnameserver6: in6_addr(Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 3)),
         vdnssearch: std::ptr::null(),
         vdomainname: std::ptr::null(),
         if_mtu: 0,

@@ -17,8 +17,10 @@ machine.
 
 Status: early. The `virt` machine boots Debian to a shell on a Mac through
 Apple's Hypervisor framework (milestone 1) and through the translator, on one
-to four CPUs, faster than QEMU's TCG (milestone 3). There is no C API, GPU or
-iOS build yet. See [docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
+to four CPUs, faster than QEMU's TCG (milestone 3). The C API is implemented
+and aTerm runs Debian on crate on an iPhone, with executable memory from an
+attached debugger (the first part of milestone 5). There is no GPU yet. See
+[docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
 [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals
@@ -56,6 +58,21 @@ Needs Rust 1.85 or later, and libslirp for user-mode networking
 
     cargo build
     cargo test
+
+## The C API and iOS
+
+`include/crate.h` is the API. `tools/xcframework.sh` builds it (release) as
+`target/xcframework/Crate.xcframework`, a static library for iOS and macOS on
+arm64 with the header and a module map for Swift; it needs the
+`aarch64-apple-ios` Rust target. The app links libslirp itself. On iOS crate
+gets executable memory from an attached debugger (see `crate_config_set_jit_region`).
+
+`tools/crate-boot/build.sh` builds a C program that boots a guest through the
+API, as an app does:
+
+    target/release/crate-boot --backend jit --cpus 4 --memory 2048 \
+        --kernel vmlinuz --initrd initrd.img --disk rootfs.img \
+        --cmdline "console=ttyAMA0 root=/dev/vda rw" --forward 2230:22
 
 ## Running a guest on a Mac
 

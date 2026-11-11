@@ -14,7 +14,7 @@
 //! Line settings (baud rate, framing) are stored and otherwise ignored.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate_core::bus::MmioDevice;
 use crate_core::irq::IrqLine;
@@ -52,9 +52,14 @@ const CR_LBE: u32 = 1 << 7;
 const ID: [u8; 8] = [0x11, 0x10, 0x34, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 
 pub type Output = Arc<dyn Fn(&[u8]) + Send + Sync>;
+/// Told when the receive FIFO, having turned bytes away, has emptied.
+pub type InputReady = Arc<dyn Fn() + Send + Sync>;
 
 struct State {
     rx: VecDeque<u8>,
+    /// `receive` took fewer bytes than it was offered since the FIFO last
+    /// emptied.
+    starved: bool,
     /// Interrupts other than RX, TX and RT that ICR clears (errors, modem).
     latched: u32,
     imsc: u32,
@@ -87,6 +92,7 @@ pub struct Pl011 {
     state: Mutex<State>,
     irq: IrqLine,
     output: Output,
+    input_ready: OnceLock<InputReady>,
 }
 
 impl Pl011 {
@@ -94,6 +100,7 @@ impl Pl011 {
         Arc::new(Pl011 {
             state: Mutex::new(State {
                 rx: VecDeque::with_capacity(FIFO_DEPTH),
+                starved: false,
                 latched: 0,
                 imsc: 0,
                 cr: 0x300,
@@ -107,7 +114,14 @@ impl Pl011 {
             }),
             irq,
             output,
+            input_ready: OnceLock::new(),
         })
+    }
+
+    /// Calls `ready` (on the vCPU that read the last byte) when the FIFO
+    /// empties after `receive` turned bytes away. Set once.
+    pub fn set_input_ready(&self, ready: InputReady) {
+        let _ = self.input_ready.set(ready);
     }
 
     /// Bytes for the guest to read. Takes what fits in the receive FIFO and
@@ -117,6 +131,7 @@ impl Pl011 {
         let room = FIFO_DEPTH - state.rx.len();
         let taken = bytes.len().min(room);
         state.rx.extend(&bytes[..taken]);
+        state.starved |= taken < bytes.len();
         self.update_irq(&mut state);
         taken
     }
@@ -137,6 +152,15 @@ impl MmioDevice for Pl011 {
             DR => {
                 let byte = state.rx.pop_front().unwrap_or(0);
                 self.update_irq(&mut state);
+                if state.starved && state.rx.is_empty() {
+                    state.starved = false;
+                    // Out of the lock: the app may offer more at once.
+                    drop(state);
+                    if let Some(ready) = self.input_ready.get() {
+                        ready();
+                    }
+                    return byte as u64;
+                }
                 byte as u32
             }
             RSR => 0,
@@ -267,6 +291,30 @@ mod tests {
             uart.read(DR, 4);
         }
         assert!(!chip.level(1));
+    }
+
+    #[test]
+    fn says_when_it_can_take_bytes_again() {
+        let (uart, _, _) = uart();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        uart.set_input_ready(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let count = || calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(uart.receive(b"ab"), 2);
+        uart.read(DR, 4);
+        uart.read(DR, 4);
+        assert_eq!(count(), 0, "nothing was turned away");
+        assert_eq!(uart.receive(&[b'x'; 40]), 32);
+        for _ in 0..31 {
+            uart.read(DR, 4);
+        }
+        assert_eq!(count(), 0, "not until it empties");
+        uart.read(DR, 4);
+        assert_eq!(count(), 1);
+        uart.read(DR, 4);
+        assert_eq!(count(), 1, "once per refusal");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate_core::run::StopReason;
 use crate_core::{Error, Result};
 use crate_host::disk::FileDisk;
 use crate_host::slirp::{PortForward, UserNet};
-use crate_virt::{ConsoleConfig, ConsoleKind, VirtConfig, VirtMachine};
+use crate_virt::{ConsoleConfig, ConsoleKind, NetworkConfig, VirtConfig, VirtMachine};
 
 const USAGE: &str = "\
 usage: crate-run --kernel IMAGE [options]
@@ -277,9 +277,12 @@ fn run(args: Args) -> Result<StopReason> {
     for (path, read_only) in &args.disks {
         disks.push(Arc::new(FileDisk::open(path, *read_only)?));
     }
-    let mut networks: Vec<Arc<dyn crate_core::net::NetBackend>> = Vec::new();
+    let mut networks = Vec::new();
     if args.net {
-        networks.push(UserNet::new(args.forwards.clone())?);
+        networks.push(NetworkConfig {
+            backend: UserNet::new(args.forwards.clone())?,
+            mac: None,
+        });
     }
 
     let stdout: crate_virt::Output = Arc::new(|bytes: &[u8]| {
@@ -290,6 +293,7 @@ fn run(args: Args) -> Result<StopReason> {
     let mut consoles = vec![ConsoleConfig {
         kind: ConsoleKind::Serial,
         output: stdout,
+        input_ready: None,
     }];
     let hvc_client: Arc<Mutex<Option<UnixStream>>> = Arc::default();
     let hvc_listener = match &args.virtio_console {
@@ -305,6 +309,7 @@ fn run(args: Args) -> Result<StopReason> {
                         let _ = stream.write_all(bytes);
                     }
                 }),
+                input_ready: None,
             });
             Some(listener)
         }

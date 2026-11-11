@@ -37,6 +37,10 @@ pub enum Op {
         imm12: u32,
         shift12: bool,
     },
+    /// AND, ORR or EOR (immediate) into SP, which is what Rd 31 means for
+    /// them (with flags, ANDS, it is the zero register): `word` with its
+    /// source (Rn, where 31 is the zero register) as it is.
+    LogicalSpImm { word: u32 },
     /// An add or subtract of an extended register that names SP.
     AddSubSpExt {
         sub: bool,
@@ -298,7 +302,10 @@ fn decode_data_imm(word: u32, pc: u64) -> Op {
         }
         // Add/subtract immediate with tags (ADDG/SUBG): rare, not modelled.
         0b011 => Op::Undefined,
-        // Logical, move wide, bitfield, extract: 31 is the zero register.
+        // Logical immediate: Rd 31 is SP for AND, ORR and EOR (aligning the
+        // stack is `and sp, xN, #-16`), the zero register for ANDS.
+        0b100 if word & 31 == 31 && (word >> 29) & 3 != 0b11 => Op::LogicalSpImm { word },
+        // Other logical, move wide, bitfield, extract: 31 is the zero register.
         _ => Op::Copy,
     }
 }
@@ -893,6 +900,16 @@ mod tests {
             decode(0x910003fd, 0),
             Op::AddSubSpImm { rd: 29, rn: 31, .. }
         ));
+        // and sp, x9, #0xfffffffffffffff0; orr wsp, wzr, #1; eor sp, x0, #1
+        for word in [0x927cedff, 0x320003ff, 0xd240001f] {
+            assert!(
+                matches!(decode(word, 0), Op::LogicalSpImm { .. }),
+                "{word:#x}"
+            );
+        }
+        // ands xzr, x9, #-16 (tst) and and x0, x9, #-16 copy
+        assert!(matches!(decode(0xf27ced3f, 0), Op::Copy));
+        assert!(matches!(decode(0x927ced20, 0), Op::Copy));
         // add sp, sp, x0 (extended register, uxtx)
         assert!(matches!(decode(0x8b2063ff, 0), Op::AddSubSpExt { .. }));
     }
