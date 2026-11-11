@@ -77,6 +77,16 @@ s against 4.4; on all four CPUs four compiles take 48-49 s against 56-77. The
 measurements, and where the remaining time goes (ordinary loads and stores,
 jump-cache lookups), are the input to milestone 6.
 
+The first part of milestone 5 was reached on 2026-11-11, everything but what
+needs milestone 4's GPU: the C API is implemented, crate builds as an
+XCFramework for iOS and macOS, and aTerm runs Debian on it as a third engine
+beside QEMU and Henge. On an iPhone (A20, iOS 27.1, JIT from StikDebug's
+legacy.js), Debian on three CPUs reaches a root prompt 6.3-6.6 s after the app
+launches, the debugger's authorization of the 384 MiB code region included
+(Henge: 7 s); a second tab connects over SSH, port forwards work, Claude Code
+runs, and poweroff and relaunch work. The desktop, resolution changes and the
+Omarchy guest wait for milestone 4.
+
 ## How aTerm adopts it
 
 aTerm already chooses an engine at launch. crate becomes another choice beside

@@ -1,7 +1,7 @@
 # Design
 
 How the pieces in [PLAN.md](PLAN.md)'s diagram meet in code, as of
-milestone 3.
+milestone 3 and the first part of milestone 5 (the C API and iOS).
 
 ## The board and the CPU backend
 
@@ -201,7 +201,23 @@ register, a call, an exception, a wait).
 **Executable memory** comes from `crate-host`: two mappings of the same pages,
 one writable and one executable, so translating and patching never switch a
 thread's W^X state. This is also the shape iOS needs. Nothing in crate-jit is
-macOS-only.
+macOS-only. A machine can run all its CPUs in one region, an equal slice each
+(`JitRegion::split`, `Jit::in_region`), which is how the C API runs them. A CPU
+uses at most 128 MiB of its region, the reach of the B and BL that take its
+blocks to the stubs at the start, and empties its cache when that is full; a
+block's room is checked before its branches are resolved.
+
+**On iOS** an app cannot make memory executable on its own; a debugger
+attached to it can, and StikDebug's scripts handle one `brk #0x69` stop a
+launch. `JitRegion::shared` maps the region executable (private, anonymous),
+checks that a debugger is tracing the process (a stop with none would kill
+it), stops with the region's address in x0 and its length in x1, and once the
+debugger has prepared every page and resumed past the instruction, remaps the
+same pages (copy = false) as the writable alias. The order matters: made the
+other way round, a writable mapping with an executable alias that the debugger
+prepares, the pages fault on execution. The region is kept for the life of the
+process, so a later machine gets it back. Every page is made resident when it
+is prepared, so it counts against the app's memory limit from the start.
 
 **The fast paths can be turned off** (`CRATE_JIT_SLOW=1`): every load and store
 then calls the slow path, every branch returns to the dispatcher, and system
@@ -227,13 +243,38 @@ arm64 kvm-unit-tests run on jit at 4 and 16 KiB and on hvf, single- and
 multi-CPU (`tools/kvm-unit-tests.py`); `tools/el1-diff.sh` compares small EL1
 programs on jit and hvf.
 
+## The C API
+
+`crate-ffi` implements `include/crate.h` over crate-virt's Rust API and builds
+as a static library; `tools/xcframework.sh` packages it with the header and a
+module map (Swift's `import Crate`) as an XCFramework for iOS and macOS on
+arm64. The app links libslirp itself: on iOS the framework it ships (aTerm's
+`slirp.0.framework`; Homebrew's libslirp is a macOS library), on a Mac
+Homebrew's, and the Hypervisor framework there.
+
+A config is checked as it is built, each call failing on its own mistake. A
+machine runs on a thread of its own (`crate-machine`), which reports RUNNING
+and then STOPPED with the reason through the state callback; `wait` returns
+once that report has returned. Console output reaches the app on the vCPU
+thread that wrote it; input goes in through `crate_console_write`, which takes
+what fits (the UART's 32-byte FIFO, the buffers a virtio console's driver
+posted), and `input_ready` says when there is room again: when the UART's
+FIFO empties, when the guest posts buffers. Pointers and enumerations from C
+are checked, and a panic never crosses into C: a panic hook stops the machine
+with CRATE_STOP_ERROR, so the other CPUs leave guest code rather than run on
+without one. `CRATE_CPU_AUTO` probes hvf by making and dropping a VM.
+
+`tools/crate-boot` is a C program that boots a guest through the API the way
+an app does, optionally on executable memory it maps itself.
+
 ## Not yet
 
-- The C API (`include/crate.h`) is not implemented; crate-run uses the Rust
-  API in crate-virt directly.
+- Displays, input devices, pause and resume, a power button and disk discard
+  are in crate.h but return CRATE_ERR_UNSUPPORTED.
 - The translator keeps no translations across launches and shares none
-  between CPUs; each CPU has a 256 MiB code region. The guest's 16 KiB pages
-  still take four 4 KiB TLB entries.
+  between CPUs; each CPU has a code region of at most 128 MiB (a slice of one
+  region through the C API). The guest's 16 KiB pages still take four 4 KiB
+  TLB entries.
 - PL031 alarms never fire.
 - No block I/O thread, no virtio event-index or offloads, no PCIe.
 - Loads and stores to MMIO that the CPU cannot describe (ISV clear) stop the
