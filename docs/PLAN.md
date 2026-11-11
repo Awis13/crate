@@ -64,6 +64,19 @@ Milestone 1 was reached on 2026-11-10: aTerm's Debian 13 image boots to a root
 prompt under `crate-run` on an M3 in about 1.2 s, with 4 CPUs, its disk, user
 networking, SSH through a port forward, and serial and virtio consoles.
 
+Milestone 2 was reached on 2026-11-10 (random instruction streams match the
+CPU; the single-CPU kvm-unit-tests pass), and milestone 3 on 2026-11-10: on
+`jit`, Debian boots to a root prompt on one CPU in about 13 s and on four in
+about 10 s, with SSH through a port forward. Every arm64 kvm-unit-test, single-
+and multi-CPU, passes or skips on `jit` at 4 and 16 KiB pages and on `hvf`
+(gicv2 and migration tests are not applicable). The engine benchmark
+(crate-bench, 4 CPUs, 4 GB) prints the same output hashes as `hvf` on every
+line, and every line is faster than QEMU's TCG: the single pass takes 73-81 s
+against TCG's 130.5 (native 9), gcc -O2 22-26 s against 35, 1000 spawns 1.6-2.1
+s against 4.4; on all four CPUs four compiles take 48-49 s against 56-77. The
+measurements, and where the remaining time goes (ordinary loads and stores,
+jump-cache lookups), are the input to milestone 6.
+
 ## How aTerm adopts it
 
 aTerm already chooses an engine at launch. crate becomes another choice beside
