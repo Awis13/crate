@@ -142,14 +142,20 @@ impl CodeCache {
         let mut asm = Asm::new();
         emit::mem_stub(&mut asm, self.helper);
         self.stubs.mem = self.place(asm);
+        let stats = std::env::var_os("CRATE_JIT_STATS").is_some();
         for el in 0..2 {
-            let mut asm = Asm::new();
-            let base = self.exec(self.cursor);
-            let stats = std::env::var_os("CRATE_JIT_STATS").is_some();
-            let (at, miss) = emit::jc_stub(&mut asm, el, self.stubs.save, stats);
-            self.place(asm);
-            self.stubs.jc[el as usize] = base + at as u64;
-            self.stubs.jc_miss[el as usize] = base + miss as u64;
+            for ret in [false, true] {
+                let mut asm = Asm::new();
+                let base = self.exec(self.cursor);
+                let (at, miss) = emit::jc_stub(&mut asm, el, self.stubs.save, stats, ret);
+                self.place(asm);
+                if ret {
+                    self.stubs.jc_ret[el as usize] = base + at as u64;
+                } else {
+                    self.stubs.jc[el as usize] = base + at as u64;
+                    self.stubs.jc_miss[el as usize] = base + miss as u64;
+                }
+            }
         }
     }
 
@@ -237,6 +243,19 @@ impl CodeCache {
         }
         let base = self.exec(self.cursor);
         let fetch_faulted = block.fetch_faulted;
+        // The block's further entries (where its calls return to), each the
+        // block for its own guest PC from now on.
+        let entries: Vec<(BlockKey, usize)> = block
+            .entries
+            .iter()
+            .map(|&(pc, label)| {
+                let key = BlockKey {
+                    pa: key.pa.wrapping_add(pc.wrapping_sub(block.start)),
+                    mode: key.mode,
+                };
+                (key, block.asm.offset_of(label) as usize)
+            })
+            .collect();
         let (words, cold_words) = block.asm.finish_split(base, self.exec(cold));
         if !cold_words.is_empty() {
             let mut w = self.region.writer();
@@ -248,8 +267,12 @@ impl CodeCache {
         let off = self.cursor;
         self.put(&words);
         if !fetch_faulted {
-            self.blocks.insert(key, off);
-            self.pages.entry(key.pa >> 12).or_default().push(key);
+            let keys = self.pages.entry(key.pa >> 12).or_default();
+            for (k, at) in std::iter::once((key, 0)).chain(entries) {
+                if self.blocks.insert(k, off + at).is_none() {
+                    keys.push(k);
+                }
+            }
         }
         Ok(self.exec(off))
     }
@@ -346,5 +369,43 @@ mod tests {
         assert_eq!(cache.epoch(), 1, "the cache was emptied");
         assert_eq!(cache.lookup(&key), Some(entry));
         assert!(cache.used() < 1 << 20);
+    }
+
+    #[test]
+    fn a_call_returns_to_an_entry_of_its_block() {
+        let region = JitRegion::new_dual(1 << 20).unwrap();
+        let mut cache = CodeCache::with_region(region, 0x1000, true);
+        let ctx = Ctx {
+            el: 1,
+            fast: true,
+            debug: false,
+            stubs: *cache.stubs(),
+            mpidr: 0,
+        };
+        // add x0, x0, #1 ; bl +8 ; add x0, x0, #2 ; ret ; add x0, x0, #3
+        let words = [
+            0x9100_0400,
+            0x9400_0002,
+            0x9100_0800,
+            0xd65f_03c0,
+            0x9100_0c00,
+        ];
+        let key = BlockKey {
+            pa: 0x4000_0000,
+            mode: 1,
+        };
+        let entry = cache.translate(key, 0x4000_0000, &words, ctx);
+        // The instruction after the call is an entry, after the call's BL.
+        let after = BlockKey {
+            pa: 0x4000_0008,
+            mode: 1,
+        };
+        let ret = cache.lookup(&after).expect("an entry for the return point");
+        assert!(ret > entry && ret < entry + 0x100);
+        assert_eq!(cache.block_count(), 2);
+        // Dropping the page drops both.
+        assert!(cache.invalidate_page(0x4000_0000));
+        assert_eq!(cache.lookup(&after), None);
+        assert_eq!(cache.block_count(), 0);
     }
 }

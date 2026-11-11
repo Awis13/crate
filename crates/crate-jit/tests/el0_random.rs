@@ -429,6 +429,29 @@ impl Gen<'_> {
                 out.push(b((sub.len() as i64 + 1) * 4));
                 out.extend(sub);
             }
+            5 => {
+                // An indirect call (BLR, sometimes through x30 itself) to a
+                // subroutine placed right after, then a branch over it. The
+                // subroutine first clears the register that held its address,
+                // which depends on where the code runs.
+                let k = if self.rng.next() % 4 == 0 {
+                    30
+                } else {
+                    self.reg_not(&[0])
+                };
+                let mut sub = Vec::new();
+                if k != 30 {
+                    sub.push(movz(true, k, 0, 0));
+                }
+                for _ in 0..1 + self.rng.next() % 2 {
+                    self.unit(&mut sub);
+                }
+                sub.push(ret());
+                out.push(adr(k, 12));
+                out.push(blr(k));
+                out.push(b((sub.len() as i64 + 1) * 4));
+                out.extend(sub);
+            }
             4 => {
                 // An indirect jump over 0..2 units, then x30 cleared so the
                 // result does not depend on where the code runs.

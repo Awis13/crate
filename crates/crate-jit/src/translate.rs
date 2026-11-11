@@ -28,6 +28,12 @@
 //! request first, so no loop of translated code can keep the CPU from its
 //! dispatcher.
 //!
+//! **Calls** (BL, BLR) do not end a block: each is a host BL to a tail that
+//! sets the link and goes to the target, and the code the call returns to
+//! follows the BL, as an entry of its own. A return's jump-cache lookup finds
+//! that entry and jumps there with RET, so the CPU predicts guest returns
+//! from its own return stack.
+//!
 //! A block never crosses a 4 KiB page, so a chained branch never leaves the
 //! page its block came from: invalidating a page's code throws away every
 //! block that could reach another through a chain.
@@ -220,13 +226,15 @@ fn uses(op: &Op, word: u32) -> (u32, u32) {
             | CondKind::Tbnz { rt, .. } => (bit(rt), 0),
             CondKind::Cond => (0, 0),
         },
+        // A call's callee may read any register.
+        Op::IndBranch { link: true, .. } | Op::Branch { link: true, .. } => (!0 >> 1, 1 << 30),
         Op::IndBranch { rn, .. } => (bit(rn), 0),
         Op::Sysreg { read: true, rt, .. } => (0, bit(rt)),
         Op::Sysreg {
             read: false, rt, ..
         } => (bit(rt), 0),
         Op::System { word } => (bit(word & 31), 0),
-        Op::Branch { .. }
+        Op::Branch { link: false, .. }
         | Op::Nop
         | Op::MsrImm { .. }
         | Op::Call { .. }
@@ -289,8 +297,16 @@ fn rd_write_only(word: u32) -> bool {
 }
 
 /// Whether an instruction always ends the block it is in, so looking further
-/// ahead is pointless.
-fn ends_block(op: &Op) -> bool {
+/// ahead is pointless. With `calls` a call does not: the block goes on with
+/// the code it returns to (see `Block::emit_call`).
+fn ends_block(op: &Op, calls: bool) -> bool {
+    match op {
+        Op::Branch { link: true, .. } | Op::IndBranch { link: true, .. } => !calls,
+        _ => ends_block_always(op),
+    }
+}
+
+fn ends_block_always(op: &Op) -> bool {
     matches!(
         op,
         Op::Branch { .. }
@@ -326,6 +342,18 @@ pub struct Block {
     ahead: Vec<(u32, u32)>,
     /// The index in `ahead` of the instruction being translated.
     at: usize,
+    /// The guest PC the block starts at.
+    pub start: u64,
+    /// Further entries: where each call in the block returns to, with the
+    /// guest PC of the instruction there (see `emit_call`).
+    pub entries: Vec<(u64, Label)>,
+    /// The calls' tails, emitted after the block's code: the label each
+    /// call's BL goes to, the link value, the call's PC, and the target
+    /// (None: in X16).
+    calls: Vec<(Label, u64, u64, Option<u64>)>,
+    /// The link value of a call just translated: the next instruction, if it
+    /// is translated right after the call, is an entry.
+    returns_to: Option<u64>,
 }
 
 /// Translates guest code at `pc`, whose words up to the end of its 4 KiB page
@@ -339,7 +367,7 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize) -> Block {
     for &word in words.iter().take(limit.max(1)) {
         let op = decode::decode(word, cur);
         ops.push((op, word, cur));
-        if ends_block(&op) {
+        if ends_block(&op, ctx.fast_paths()) {
             break;
         }
         cur = cur.wrapping_add(4);
@@ -355,6 +383,13 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize) -> Block {
     let mut next = pc;
     for (i, &(op, word, at)) in ops.iter().enumerate() {
         t.at = i;
+        if t.returns_to.take() == Some(at) {
+            // A call's return point, translated right after it: from now on
+            // the block for this PC (see `Block::emit_call`).
+            let entry = t.asm.label();
+            t.asm.bind(entry);
+            t.entries.push((at, entry));
+        }
         next = at.wrapping_add(4);
         if t.emit(op, word, at) {
             break;
@@ -363,6 +398,7 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize) -> Block {
     if !t.terminated {
         t.goto_const(next, None, next.wrapping_sub(4));
     }
+    t.emit_call_tails();
     t.emit_slow_sites();
     t
 }
@@ -397,6 +433,10 @@ impl Block {
             cache: RegCache::default(),
             ahead: Vec::new(),
             at: 0,
+            start: pc,
+            entries: Vec::new(),
+            calls: Vec::new(),
+            returns_to: None,
         }
     }
 
@@ -473,6 +513,10 @@ impl Block {
                 self.emit_dc_zva(word, rt, pc);
                 false
             }
+            Op::Branch { link: true, target } if self.ctx.fast_paths() => {
+                self.emit_call(pc, Some(target), 31);
+                false
+            }
             Op::Branch { link, target } => {
                 self.goto_const(target, link.then_some(pc.wrapping_add(4)), pc);
                 true
@@ -481,8 +525,12 @@ impl Block {
                 self.emit_cond_branch(word, kind, taken, pc);
                 true
             }
-            Op::IndBranch { link, rn, .. } => {
-                self.goto_reg(rn, link.then_some(pc.wrapping_add(4)));
+            Op::IndBranch { link: true, rn, .. } if self.ctx.fast_paths() => {
+                self.emit_call(pc, None, rn);
+                false
+            }
+            Op::IndBranch { link, ret, rn } => {
+                self.goto_reg(rn, link.then_some(pc.wrapping_add(4)), ret);
                 true
             }
             Op::Sysreg { read, reg, rt } => {
@@ -1461,7 +1509,7 @@ impl Block {
     }
 
     /// Continues at the address in guest register `rn` (BR, BLR, RET).
-    fn goto_reg(&mut self, rn: u32, link: Option<u64>) {
+    fn goto_reg(&mut self, rn: u32, link: Option<u64>, ret: bool) {
         if !self.ctx.fast_paths() {
             self.exit(
                 Exit::Branch as u32,
@@ -1473,6 +1521,20 @@ impl Block {
             );
             return;
         }
+        self.target_into_jump_reg(rn);
+        if let Some(link) = link {
+            emit::guest_va(&mut self.asm, 30, link, self.page << 12, 31);
+        }
+        let el = self.ctx.el.min(1) as usize;
+        let stubs = &self.ctx.stubs;
+        self.asm
+            .b_abs(if ret { stubs.jc_ret[el] } else { stubs.jc[el] });
+        self.terminated = true;
+    }
+
+    /// Puts every register back in place and guest register `rn` in X16, for
+    /// the jump cache.
+    fn target_into_jump_reg(&mut self, rn: u32) {
         self.need(rn, true, false);
         self.sync();
         match rn {
@@ -1482,12 +1544,48 @@ impl Block {
             31 => self.asm.emit(movz(true, JUMP_REG, 0, 0)),
             r => self.asm.emit(mov(JUMP_REG, r)),
         }
-        if let Some(ret) = link {
-            emit::guest_va(&mut self.asm, 30, ret, self.page << 12, 31);
+    }
+
+    /// A call (BL, or BLR to the address in `rn` when `target` is None) at
+    /// `pc`: a host BL to the call's tail, which sets the link and goes to
+    /// the target, with the code the call returns to right after the BL. So
+    /// the CPU's return stack holds the host address of the return point: the
+    /// jump cache finds that same address for the link value (it is the
+    /// entry of the block for the instruction after the call), and the
+    /// return's lookup jumps there with RET, which the CPU predicts. The
+    /// block goes on from the return point as if it had just been entered.
+    fn emit_call(&mut self, pc: u64, target: Option<u64>, rn: u32) {
+        let link = pc.wrapping_add(4);
+        if target.is_some() {
+            self.sync();
+        } else {
+            // Before the BL, which overwrites X30 (BLR X30).
+            self.target_into_jump_reg(rn);
         }
-        self.asm
-            .b_abs(self.ctx.stubs.jc[self.ctx.el.min(1) as usize]);
-        self.terminated = true;
+        let tail = self.asm.label();
+        self.asm.bl(tail);
+        self.calls.push((tail, link, pc, target));
+        self.cache = RegCache::default();
+        // Only if the instruction there is translated next: what the block
+        // ends with otherwise (a branch to the block for the link value) must
+        // not be that block itself.
+        self.returns_to = Some(link);
+    }
+
+    /// The calls' tails: the link value in X30, then the jump to the target.
+    fn emit_call_tails(&mut self) {
+        for (tail, link, pc, target) in std::mem::take(&mut self.calls) {
+            self.asm.bind(tail);
+            self.cache = RegCache::default();
+            emit::guest_va(&mut self.asm, 30, link, self.page << 12, 31);
+            match target {
+                Some(target) => self.goto_const(target, None, pc),
+                None => {
+                    let el = self.ctx.el.min(1) as usize;
+                    self.asm.b_abs(self.ctx.stubs.jc[el]);
+                }
+            }
+        }
     }
 
     fn emit_cond_branch(&mut self, word: u32, kind: CondKind, taken: u64, pc: u64) {

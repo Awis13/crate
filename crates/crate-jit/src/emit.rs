@@ -29,6 +29,8 @@ pub struct Stubs {
     pub mem: u64,
     /// The jump-cache lookup for EL0 and EL1 code (see `jc_stub`).
     pub jc: [u64; 2],
+    /// The same for returns, which jump with RET.
+    pub jc_ret: [u64; 2],
     /// Where a jump-cache miss goes; also the target of an empty entry.
     pub jc_miss: [u64; 2],
 }
@@ -161,8 +163,13 @@ fn call_rust(asm: &mut Asm, helper: u64, with_site: bool) {
 /// request, so a loop through indirect branches cannot keep the CPU from its
 /// dispatcher -- leaves with a Branch exit to the target.
 ///
+/// The lookup for a return (`ret`) jumps with RET, so the CPU predicts it
+/// from its own return stack: a guest call is a host BL whose return address
+/// is the translation of the instruction after the call (see
+/// `translate::Block::emit_call`).
+///
 /// Returns (lookup, miss) offsets in the region-relative sense of `asm.here`.
-pub fn jc_stub(asm: &mut Asm, el: u32, save: u64, stats: bool) -> (u32, u32) {
+pub fn jc_stub(asm: &mut Asm, el: u32, save: u64, stats: bool, ret: bool) -> (u32, u32) {
     let at = asm.here();
     let miss = asm.label();
     let kicked = asm.label();
@@ -195,7 +202,7 @@ pub fn jc_stub(asm: &mut Asm, el: u32, save: u64, stats: bool) -> (u32, u32) {
     asm.emit(ldr_imm(3, 16, SP, offsets::NEXT_PC));
     asm.emit(and_imm(true, 16, 16, !0xfff));
     asm.emit(str_imm(3, 16, SP, offsets::PAGE_VA));
-    asm.emit(br(15));
+    asm.emit(if ret { ret_reg(15) } else { br(15) });
     asm.bind(miss);
     let miss_at = asm.here();
     asm.emit(ldr_imm(3, 15, SP, offsets::JC_MISSES));
