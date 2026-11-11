@@ -1,2 +1,5 @@
 /target
 .DS_Store
+# Guest disk images and boot logs from local test runs.
+*.img
+*.log
