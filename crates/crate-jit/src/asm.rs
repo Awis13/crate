@@ -215,7 +215,17 @@ pub fn logical_imm(value: u64, sf: bool) -> Option<u32> {
         }
     };
     let run = (1u64 << ones) - 1;
-    let rotation = (0..size).find(|&r| rotr(element, r) == run)?;
+    // A rotated run has exactly one bit that is set while the bit below it
+    // (cyclically) is clear: where the run starts.
+    let below = ((element << 1) | (element >> (size - 1))) & mask;
+    let starts = element & !below;
+    if starts.count_ones() != 1 {
+        return None;
+    }
+    let rotation = starts.trailing_zeros();
+    if rotr(element, rotation) != run {
+        return None;
+    }
     // immr rotates the run back into place: right by (size - rotation).
     let immr = (size - rotation) % size;
     let n = (size == 64) as u32;
@@ -462,7 +472,13 @@ pub struct Asm {
 
 impl Asm {
     pub fn new() -> Self {
-        Self::default()
+        Asm {
+            words: Vec::with_capacity(4096),
+            labels: Vec::with_capacity(256),
+            fixups: Vec::with_capacity(256),
+            external: Vec::with_capacity(64),
+            literals: Vec::new(),
+        }
     }
 
     /// The offset of the next instruction.

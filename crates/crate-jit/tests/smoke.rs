@@ -158,3 +158,64 @@ fn shifted_value_then_store() {
     assert_eq!(cpu.state.x[2], 0x0800_0000, "w2 = 1<<27");
     assert_eq!(cpu.state.x[3], 0x0800_0000, "stored and read back");
 }
+
+/// PC-relative values come from where the code runs, not where it was first
+/// translated: the same physical code run at a second address (through the
+/// MMU, with the same code cache) gives the second address's ADR, ADRP and
+/// link values.
+#[test]
+fn pc_relative_values_follow_the_address_the_code_runs_at() {
+    use crate_jit::state::MmuRegs;
+    let ram = 0x4000_0000u64;
+    // adr x1, .+8 ; adrp x2, .+0x3000 ; bl .+8 ; brk #1 ; mov x4, x30 ; brk #0
+    let code = [
+        0x10000041, 0xf0000002, 0x94000002, 0xd4200020, 0xaa1e03e4, 0xd4200000,
+    ];
+    let (mut cpu, mut cache) = setup(&code);
+    // Identity-map RAM (4 KiB pages, EL1) and map the code page again at a
+    // second address.
+    let alias = 0x10_0000_0000u64 + 0x7000;
+    let tables = ram + 0x8000;
+    let l = |n: u64| tables + n * 0x1000;
+    let mem = cpu.mem.clone();
+    let map = |va: u64, pa: u64, next: &mut u64| {
+        let mut table = l(0);
+        for level in 0..3 {
+            let slot = table + ((va >> (39 - 9 * level)) & 0x1ff) * 8;
+            let d = mem.read_u64(slot).unwrap();
+            table = if d & 1 == 0 {
+                let t = l(*next);
+                *next += 1;
+                mem.write_u64(slot, t | 3).unwrap();
+                t
+            } else {
+                d & 0xffff_ffff_f000
+            };
+        }
+        mem.write_u64(table + ((va >> 12) & 0x1ff) * 8, pa | 3 | 1 << 10)
+            .unwrap();
+    };
+    let mut next = 1;
+    for off in (0..0x10000).step_by(0x1000) {
+        map(ram + off, ram + off, &mut next);
+    }
+    map(alias, ram, &mut next);
+    cpu.state.pstate = 0b0101; // EL1h
+    cpu.state.mmu = MmuRegs {
+        sctlr_el1: 1,
+        ttbr0_el1: l(0),
+        tcr_el1: 16,
+        ..Default::default()
+    };
+    for base in [ram, alias] {
+        cpu.state.pc = base;
+        assert_eq!(cpu.run(&mut cache), Stop::Brk(0), "at {base:#x}");
+        assert_eq!(cpu.state.x[1], base + 8, "adr at {base:#x}");
+        assert_eq!(
+            cpu.state.x[2],
+            (base & !0xfff) + 0x3000,
+            "adrp at {base:#x}"
+        );
+        assert_eq!(cpu.state.x[4], base + 12, "bl's link at {base:#x}");
+    }
+}

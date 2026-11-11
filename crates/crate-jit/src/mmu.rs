@@ -55,6 +55,12 @@ pub struct Translation {
     pub pa: u64,
     pub writable: bool,
     pub page_shift: u32,
+    /// log2 of the size of the mapping the walk ended at (a page, or a larger
+    /// block), so a TLB invalidation of one address can drop every cached
+    /// piece of the block.
+    pub size_shift: u32,
+    /// The mapping is global (nG clear): it does not belong to one ASID.
+    pub global: bool,
 }
 
 const SCTLR_M: u64 = 1 << 0;
@@ -133,6 +139,8 @@ pub fn translate(
             pa: va,
             writable: true,
             page_shift: ttbr0_page_shift(regs),
+            size_shift: 64,
+            global: true,
         });
     }
 
@@ -223,6 +231,8 @@ pub fn translate(
             pa,
             writable: write_ok,
             page_shift,
+            size_shift: bottom,
+            global: desc & (1 << 11) == 0,
         });
     }
 }

@@ -20,6 +20,11 @@
 pub enum Op {
     /// Copy the word into the host block unchanged.
     Copy,
+    /// A hint with no effect on this machine (NOP, YIELD, the pointer
+    /// authentication and branch-target hints, which the CPU does not offer,
+    /// and the data-cache maintenance the translator does not need): emit
+    /// nothing.
+    Nop,
     /// A PC-relative address (ADR, ADRP): compute it from the guest PC into Rd.
     PcRel { adrp: bool, rd: u32, imm: i64 },
     /// An add or subtract immediate that names SP: `rd = rn +/- imm12<<sh`.
@@ -64,22 +69,27 @@ pub enum Op {
     Call { kind: CallKind, imm: u32 },
     /// A hint whose only effect that matters is waiting (WFI, WFE).
     Wait { event: bool },
+    /// ISB: a context synchronization event, where a CPU must see code that
+    /// another CPU changed and invalidated.
+    Isb,
+    /// CLREX: clear the exclusive monitor.
+    Clrex,
+    /// DC ZVA: zero a 64-byte block of memory.
+    DcZva { rt: u32 },
     /// A barrier or cache/TLB maintenance operation handled as a helper.
     System { word: u32 },
     /// An exception-returning instruction (ERET).
     Eret,
-    /// A PC-relative literal load (LDR/LDRSW literal). The value lives at a
-    /// known guest address; the translator reads it and materialises it.
+    /// A PC-relative literal load (LDR/LDRSW literal, of a general or a
+    /// SIMD&FP register): a load from a known guest address.
     LiteralLoad {
         rt: u32,
         addr: u64,
-        /// log2 of the access size in bytes (2 or 3 for general registers).
+        /// log2 of the access size in bytes.
         size: u32,
         signed: bool,
-        /// A SIMD/FP destination (not yet handled).
+        /// A SIMD/FP destination.
         vector: bool,
-        /// PRFM (a hint); do nothing.
-        prefetch: bool,
     },
     /// Not understood; raise an Undefined-instruction exception.
     Undefined,
@@ -90,7 +100,7 @@ pub enum Op {
 pub struct Mem {
     pub word: u32,
     pub kind: MemKind,
-    /// log2 of the access size in bytes.
+    /// log2 of the access (or element) size in bytes.
     pub size: u32,
     /// Whether the loaded value is sign-extended.
     pub signed: bool,
@@ -104,6 +114,9 @@ pub struct Mem {
     pub rt: u32,
     /// Second transfer register for a pair.
     pub rt2: u32,
+    /// The status register of a store-exclusive, or the compare/source
+    /// register of a CAS or an atomic.
+    pub rs: u32,
     /// The computed byte displacement for the simple addressing modes.
     pub offset: i64,
     /// Write the base back (pre/post-index).
@@ -112,6 +125,44 @@ pub struct Mem {
     pub pre: bool,
     /// For a register offset: the offset register, its extend and shift.
     pub index_reg: Option<(u32, u32, u32)>,
+    /// For a post-indexed SIMD structure access by register: the register
+    /// added to the base afterwards.
+    pub wb_reg: Option<u32>,
+    /// Every byte the access touches, from its address.
+    pub total: u32,
+    /// The alignment the access requires, in bytes (1 for none).
+    pub align: u32,
+    pub acquire: bool,
+    pub release: bool,
+    /// LDTR/STTR and friends: checked as if at EL0.
+    pub unprivileged: bool,
+}
+
+impl Mem {
+    fn new(word: u32, kind: MemKind, size: u32, load: bool) -> Mem {
+        Mem {
+            word,
+            kind,
+            size,
+            signed: false,
+            reg64: size == 3,
+            load,
+            rn: (word >> 5) & 31,
+            rt: word & 31,
+            rt2: 31,
+            rs: 31,
+            offset: 0,
+            writeback: false,
+            pre: true,
+            index_reg: None,
+            wb_reg: None,
+            total: 1 << size,
+            align: 1,
+            acquire: false,
+            release: false,
+            unprivileged: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,10 +175,23 @@ pub enum MemKind {
     Vec,
     /// A pair of SIMD/FP registers.
     VecPair,
-    /// Exclusive or acquire/release; handled by the helper conservatively.
-    Ordered,
-    /// An LSE atomic read-modify-write (LDADD, SWP, ...) or CAS, done by the
-    /// helper as a single-CPU read-modify-write.
+    /// LD1..LD4 and ST1..ST4, of multiple structures, a single lane, or one
+    /// element replicated: the host runs the same instruction on the host
+    /// address.
+    VecStruct,
+    /// LDXR/LDAXR, or LDXP/LDAXP when `rt2` is not 31.
+    LoadExclusive,
+    /// STXR/STLXR, or STXP/STLXP when `rt2` is not 31; `rs` gets the status.
+    StoreExclusive,
+    /// LDAR, LDLAR and LDAPR.
+    LoadAcquire,
+    /// STLR and STLLR.
+    StoreRelease,
+    /// CAS: compare `rs` with memory, store `rt` if equal; `rs` gets the old.
+    Cas,
+    /// CASP: the same for the even/odd pairs at `rs` and `rt`.
+    CasPair,
+    /// An LSE read-modify-write (LDADD, LDCLR, LDEOR, LDSET, LD[SU]MAX/MIN, SWP).
     Atomic,
 }
 
@@ -325,24 +389,27 @@ fn decode_branch_system(word: u32, pc: u64) -> Op {
 fn decode_branch_reg(word: u32) -> Op {
     let opc = (word >> 21) & 0xf;
     let rn = (word >> 5) & 31;
+    // op2 (20:16) must be all ones and op3 (15:10) zero for the plain forms.
+    let plain = (word >> 16) & 31 == 31 && (word >> 10) & 0x3f == 0 && word & 31 == 0;
     match opc {
-        0b0000 => Op::IndBranch {
+        0b0000 if plain => Op::IndBranch {
             link: false,
             ret: false,
             rn,
         }, // BR
-        0b0001 => Op::IndBranch {
+        0b0001 if plain => Op::IndBranch {
             link: true,
             ret: false,
             rn,
         }, // BLR
-        0b0010 => Op::IndBranch {
+        0b0010 if plain => Op::IndBranch {
             link: false,
             ret: true,
             rn,
         }, // RET
-        0b0100 => Op::Eret,
-        // BRAA/BRAB/RETAA/... (pointer-authenticated branches) are not modelled.
+        0b0100 if word == 0xd69f_03e0 => Op::Eret,
+        // BRAA/BRAB/RETAA/ERETAA... (pointer-authenticated branches) are not
+        // offered, so they are undefined.
         _ => Op::Undefined,
     }
 }
@@ -380,43 +447,59 @@ fn decode_exception(word: u32) -> Op {
 fn decode_system(word: u32) -> Op {
     let l = word & (1 << 21) != 0;
     let op0 = (word >> 19) & 0x3;
+    let op1 = (word >> 16) & 0x7;
+    let crn = (word >> 12) & 0xf;
+    let crm = (word >> 8) & 0xf;
+    let op2 = (word >> 5) & 0x7;
     // MSR (immediate) and hints and barriers have op0 == 0b00.
     if op0 == 0b00 {
-        let op1 = (word >> 16) & 0x7;
-        let crn = (word >> 12) & 0xf;
-        let crm = (word >> 8) & 0xf;
-        let op2 = (word >> 5) & 0x7;
         if crn == 0b0100 {
             // MSR (immediate) to a PSTATE field.
             return Op::MsrImm { op1, op2, crm };
         }
-        if crn == 0b0010 {
-            // Hints: NOP, YIELD, WFE, WFI, SEV, and the rest.
-            return match (op1, op2) {
-                (0b011, 0b010) => Op::Wait { event: true },  // WFE
-                (0b011, 0b011) => Op::Wait { event: false }, // WFI
-                _ => Op::Copy,                               // NOP, YIELD, hints: harmless
+        if crn == 0b0010 && word & 31 == 31 {
+            // Hints, numbered CRm:op2.
+            return match (crm << 3) | op2 {
+                2 => Op::Wait { event: true },  // WFE
+                3 => Op::Wait { event: false }, // WFI
+                // NOP, YIELD, SEV and SEVL (WFE does not sleep on events here,
+                // see the dispatcher), DGH, ESB, CSDB, the PAC hints (the CPU
+                // offers no pointer authentication, so they are NOPs, as the
+                // architecture specifies), BTI and the rest.
+                _ => Op::Nop,
             };
         }
-        if crn == 0b0011 {
-            // CLREX (op2 == 2) clears the guest's exclusive monitor, so it goes
-            // to the helper; the barriers (DSB, DMB, ISB) run on the host.
-            return if op2 == 0b010 {
-                Op::System { word }
-            } else {
-                Op::Copy
+        if crn == 0b0011 && word & 31 == 31 {
+            return match op2 {
+                0b010 => Op::Clrex,
+                0b100 | 0b101 => Op::Copy, // DSB, DMB: the host's own barrier
+                0b110 => Op::Isb,
+                0b111 => Op::Nop, // SB, not offered
+                _ => Op::Undefined,
             };
+        }
+        return Op::System { word };
+    }
+    let rt = word & 31;
+    if op0 == 0b01 {
+        // SYS and SYSL: cache, address-translation and TLB maintenance.
+        if l {
+            return Op::Undefined;
+        }
+        if crn == 0b0111 {
+            match (op1, crm, op2) {
+                (0b011, 0b0100, 0b001) => return Op::DcZva { rt },
+                // DC CVAC/CVAU/CVAP/CVADP/CIVAC, and DC IVAC/ISW/CSW/CISW:
+                // this machine has no caches for the guest to maintain.
+                (0b011, 0b1010..=0b1110, 0b001) => return Op::Nop,
+                (0b000, 0b0110 | 0b1010 | 0b1110, 0b001 | 0b010) => return Op::Nop,
+                _ => {}
+            }
         }
         return Op::System { word };
     }
     // MRS/MSR of a named system register (op0 0b10 or 0b11).
     let reg = sysreg_encoding(word);
-    let rt = word & 31;
-    // Cache and TLB maintenance are MSR to CRn 7 or 8; keep them as helpers.
-    let crn = (word >> 12) & 0xf;
-    if !l && (crn == 0b0111 || crn == 0b1000) {
-        return Op::System { word };
-    }
     Op::Sysreg { read: l, reg, rt }
 }
 
@@ -437,9 +520,6 @@ pub fn sysreg_encoding(word: u32) -> u16 {
 }
 
 fn decode_load_store(word: u32, pc: u64) -> Op {
-    // The load/store encoding group, split by bits 29:28 (op0's low part is in
-    // the dispatcher) and 26 (V, a SIMD transfer) and 24.
-    let op0 = (word >> 28) & 0xf;
     let v = word & (1 << 26) != 0;
 
     // Load register (literal): bits 29:27 == 0b011, 25:24 == 0b00.
@@ -447,14 +527,17 @@ fn decode_load_store(word: u32, pc: u64) -> Op {
         let opc = (word >> 30) & 0x3;
         let imm = sign_extend(((word >> 5) & 0x7ffff) as u64, 19) * 4;
         let addr = pc.wrapping_add(imm as u64);
-        let (size, signed, prefetch) = if v {
-            (2 + opc, false, false) // S/D/Q
+        let (size, signed) = if v {
+            if opc == 0b11 {
+                return Op::Undefined;
+            }
+            (2 + opc, false) // S/D/Q
         } else {
             match opc {
-                0b00 => (2, false, false), // LDR (32-bit)
-                0b01 => (3, false, false), // LDR (64-bit)
-                0b10 => (2, true, false),  // LDRSW
-                _ => (3, false, true),     // PRFM (literal)
+                0b00 => (2, false),  // LDR (32-bit)
+                0b01 => (3, false),  // LDR (64-bit)
+                0b10 => (2, true),   // LDRSW
+                _ => return Op::Nop, // PRFM (literal), a hint
             }
         };
         return Op::LiteralLoad {
@@ -463,32 +546,28 @@ fn decode_load_store(word: u32, pc: u64) -> Op {
             size,
             signed,
             vector: v,
-            prefetch,
         };
     }
 
-    // Load/store register pair (op0 x0x0 with bit 25 == 0, selected here by the
-    // 101x0 shape at bits 29:27 == 0b101).
+    // Load/store register pair (bits 29:27 == 0b101, 25 == 0).
     if (word >> 27) & 0x7 == 0b101 && (word >> 25) & 1 == 0 {
         return decode_pair(word, v);
     }
 
     // Load/store register (unscaled, immediate post/pre-index, unprivileged,
-    // register offset, PAC) and unsigned immediate: bits 29:27 == 0b111.
+    // register offset, atomics) and unsigned immediate: bits 29:27 == 0b111.
     if (word >> 27) & 0x7 == 0b111 {
         return decode_single(word, v);
     }
 
-    // Load/store exclusive and ordered (LDAR/STLR, LDXR/STXR, CAS): bits
-    // 29:27 == 0b001. Handle conservatively through the helper.
+    // Bits 29:27 == 0b001: with V, the SIMD structure loads and stores;
+    // without, exclusive and ordered accesses and compare-and-swap.
     if (word >> 27) & 0x7 == 0b001 {
-        return decode_ordered(word);
-    }
-
-    // Literal loads (LDR literal) read from PC-relative memory.
-    if op0 & 0b0011 == 0b0001 && (word >> 27) & 0x7 == 0b011 {
-        // Falls through to Undefined for now; handled as PC-relative literal
-        // in a dedicated path by the translator's caller.
+        return if v {
+            decode_struct(word)
+        } else {
+            decode_ordered(word)
+        };
     }
     Op::Undefined
 }
@@ -496,67 +575,93 @@ fn decode_load_store(word: u32, pc: u64) -> Op {
 fn decode_pair(word: u32, v: bool) -> Op {
     let opc = (word >> 30) & 0x3;
     let load = word & (1 << 22) != 0;
-    let kind_bits = (word >> 23) & 0x3; // 01 post, 10 offset, 11 pre
-    let rt = word & 31;
-    let rt2 = (word >> 10) & 31;
-    let rn = (word >> 5) & 31;
+    let kind_bits = (word >> 23) & 0x3; // 00 no-allocate, 01 post, 10 offset, 11 pre
     let imm7 = sign_extend(((word >> 15) & 0x7f) as u64, 7);
-    let (size, scale, kind) = if v {
-        let size = 2 + opc; // 32/64/128-bit vectors
-        (size, size, MemKind::VecPair)
+    let (size, kind) = if v {
+        if opc == 0b11 {
+            return Op::Undefined;
+        }
+        (2 + opc, MemKind::VecPair) // 32/64/128-bit vectors
     } else {
-        let size = if opc == 0b10 { 3 } else { 2 }; // 64 or 32-bit (opc 01 is signed)
-        (size, size, MemKind::Pair)
+        if opc == 0b11 || (opc == 0b01 && !load) {
+            // opc 01 is LDPSW only (STGP is memory tagging, not offered).
+            return Op::Undefined;
+        }
+        (if opc == 0b10 { 3 } else { 2 }, MemKind::Pair)
     };
-    let offset = imm7 << scale;
-    let (pre, writeback) = match kind_bits {
+    let mut m = Mem::new(word, kind, size, load);
+    m.rt2 = (word >> 10) & 31;
+    m.offset = imm7 << size;
+    (m.pre, m.writeback) = match kind_bits {
         0b01 => (false, true), // post-index
         0b11 => (true, true),  // pre-index
-        _ => (true, false),    // signed offset
+        _ => (true, false),    // signed offset (and the no-allocate forms)
     };
-    let signed = !v && opc == 0b01;
+    m.signed = !v && opc == 0b01;
     // A pair is 64-bit per element except the 32-bit non-vector form; LDPSW
     // (signed) targets 64-bit registers.
-    let reg64 = v || opc != 0b00 || signed;
-    Op::Memory(Mem {
-        word,
-        kind,
-        size,
-        signed,
-        reg64,
-        load,
-        rn,
-        rt,
-        rt2,
-        offset,
-        writeback,
-        pre,
-        index_reg: None,
-    })
+    m.reg64 = v || opc != 0b00;
+    m.total = 2 << size;
+    Op::Memory(m)
 }
 
 fn decode_single(word: u32, v: bool) -> Op {
     let size_field = (word >> 30) & 0x3;
     let opc = (word >> 22) & 0x3;
-    let rt = word & 31;
-    let rn = (word >> 5) & 31;
 
-    // PRFM (prefetch) is opc 0b10 with size 0b11 in the non-SIMD group; it is a
-    // hint with no architectural effect, so copy it (a host prefetch to an
-    // unmapped address is a no-op) rather than treating it as a load.
+    // Atomic memory operations (LSE: LDADD, SWP, ...) and LDAPR share the
+    // register group but set bit 21 with bits 11:10 == 0b00.
+    if word & (1 << 24) == 0 && word & (1 << 21) != 0 && (word >> 10) & 3 == 0 {
+        if v {
+            return Op::Undefined;
+        }
+        let o3 = (word >> 15) & 1;
+        let op = (word >> 12) & 7;
+        let acquire = word & (1 << 23) != 0;
+        let release = word & (1 << 22) != 0;
+        let rs = (word >> 16) & 31;
+        if o3 == 1 && op == 0b100 {
+            // LDAPR: an acquiring load (A set, R clear, Rs all ones).
+            if !acquire || release || rs != 31 {
+                return Op::Undefined;
+            }
+            let mut m = Mem::new(word, MemKind::LoadAcquire, size_field, true);
+            m.align = 1 << size_field;
+            m.acquire = true;
+            return Op::Memory(m);
+        }
+        if o3 == 1 && op != 0 {
+            return Op::Undefined; // only SWP and LDAPR have o3 set
+        }
+        let mut m = Mem::new(word, MemKind::Atomic, size_field, true);
+        m.rs = rs;
+        m.align = 1 << size_field;
+        m.acquire = acquire;
+        m.release = release;
+        return Op::Memory(m);
+    }
+
+    // PRFM (prefetch) is opc 0b10 with size 0b11 in the non-SIMD group: a hint
+    // with no architectural effect.
     if !v && opc == 0b10 && size_field == 0b11 {
-        return Op::Copy;
+        return Op::Nop;
     }
 
     // Size and whether this is a load, its sign-extension and register width.
     let (size, load, signed, reg64) = if v {
         // SIMD: the size is (opc<1> : size_field).
         let size = ((opc & 2) << 1) | size_field;
+        if size > 4 {
+            return Op::Undefined;
+        }
         let load = opc & 1 != 0;
         (size, load, false, false)
     } else {
         let load = opc != 0b00; // 00 STR, 01 LDR, 10/11 LDRS
         let signed = opc == 0b10 || opc == 0b11;
+        if signed && size_field == 3 || (opc == 0b11 && size_field == 2) {
+            return Op::Undefined;
+        }
         // opc 10 sign-extends to 64 bits; opc 11 to 32. An unsigned 64-bit load
         // is size 3; everything else targets a 32-bit register.
         let reg64 = (signed && opc == 0b10) || (!signed && size_field == 3);
@@ -564,167 +669,202 @@ fn decode_single(word: u32, v: bool) -> Op {
     };
     let kind = if v { MemKind::Vec } else { MemKind::Gpr };
 
-    // Atomic memory operations (LSE: LDADD, SWP, ...) and LDAPR share the
-    // register group but set bit 21 with bits 11:10 == 0b00. Hand the whole
-    // word to the helper, which does a single-CPU read-modify-write.
-    if !v && word & (1 << 24) == 0 && word & (1 << 21) != 0 && (word >> 10) & 3 == 0 {
-        return Op::Memory(Mem {
-            word,
-            kind: MemKind::Atomic,
-            size,
-            signed: false,
-            reg64: size == 3,
-            load: true,
-            rn,
-            rt,
-            rt2: (word >> 16) & 31, // Rs
-            offset: 0,
-            writeback: false,
-            pre: true,
-            index_reg: None,
-        });
-    }
+    let mut m = Mem::new(word, kind, size, load);
+    m.signed = signed;
+    m.reg64 = reg64;
 
     // Unsigned immediate: bit 24 set.
     if word & (1 << 24) != 0 {
-        let offset = (((word >> 10) & 0xfff) as i64) << size;
-        return Op::Memory(Mem {
-            word,
-            kind,
-            size,
-            signed,
-            reg64,
-            load,
-            rn,
-            rt,
-            rt2: 0,
-            offset,
-            writeback: false,
-            pre: true,
-            index_reg: None,
-        });
+        m.offset = (((word >> 10) & 0xfff) as i64) << size;
+        return Op::Memory(m);
     }
 
     let imm9 = sign_extend(((word >> 12) & 0x1ff) as u64, 9);
     let mode = (word >> 10) & 0x3;
-    match mode {
-        0b00 => {
-            // Unscaled immediate (LDUR/STUR) or, with bit 21, register offset /
-            // atomics -- but register offset has bit 21 set and 11:10 == 10.
-            Op::Memory(Mem {
-                word,
-                kind,
-                size,
-                signed,
-                reg64,
-                load,
-                rn,
-                rt,
-                rt2: 0,
-                offset: imm9,
-                writeback: false,
-                pre: true,
-                index_reg: None,
-            })
+    let reg_form = word & (1 << 21) != 0;
+    match (mode, reg_form) {
+        // Unscaled immediate (LDUR/STUR).
+        (0b00, false) => m.offset = imm9,
+        // Post-index.
+        (0b01, false) => {
+            m.offset = imm9;
+            m.writeback = true;
+            m.pre = false;
         }
-        0b01 => Op::Memory(Mem {
-            word,
-            kind,
-            size,
-            signed,
-            reg64,
-            load,
-            rn,
-            rt,
-            rt2: 0,
-            offset: imm9,
-            writeback: true,
-            pre: false, // post-index
-            index_reg: None,
-        }),
-        0b11 => Op::Memory(Mem {
-            word,
-            kind,
-            size,
-            signed,
-            reg64,
-            load,
-            rn,
-            rt,
-            rt2: 0,
-            offset: imm9,
-            writeback: true,
-            pre: true, // pre-index
-            index_reg: None,
-        }),
-        // Register offset: bit 21 set, option in 15:13, S in 12.
-        0b10 if word & (1 << 21) != 0 => {
+        // Pre-index.
+        (0b11, false) => {
+            m.offset = imm9;
+            m.writeback = true;
+        }
+        // Register offset: option in 15:13, S in 12.
+        (0b10, true) => {
             let rm = (word >> 16) & 31;
             let option = (word >> 13) & 7;
+            if option & 0b010 == 0 {
+                return Op::Undefined; // only UXTW, LSL (UXTX), SXTW and SXTX
+            }
             let s = (word >> 12) & 1;
             let amount = if s != 0 { size } else { 0 };
-            Op::Memory(Mem {
-                word,
-                kind,
-                size,
-                signed,
-                reg64,
-                load,
-                rn,
-                rt,
-                rt2: 0,
-                offset: 0,
-                writeback: false,
-                pre: true,
-                index_reg: Some((rm, option, amount)),
-            })
+            m.index_reg = Some((rm, option, amount));
         }
-        // Unprivileged load/store (LDTR/STTR family): bits 11:10 == 10, bit 21
-        // clear. It is an unscaled `[Xn, #imm9]` access the kernel uses for
-        // usercopy; the memory helper reads the EL from the word and translates
-        // it at EL0. There is no SIMD unprivileged form.
-        0b10 if !v => Op::Memory(Mem {
-            word,
-            kind,
-            size,
-            signed,
-            reg64,
-            load,
-            rn,
-            rt,
-            rt2: 0,
-            offset: imm9,
-            writeback: false,
-            pre: true,
-            index_reg: None,
-        }),
-        _ => Op::Undefined,
+        // Unprivileged load/store (LDTR/STTR family): an unscaled `[Xn,#imm9]`
+        // access the kernel uses for usercopy, checked as if at EL0. There is
+        // no SIMD unprivileged form.
+        (0b10, false) if !v => {
+            m.offset = imm9;
+            m.unprivileged = true;
+        }
+        _ => return Op::Undefined,
     }
+    Op::Memory(m)
 }
 
-fn decode_ordered(word: u32) -> Op {
-    let size = (word >> 30) & 0x3;
+/// LD1..LD4 / ST1..ST4: multiple structures, a single structure (one lane), or
+/// one structure replicated to every lane (LD1R..LD4R), with optional
+/// post-index writeback by the transfer size or by a register.
+fn decode_struct(word: u32) -> Op {
+    // Bit 31 is zero and bits 29:24 are 0b001100 (no offset or register post-
+    // index forms of multiple structures) or 0b001101 (single structures).
+    if word & (1 << 31) != 0 || (word >> 25) & 0x1f != 0b00110 {
+        return Op::Undefined;
+    }
+    let q = word & (1 << 30) != 0;
     let load = word & (1 << 22) != 0;
-    let rt = word & 31;
-    let rn = (word >> 5) & 31;
-    // LDAR/STLR, LDAXR/STLXR, LDXR/STXR, CAS and the pair forms all go through
-    // the helper, which does the access with host ordering and the exclusive
-    // monitor. The details it needs beyond these are decoded there.
-    Op::Memory(Mem {
-        word,
-        kind: MemKind::Ordered,
-        size,
-        signed: false,
-        reg64: size == 3,
-        load,
-        rn,
-        rt,
-        rt2: (word >> 10) & 31,
-        offset: 0,
-        writeback: false,
-        pre: true,
-        index_reg: None,
-    })
+    let post = word & (1 << 23) != 0;
+    let single = word & (1 << 24) != 0;
+    let rm = (word >> 16) & 31;
+    let size = (word >> 10) & 3;
+    let total = if !single {
+        if word & (1 << 21) != 0 || (!post && rm != 0) {
+            return Op::Undefined;
+        }
+        let (regs, selem) = match (word >> 12) & 0xf {
+            0b0000 => (4, 4),
+            0b0010 => (4, 1),
+            0b0100 => (3, 3),
+            0b0110 => (3, 1),
+            0b0111 => (1, 1),
+            0b1000 => (2, 2),
+            0b1010 => (2, 1),
+            _ => return Op::Undefined,
+        };
+        if size == 3 && !q && selem > 1 {
+            return Op::Undefined;
+        }
+        regs * if q { 16 } else { 8 }
+    } else {
+        if !post && rm != 0 {
+            return Op::Undefined;
+        }
+        let opcode = (word >> 13) & 7;
+        let s = (word >> 12) & 1;
+        let r = (word >> 21) & 1;
+        let selem = (((opcode & 1) << 1) | r) + 1;
+        let esize = match opcode >> 1 {
+            0 => 0,
+            1 if size & 1 == 0 => 1,
+            2 if size == 0 => 2,
+            2 if size == 1 && s == 0 => 3,
+            3 if load && s == 0 => size, // replicate
+            _ => return Op::Undefined,
+        };
+        selem << esize
+    };
+    let mut m = Mem::new(word, MemKind::VecStruct, 0, load);
+    m.total = total;
+    if post {
+        m.writeback = true;
+        m.pre = false;
+        if rm == 31 {
+            m.offset = total as i64;
+        } else {
+            m.wb_reg = Some(rm);
+        }
+    }
+    Op::Memory(m)
+}
+
+/// The exclusive, acquire/release and compare-and-swap group (bits 29:24 ==
+/// 0b001000).
+fn decode_ordered(word: u32) -> Op {
+    if (word >> 24) & 0x3f != 0b001000 {
+        return Op::Undefined;
+    }
+    let size = (word >> 30) & 0x3;
+    let o2 = word & (1 << 23) != 0;
+    let l = word & (1 << 22) != 0;
+    let o1 = word & (1 << 21) != 0;
+    let o0 = word & (1 << 15) != 0;
+    let rs = (word >> 16) & 31;
+    let rt2 = (word >> 10) & 31;
+    let mut m = match (o2, o1) {
+        (false, false) => {
+            // LDXR/LDAXR (L) or STXR/STLXR.
+            let kind = if l {
+                MemKind::LoadExclusive
+            } else {
+                MemKind::StoreExclusive
+            };
+            let mut m = Mem::new(word, kind, size, l);
+            m.acquire = l && o0;
+            m.release = !l && o0;
+            m
+        }
+        (false, true) if size >= 2 => {
+            // LDXP/LDAXP or STXP/STLXP: 32-bit (size 10) or 64-bit (11) pairs.
+            let kind = if l {
+                MemKind::LoadExclusive
+            } else {
+                MemKind::StoreExclusive
+            };
+            let elem = size; // 2 or 3
+            let mut m = Mem::new(word, kind, elem, l);
+            m.rt2 = rt2;
+            m.total = 2 << elem;
+            m.acquire = l && o0;
+            m.release = !l && o0;
+            m
+        }
+        (false, true) => {
+            // CASP: size 00 is the 32-bit form, 01 the 64-bit one.
+            let elem = size + 2;
+            let mut m = Mem::new(word, MemKind::CasPair, elem, true);
+            m.total = 2 << elem;
+            m.acquire = l;
+            m.release = o0;
+            m
+        }
+        (true, false) => {
+            // LDAR/LDLAR (L) or STLR/STLLR.
+            let kind = if l {
+                MemKind::LoadAcquire
+            } else {
+                MemKind::StoreRelease
+            };
+            let mut m = Mem::new(word, kind, size, l);
+            m.acquire = l;
+            m.release = !l;
+            m
+        }
+        (true, true) => {
+            let mut m = Mem::new(word, MemKind::Cas, size, true);
+            m.acquire = l;
+            m.release = o0;
+            m
+        }
+    };
+    if !matches!(m.kind, MemKind::LoadExclusive | MemKind::LoadAcquire) || o1 {
+        m.rs = rs;
+    }
+    if m.kind == MemKind::LoadExclusive {
+        m.rs = 31;
+    }
+    if matches!(m.kind, MemKind::LoadAcquire | MemKind::StoreRelease) {
+        m.rs = 31;
+    }
+    m.align = m.total;
+    m.reg64 = m.size == 3;
+    Op::Memory(m)
 }
 
 #[cfg(test)]
@@ -812,6 +952,8 @@ mod tests {
                 ..
             }
         ));
+        // retaa is not offered
+        assert_eq!(decode(0xd65f0bff, 0), Op::Undefined);
     }
 
     #[test]
@@ -875,13 +1017,22 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(decode(0xd50342df, 0), Op::MsrImm { .. })); // msr daifset
-        // wfi ; wfe ; nop
+        // wfi ; wfe ; nop ; paciasp ; autiasp ; bti c
         assert_eq!(decode(0xd503207f, 0), Op::Wait { event: false });
         assert_eq!(decode(0xd503205f, 0), Op::Wait { event: true });
-        assert_eq!(decode(0xd503201f, 0), Op::Copy);
-        // dsb ish ; isb
+        assert_eq!(decode(0xd503201f, 0), Op::Nop);
+        assert_eq!(decode(0xd503233f, 0), Op::Nop);
+        assert_eq!(decode(0xd50323bf, 0), Op::Nop);
+        assert_eq!(decode(0xd503245f, 0), Op::Nop);
+        // dsb ish ; isb ; clrex
         assert_eq!(decode(0xd5033bbf, 0), Op::Copy);
-        assert_eq!(decode(0xd5033fdf, 0), Op::Copy);
+        assert_eq!(decode(0xd5033fdf, 0), Op::Isb);
+        assert_eq!(decode(0xd5033f5f, 0), Op::Clrex);
+        // dc zva, x3 ; dc cvau, x0 ; ic ivau, x0 ; tlbi vmalle1is
+        assert_eq!(decode(0xd50b7423, 0), Op::DcZva { rt: 3 });
+        assert_eq!(decode(0xd50b7b20, 0), Op::Nop);
+        assert!(matches!(decode(0xd50b7520, 0), Op::System { .. }));
+        assert!(matches!(decode(0xd508831f, 0), Op::System { .. }));
         // eret
         assert_eq!(decode(0xd69f03e0, 0), Op::Eret);
     }
@@ -892,6 +1043,7 @@ mod tests {
         match decode(0xf9400401, 0) {
             Op::Memory(m) => {
                 assert!(m.load && m.size == 3 && m.offset == 8 && m.rt == 1 && m.rn == 0);
+                assert_eq!(m.total, 8);
             }
             other => panic!("{other:?}"),
         }
@@ -921,13 +1073,130 @@ mod tests {
         match decode(0xa90107e0, 0) {
             Op::Memory(m) => {
                 assert!(m.kind == MemKind::Pair && m.rt == 0 && m.rt2 == 1 && m.rn == 31);
+                assert_eq!(m.total, 16);
             }
             other => panic!("{other:?}"),
         }
+        // prfm pldl1keep, [x0]
+        assert_eq!(decode(0xf9800000, 0), Op::Nop);
+    }
+
+    #[test]
+    fn ordered_and_exclusive() {
         // ldar x0, [x1]
         match decode(0xc8dffc20, 0) {
-            Op::Memory(m) => assert!(m.kind == MemKind::Ordered && m.load),
+            Op::Memory(m) => assert!(m.kind == MemKind::LoadAcquire && m.load && m.align == 8),
             other => panic!("{other:?}"),
         }
+        // ldaxr w2, [x3] ; stlxr w4, w5, [x6]
+        match decode(0x885ffc62, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::LoadExclusive && m.acquire && m.size == 2);
+                assert_eq!(m.rt2, 31);
+            }
+            other => panic!("{other:?}"),
+        }
+        match decode(0x8804fcc5, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::StoreExclusive && m.release && m.rs == 4 && m.rt == 5);
+            }
+            other => panic!("{other:?}"),
+        }
+        // ldxp x0, x1, [x2] ; stxp w3, x0, x1, [x2]
+        match decode(0xc87f0440, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::LoadExclusive && m.rt2 == 1 && m.total == 16)
+            }
+            other => panic!("{other:?}"),
+        }
+        match decode(0xc8230440, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::StoreExclusive && m.rt2 == 1 && m.rs == 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        // casal x0, x1, [x2] ; casp x4, x5, x6, x7, [x8]
+        match decode(0xc8e0fc41, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::Cas && m.acquire && m.release && m.rs == 0 && m.rt == 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        match decode(0x48247d06, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::CasPair && m.rs == 4 && m.rt == 6 && m.total == 16);
+            }
+            other => panic!("{other:?}"),
+        }
+        // ldaddal x1, x2, [x3] ; swp w4, w5, [x6] ; ldapr x0, [x1]
+        match decode(0xf8e10062, 0) {
+            Op::Memory(m) => assert!(m.kind == MemKind::Atomic && m.rs == 1 && m.rt == 2),
+            other => panic!("{other:?}"),
+        }
+        match decode(0xb82480c5, 0) {
+            Op::Memory(m) => assert!(m.kind == MemKind::Atomic && m.rs == 4),
+            other => panic!("{other:?}"),
+        }
+        match decode(0xf8bfc020, 0) {
+            Op::Memory(m) => assert!(m.kind == MemKind::LoadAcquire && m.acquire),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn simd_structures() {
+        // ld1 {v0.16b}, [x0] ; ld1 {v0.16b-v3.16b}, [x1], #64 ; st2 {v4.4s, v5.4s}, [x2], x3
+        match decode(0x4c407000, 0) {
+            Op::Memory(m) => assert!(m.kind == MemKind::VecStruct && m.load && m.total == 16),
+            other => panic!("{other:?}"),
+        }
+        match decode(0x4cdf2020, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::VecStruct && m.total == 64 && m.writeback);
+                assert_eq!((m.offset, m.wb_reg), (64, None));
+            }
+            other => panic!("{other:?}"),
+        }
+        match decode(0x4c838844, 0) {
+            Op::Memory(m) => {
+                assert!(m.kind == MemKind::VecStruct && !m.load && m.total == 32);
+                assert_eq!(m.wb_reg, Some(3));
+            }
+            other => panic!("{other:?}"),
+        }
+        // ld1 {v1.s}[1], [x2] ; ld1r {v3.8h}, [x4]
+        match decode(0x0d409041, 0) {
+            Op::Memory(m) => assert!(m.kind == MemKind::VecStruct && m.total == 4),
+            other => panic!("{other:?}"),
+        }
+        match decode(0x4d40c483, 0) {
+            Op::Memory(m) => assert!(m.kind == MemKind::VecStruct && m.total == 2),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn literals() {
+        // ldr x1, .+8 ; ldr q2, .+16 ; prfm plil1keep, .+4
+        assert!(matches!(
+            decode(0x58000041, 0x1000),
+            Op::LiteralLoad {
+                rt: 1,
+                addr: 0x1008,
+                size: 3,
+                vector: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode(0x9c000082, 0x1000),
+            Op::LiteralLoad {
+                rt: 2,
+                size: 4,
+                vector: true,
+                ..
+            }
+        ));
+        assert_eq!(decode(0xd8000028, 0), Op::Nop);
     }
 }

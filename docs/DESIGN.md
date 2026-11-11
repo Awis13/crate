@@ -1,7 +1,7 @@
 # Design
 
 How the pieces in [PLAN.md](PLAN.md)'s diagram meet in code, as of
-milestone 1.
+milestone 3.
 
 ## The board and the CPU backend
 
@@ -106,57 +106,134 @@ touch the machine are rewritten.
 
 **The register convention.** While translated code runs, the guest's registers
 live in the host's registers of the same number — guest X0..X30 in host
-X0..X30, the guest's NZCV in the host's, the guest V0..V31 in the host's — so a
-guest instruction that only moves data between registers *is* the same host
-instruction. The host stack pointer does not hold the guest's; it points at the
-`CpuState` block. That lets translated code spill a guest register with a plain
-`STP Xn, Xm, [SP, #off]` without first needing a scratch register, and read or
-set SP with `ADD Xn, SP, #0`. The guest's own SP lives in the state and every
-guest access to it is rewritten; a real host stack, for the moments the engine
-calls back into Rust, is kept in the state too. Keeping all 31 guest registers
-resident is what lets the common instruction copy verbatim, flags included — no
-reserved register, no per-instruction register allocation.
+X0..X30, the guest's NZCV, FPCR and FPSR in the host's, the guest V0..V31 in the
+host's — so a guest instruction that only moves data between registers *is*
+the same host instruction. The exception is X18, the platform register: the
+host OS reserves it and clobbers it (macOS zeroes it on preemption), so guest
+X18 lives in the state and every instruction that names it, data processing,
+SIMD transfers and memory alike, runs against a borrowed register. The host
+stack pointer does not hold the guest's; it points at the `CpuState` block, so
+translated code spills a register with a plain `STP Xn, Xm, [SP, #off]` and
+reaches every field with an immediate offset. The guest's own SP lives in the
+state too. FPCR and FPSR stay in the host's registers between runs as well as
+during them: the dispatcher does no floating point, and reading or writing
+them stalls the host.
 
-**What is rewritten.** Loads and stores (translated through the guest MMU),
-branches (which end a block), the stack-pointer forms of add and subtract,
-PC-relative addresses and literal loads (materialised at translation time),
-system registers, barriers and cache/TLB maintenance, waits, and the
-instructions that change the exception level. Everything else is copied.
+**Loads and stores** take an inline fast path. The guest address is computed
+into a borrowed host register (four are parked in scratch slots of the state),
+the page of its last byte is compared with the software-TLB entry for its
+first (direct-mapped, 8K entries of 4 KiB pages per exception level and kind of
+access), and on a hit the host does the same access — same size, sign,
+ordering, exclusivity — at the host address. A miss, a device, an access that
+crosses a page or a misaligned exclusive goes out of line to a stub shared by
+the code region, which saves what a call into Rust may clobber (X0..X17, the
+flags and the vectors, plus the instruction's own operands among X19..X29) and
+calls the slow path. The slow path performs the access on the state's copies of
+the registers and fills the TLB entry. Exclusives are a monitor (address and
+value) set by the load and a compare-and-swap at the store, CAS and the LSE
+atomics are the host's own instructions on the host address, and the slow
+path uses host atomics for all of them, so both paths are correct across
+CPUs. An access to a physical address no device claims reads as zero and
+ignores writes, as on hvf.
+
+**One translation per physical page.** A block never crosses a 4 KiB page and
+is found by the physical address of its first instruction and its mode (EL,
+and single-instruction for debug). Every guest address it computes — ADR and
+ADRP, literal addresses, link values, branch targets, the PC an exit records —
+is the block's run-time page (`page_va`, set by whoever enters it from
+outside its page) plus an offset. So a library is translated once however each
+process's layout places it; spawning a process does not retranslate the C
+library. The code cache keeps, per physical page, the blocks made from it, so
+IC IVAU drops exactly those.
+
+**Branches.** A direct branch to the same page ends in a branch the dispatcher
+patches to the target block (chaining); since chains never leave a page, the
+blocks of an invalidated page take every chain into them along. Other
+branches — indirect ones, returns, and direct ones to another page — look the
+target up in a jump cache (64K entries per EL, the PC's high bits folded into
+the index), a shared stub per EL; a hit branches straight into the block. EL0
+entries carry a per-CPU context number for the address space (ASID and TTBR0)
+they were filled in, so a context switch keeps them, and a TLBI of an address
+space retires its numbers instead of emptying the cache. Backward chained
+branches, jump-cache lookups and ISB test the CPU's exit request, so no loop of
+translated code keeps a CPU from its dispatcher.
+
+**System registers** that are plain state (TPIDR, SP_EL0, ELR, SPSR, ESR, FAR,
+VBAR, PAR, CPACR, CONTEXTIDR), the host's own (NZCV, FPCR, FPSR, and the
+counter, which guest and host share), constants (CTR, DCZID, MIDR, MPIDR,
+CurrentEL) and reads of the translation controls (SCTLR, TTBRx, TCR, MAIR) are
+inline; so are DAIF reads and writes, which leave for the dispatcher only when
+they unmask an interrupt that may be pending. The kernel reads TCR_EL1 about a
+million times per CPU in a compile. Everything else exits to the dispatcher,
+which emulates it as before (delegating the GIC's CPU interface to the
+controller), takes exceptions to VBAR with SP banking, and returns through
+ERET.
+
+**CPUs.** Each guest CPU runs on its own host thread with its own code cache,
+software TLBs and jump caches, which only that thread touches. PSCI CPU_ON
+hands a secondary its entry; CPU_OFF returns it to waiting. Another thread asks
+a CPU back to its dispatcher with its exit request (a kick), and wakes it if it
+sleeps in WFI on its condition variable: the interrupt controller's waker does
+this for interrupts and SGIs, a per-machine alarm thread for timer deadlines,
+and the stop hook for the machine stopping. WFE yields.
+
+**Maintenance across CPUs.** A CPU that invalidates something for the inner
+shareable domain applies it to itself and posts it to the others' queues,
+which each applies in its dispatcher before it runs guest code again. A TLB
+invalidation must be finished everywhere before the issuer goes on, so every
+CPU counts its entries to and exits from guest code in a generation word, odd
+while inside; the issuer posts, then reads each generation, and kicks and
+waits for any CPU that is inside (a sequentially consistent fence on each
+side makes one of them see the other). It waits only for CPUs running the
+address space a TLBI by ASID names, but tells them all, since any may hold its
+code. An instruction-cache invalidation neither kicks nor waits: another CPU is
+only promised the new code after its own context synchronization, so it is
+asked to look at its queue at its next ISB; and a page no CPU ever translated
+code from (a shared bitmap) needs no message at all, which is the usual case
+of a JIT writing new code.
 
 **Entering and leaving.** A trampoline (`crate_jit_enter`) saves the host's
 callee-saved registers, loads the guest state, makes SP the state block, and
-branches to the block. A block ends by storing the guest registers back and
-returning an exit code that says why (a branch, a system register, a call, an
-exception, a wait). The dispatcher acts on it: it follows branches and waits
-itself, emulates system registers (delegating the GIC's CPU interface to the
-controller, as `hvf` does), takes exceptions to VBAR with SP banking, returns
-through ERET, and drives the virtual timer from the host's counter. Memory
-accesses call a Rust helper that walks the guest page tables (4 KiB, 16 KiB and
-64 KiB granules; the page size comes from the guest's TCR), does the access on
-RAM or routes it to a device, and raises a fault where the architecture would.
+jumps to the block. A block ends by storing the guest registers back and
+returning an exit code that says why (a branch the jump cache missed, a system
+register, a call, an exception, a wait).
 
-**Executable memory** comes from `crate-host`: a MAP_JIT region on a Mac, or two
-mappings of the same pages (writable and executable aliases) elsewhere, which is
-the shape iOS needs. The translator writes through the writable alias and
-branches into the executable one, so nothing in crate-jit is macOS-only.
+**Executable memory** comes from `crate-host`: two mappings of the same pages,
+one writable and one executable, so translating and patching never switch a
+thread's W^X state. This is also the shape iOS needs. Nothing in crate-jit is
+macOS-only.
 
-**Testing.** Random EL0 instruction streams run natively (in a child process,
-caught at a trailing BRK through the signal machine context) and translated, and
-the full register file and memory are compared, so any instruction the
-translator gets wrong shows up as a divergence from the CPU itself
-(`crates/crate-jit/tests/el0_random.rs`). EL1 behaviour — the MMU, exceptions,
-system registers, the timer and the GIC — is checked against `hvf` as the
-oracle: `tools/el1-diff.sh` runs the same bare-metal programs on both backends
-and compares their output.
+**The fast paths can be turned off** (`CRATE_JIT_SLOW=1`): every load and store
+then calls the slow path, every branch returns to the dispatcher, and system
+registers all exit — the plain translation, to tell a fast-path bug from any
+other. `CRATE_JIT_STATS=1` counts exits by kind and by system register,
+jump-cache lookups and misses, slow-path calls by reason and translations,
+printed when a CPU stops.
 
-The inline software-TLB fast path for loads and stores, block chaining, and
-running several CPUs are milestone 3; the helper-per-access memory path and the
-single boot CPU here are correct but not yet fast.
+**The CPU it offers.** An Armv8.0 CPU with the LSE atomics (which the kernel
+patches its atomics to at boot), AES/PMULL, SHA1, SHA256, CRC32, RDM, the dot
+product, LRCPC, JSCVT and FCMA (all of which the host runs as copies), 4, 16 and
+64 KiB granules without LPA2, self-hosted debug, and no PAN, PAC, BTI, MTE or
+SVE.
+
+**Testing.** Random EL0 instruction streams — with forward branches, loops,
+calls and indirect jumps, across a page boundary, and every load/store form
+the fast path rewrites — run natively (in a child process, caught at a
+trailing BRK through the signal machine context) and translated with the fast
+paths on and off, and the full register file and memory are compared
+(`crates/crate-jit/tests/el0_random.rs`). Two variants name X18 (natively it is
+X29) and run one translation through the MMU at two virtual addresses. The
+arm64 kvm-unit-tests run on jit at 4 and 16 KiB and on hvf, single- and
+multi-CPU (`tools/kvm-unit-tests.py`); `tools/el1-diff.sh` compares small EL1
+programs on jit and hvf.
 
 ## Not yet
 
 - The C API (`include/crate.h`) is not implemented; crate-run uses the Rust
   API in crate-virt directly.
+- The translator keeps no translations across launches and shares none
+  between CPUs; each CPU has a 256 MiB code region. The guest's 16 KiB pages
+  still take four 4 KiB TLB entries.
 - PL031 alarms never fire.
 - No block I/O thread, no virtio event-index or offloads, no PCIe.
 - Loads and stores to MMIO that the CPU cannot describe (ISV clear) stop the

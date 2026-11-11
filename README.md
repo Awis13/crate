@@ -16,8 +16,9 @@ engine never assumes what the app looks like. The first app built on it is
 machine.
 
 Status: early. The `virt` machine boots Debian to a shell on a Mac through
-Apple's Hypervisor framework (milestone 1); the translator does not exist
-yet. See [docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
+Apple's Hypervisor framework (milestone 1) and through the translator, on one
+to four CPUs, faster than QEMU's TCG (milestone 3). There is no C API, GPU or
+iOS build yet. See [docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
 [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Goals

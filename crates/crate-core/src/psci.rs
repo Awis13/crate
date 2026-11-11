@@ -145,8 +145,11 @@ impl Psci {
         };
         let mut power = self.power.lock().unwrap();
         match power[cpu] {
-            Power::On => ALREADY_ON,
-            Power::Pending(_) => ON_PENDING,
+            // A CPU counts as on from the moment a CPU_ON for it is accepted,
+            // so of several racing calls for one CPU exactly one succeeds and
+            // the rest find it already on (as KVM answers, and as
+            // kvm-unit-tests' psci test checks).
+            Power::On | Power::Pending(_) => ALREADY_ON,
             Power::Off => {
                 power[cpu] = Power::Pending(CpuEntry { pc, context });
                 self.cond.notify_all();
@@ -216,7 +219,7 @@ mod tests {
         assert_eq!(p.call(0, [AFFINITY_INFO_64 as u64, 1, 0, 0]).0, 1);
         assert_eq!(p.call(0, [CPU_ON_64 as u64, 1, 0x4008_0000, 7]).0, 0);
         assert_eq!(p.call(0, [AFFINITY_INFO_64 as u64, 1, 0, 0]).0, 2);
-        assert_eq!(p.call(0, [CPU_ON_64 as u64, 1, 0, 0]).0 as i64, ON_PENDING);
+        assert_eq!(p.call(0, [CPU_ON_64 as u64, 1, 0, 0]).0 as i64, ALREADY_ON);
         assert_eq!(
             p.wait_for_on(1),
             Some(CpuEntry {
