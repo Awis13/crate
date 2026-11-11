@@ -63,9 +63,15 @@ type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 /// How many guest instructions a block may hold before it is cut off.
 const MAX_BLOCK: usize = 512;
 
+/// The most of a region a cache uses. Blocks branch to the stubs at the
+/// region's start with B and BL, which reach 128 MiB.
+pub const MAX_REGION: usize = 128 << 20;
+
 /// Translated host code for one CPU.
 pub struct CodeCache {
     region: JitRegion,
+    /// How much of the region is used: all of it up to `MAX_REGION`.
+    capacity: usize,
     /// Next free byte in the region.
     cursor: usize,
     /// Every live block, by key, to the offset of its entry.
@@ -92,6 +98,7 @@ impl CodeCache {
     /// A cache in `region`, whose slow path calls `helper`.
     pub fn with_region(region: JitRegion, helper: u64, fast: bool) -> Self {
         let mut cache = CodeCache {
+            capacity: region.len().min(MAX_REGION),
             region,
             cursor: 0,
             blocks: FastMap::default(),
@@ -146,7 +153,7 @@ impl CodeCache {
 
     fn put(&mut self, words: &[u32]) {
         let bytes = std::mem::size_of_val(words);
-        assert!(self.cursor + bytes <= self.region.len(), "code region full");
+        assert!(self.cursor + bytes <= self.capacity, "code region full");
         let mut w = self.region.writer();
         w.write_words(self.cursor, words);
         drop(w);
@@ -216,7 +223,7 @@ impl CodeCache {
         let fetch_faulted = block.fetch_faulted;
         let words = block.asm.finish(base);
         let bytes = std::mem::size_of_val(words.as_slice());
-        if self.cursor + bytes + 16 > self.region.len() {
+        if self.cursor + bytes + 16 > self.capacity {
             return Err(TranslateError::OutOfSpace);
         }
         let off = self.cursor;

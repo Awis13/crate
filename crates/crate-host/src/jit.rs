@@ -11,6 +11,17 @@
 //! strict policy), the same pages are mapped twice: once writable, once
 //! executable. The translator never assumes which: it writes through
 //! `write_base` and branches to addresses inside `exec_base`.
+//!
+//! On iOS an app may not make memory executable on its own. A debugger that
+//! has attached to it can: the app maps its region twice, then stops on
+//! `brk #0x69` with the executable alias's address in x0 and its length in
+//! x1, and the debugger prepares those pages and resumes it past the
+//! instruction. That is the convention StikDebug's scripts follow, and a
+//! script handles one such stop per launch, so `JitRegion::shared` asks once
+//! and keeps the region for the life of the process. A machine with several
+//! CPUs carves it into slices (`JitRegion::split`), one per CPU.
+
+use std::sync::Arc;
 
 use crate_core::{Error, Result};
 
@@ -24,6 +35,9 @@ enum Kind {
     Dual,
     /// Memory the app handed over, released by the app.
     Borrowed,
+    /// Part of another region, which it keeps alive and whose way of
+    /// switching writing it follows.
+    Slice(#[cfg_attr(not(target_os = "macos"), allow(dead_code))] Arc<JitRegion>),
 }
 
 pub struct JitRegion {
@@ -45,8 +59,29 @@ fn page_size() -> usize {
 }
 
 impl JitRegion {
+    /// The region a machine's CPUs share, got the host's way.
+    ///
+    /// On iOS that is two mappings of the same pages that an attached debugger
+    /// authorizes, asked for once per launch: a later call gets the same
+    /// region back, and fails if it wants more than the first one asked for.
+    /// Without a debugger attached it fails rather than stop on the
+    /// breakpoint, which would kill the process. Elsewhere it is a fresh pair
+    /// of mappings (`new_dual`), so no CPU switches its W^X state.
+    pub fn shared(len: usize) -> Result<Arc<Self>> {
+        #[cfg(target_os = "ios")]
+        {
+            authorized(len)
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            Ok(Arc::new(Self::new_dual(len)?))
+        }
+    }
+
     /// The host's usual kind of executable memory: MAP_JIT on a Mac, two
     /// mappings of the same pages elsewhere. `len` is rounded up to pages.
+    /// On iOS these pages are not executable until a debugger has prepared
+    /// them; see `shared`.
     pub fn new(len: usize) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
@@ -73,8 +108,8 @@ impl JitRegion {
             )
         };
         if ptr == libc::MAP_FAILED {
-            return Err(Error::Unsupported(format!(
-                "no executable memory (MAP_JIT, {} MiB): {}",
+            return Err(Error::Jit(format!(
+                "MAP_JIT, {} MiB: {}",
                 len >> 20,
                 std::io::Error::last_os_error()
             )));
@@ -119,6 +154,42 @@ impl JitRegion {
         }
     }
 
+    /// Carves the region into `parts` slices of equal size, each at most
+    /// `max_each` bytes and a whole number of host pages, which keep the
+    /// region alive and switch writing the way it does. What does not fit in
+    /// them is left unused.
+    pub fn split(self: Arc<Self>, parts: usize, max_each: usize) -> Result<Vec<JitRegion>> {
+        let page = page_size();
+        let each = (self.len / parts.max(1)).min(max_each) / page * page;
+        if parts == 0 || each == 0 {
+            return Err(Error::Jit(format!(
+                "{} KiB cannot be split {parts} ways",
+                self.len >> 10
+            )));
+        }
+        Ok((0..parts)
+            .map(|i| JitRegion {
+                // SAFETY: each slice lies inside the region: i * each + each
+                // <= parts * each <= len.
+                exec: unsafe { self.exec.add(i * each) },
+                // SAFETY: as above, in the writable alias.
+                write: unsafe { self.write.add(i * each) },
+                len: each,
+                kind: Kind::Slice(self.clone()),
+            })
+            .collect())
+    }
+
+    /// Whether writing is switched per thread (MAP_JIT).
+    #[cfg(target_os = "macos")]
+    fn switches_writing(&self) -> bool {
+        match &self.kind {
+            Kind::MapJit => true,
+            Kind::Slice(parent) => parent.switches_writing(),
+            _ => false,
+        }
+    }
+
     pub fn exec_base(&self) -> *const u8 {
         self.exec
     }
@@ -144,7 +215,7 @@ impl JitRegion {
     /// With MAP_JIT the thread cannot run the region's code meanwhile.
     pub fn writer(&self) -> JitWriter<'_> {
         #[cfg(target_os = "macos")]
-        if matches!(self.kind, Kind::MapJit) {
+        if self.switches_writing() {
             // SAFETY: switches this thread's view of MAP_JIT memory.
             unsafe { libc::pthread_jit_write_protect_np(0) };
         }
@@ -172,7 +243,7 @@ impl Drop for JitRegion {
                 libc::munmap(self.exec.cast(), self.len);
                 libc::munmap(self.write.cast(), self.len);
             },
-            Kind::Borrowed => {}
+            Kind::Borrowed | Kind::Slice(_) => {}
         }
     }
 }
@@ -217,11 +288,97 @@ impl JitWriter<'_> {
 impl Drop for JitWriter<'_> {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
-        if matches!(self.region.kind, Kind::MapJit) {
+        if self.region.switches_writing() {
             // SAFETY: switches this thread's view back to executable.
             unsafe { libc::pthread_jit_write_protect_np(1) };
         }
     }
+}
+
+/// The process's one debugger-authorized region (see the module comment).
+#[cfg(target_os = "ios")]
+fn authorized(len: usize) -> Result<Arc<JitRegion>> {
+    use std::sync::Mutex;
+    static REGION: Mutex<Option<Arc<JitRegion>>> = Mutex::new(None);
+    let mut slot = REGION.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(region) = &*slot {
+        if region.len >= len.div_ceil(page_size()) * page_size() {
+            return Ok(region.clone());
+        }
+        return Err(Error::Jit(format!(
+            "this launch's region is {} MiB, a debugger authorizes one per launch, \
+             and {} MiB were asked for",
+            region.len >> 20,
+            len >> 20
+        )));
+    }
+    if !debugger_attached() {
+        return Err(Error::Jit(
+            "no debugger is attached to authorize it (on iOS, start the app from a \
+             debugger that handles brk #0x69, such as StikDebug's legacy.js)"
+                .into(),
+        ));
+    }
+    let region = JitRegion::new_dual(len)?;
+    crate_core::info!(
+        "asking the debugger to authorize {} MiB of code at {:#x}",
+        region.len >> 20,
+        region.exec as usize
+    );
+    // SAFETY: stops for the debugger, which prepares the executable alias's
+    // pages and resumes past the instruction. Nothing has been written to
+    // the region yet, so the bytes it writes into each page do no harm.
+    unsafe {
+        std::arch::asm!(
+            "brk #0x69",
+            inout("x0") region.exec as u64 => _,
+            in("x1") region.len as u64,
+            options(nostack),
+        )
+    };
+    let region = Arc::new(region);
+    *slot = Some(region.clone());
+    Ok(region)
+}
+
+/// Whether a debugger is tracing this process (P_TRACED), the one that would
+/// answer `brk #0x69`.
+#[cfg(target_os = "ios")]
+fn debugger_attached() -> bool {
+    // struct kinfo_proc as the SDK's sys/sysctl.h lays it out for 64-bit:
+    // 648 bytes, with kp_proc.p_flag at 32.
+    const SIZE: usize = 648;
+    const P_FLAG: usize = 32;
+    const P_TRACED: i32 = 0x800;
+    let mut info = [0u64; SIZE / 8];
+    let mut size = SIZE;
+    // SAFETY: getpid has no preconditions.
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        unsafe { libc::getpid() },
+    ];
+    // SAFETY: the buffer holds `size` bytes; sysctl writes at most that.
+    let ok = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            info.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    let bytes: &[u8] = as_bytes(&info);
+    ok && size >= P_FLAG + 4
+        && i32::from_ne_bytes(bytes[P_FLAG..P_FLAG + 4].try_into().unwrap()) & P_TRACED != 0
+}
+
+#[cfg(target_os = "ios")]
+fn as_bytes(words: &[u64]) -> &[u8] {
+    // SAFETY: any initialized u64s are valid bytes, and the length is exact.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), std::mem::size_of_val(words)) }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -260,12 +417,7 @@ mod mach {
 /// `len` must be a non-zero multiple of the page size.
 #[cfg(target_vendor = "apple")]
 unsafe fn dual_map(len: usize) -> Result<(*mut u8, *mut u8)> {
-    let fail = |what: &str| {
-        Error::Unsupported(format!(
-            "no executable memory ({what}): {}",
-            std::io::Error::last_os_error()
-        ))
-    };
+    let fail = |what: &str| Error::Jit(format!("{what}: {}", std::io::Error::last_os_error()));
     // SAFETY: a fresh anonymous mapping aliases nothing.
     let write = unsafe {
         libc::mmap(
@@ -302,9 +454,7 @@ unsafe fn dual_map(len: usize) -> Result<(*mut u8, *mut u8)> {
     if kr != mach::KERN_SUCCESS {
         // SAFETY: mapped above.
         unsafe { libc::munmap(write, len) };
-        return Err(Error::Unsupported(format!(
-            "no executable memory (mach_vm_remap: {kr:#x})"
-        )));
+        return Err(Error::Jit(format!("mach_vm_remap: {kr:#x}")));
     }
     // SAFETY: the alias was just made and is ours.
     if unsafe { libc::mprotect(exec as *mut _, len, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
@@ -321,12 +471,7 @@ unsafe fn dual_map(len: usize) -> Result<(*mut u8, *mut u8)> {
 
 #[cfg(target_os = "linux")]
 unsafe fn dual_map(len: usize) -> Result<(*mut u8, *mut u8)> {
-    let fail = |what: &str| {
-        Error::Unsupported(format!(
-            "no executable memory ({what}): {}",
-            std::io::Error::last_os_error()
-        ))
-    };
+    let fail = |what: &str| Error::Jit(format!("{what}: {}", std::io::Error::last_os_error()));
     // SAFETY: the name is a valid C string.
     let fd = unsafe { libc::memfd_create(c"crate-jit".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
@@ -468,6 +613,25 @@ mod tests {
         let region = JitRegion::new_dual(1 << 20).unwrap();
         assert!(region.is_aliased());
         runs_code(&region);
+    }
+
+    #[test]
+    fn slices_run_code_of_their_own() {
+        for region in [JitRegion::new(4 << 20), JitRegion::new_dual(4 << 20)] {
+            let slices = Arc::new(region.unwrap()).split(3, 1 << 20).unwrap();
+            assert_eq!(slices.len(), 3);
+            for pair in slices.windows(2) {
+                assert_eq!(pair[0].len(), 1 << 20, "capped at max_each");
+                assert!(
+                    pair[0].exec_base() as usize + pair[0].len() <= pair[1].exec_base() as usize
+                );
+            }
+            for slice in &slices {
+                runs_code(slice);
+            }
+        }
+        let small = Arc::new(JitRegion::new_dual(page_size()).unwrap());
+        assert!(small.split(2, usize::MAX).is_err(), "less than a page each");
     }
 
     #[test]

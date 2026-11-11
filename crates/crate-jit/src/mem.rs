@@ -226,6 +226,9 @@ unsafe fn atomic_store(ptr: *mut u8, size: u32, value: u64) {
 /// # Safety
 ///
 /// `ptr` is 16-byte aligned and valid for 16 bytes.
+// Every host the translator runs on has LSE (it copies the guest's LSE atomics
+// as they are), but the iOS target's baseline CPU predates it.
+#[target_feature(enable = "lse")]
 unsafe fn cas128(ptr: *mut u8, expected: (u64, u64), new: (u64, u64)) -> (u64, u64) {
     let (mut lo, mut hi) = expected;
     // SAFETY: the caller's contract; CASP wants even/odd register pairs, which
