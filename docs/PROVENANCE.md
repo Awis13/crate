@@ -22,6 +22,10 @@ not consulted while working on crate.
 - RFC 6143, The Remote Framebuffer Protocol, for the optional VNC server.
 - The public headers and documentation of libraries crate calls
   (virglrenderer, libslirp, Apple's Hypervisor framework).
+- JJTech's write-up on JIT with a debugger on iOS
+  (https://gist.github.com/JJTech0130/142aee0f7bda9c61a421140d17afbdeb), for
+  the order in which iOS executable memory and its writable alias are mapped
+  and handed to the debugger.
 
 A guest's own source code may be read to learn what that guest expects of a
 device (how Linux drives a PL011, say). It is never copied.
