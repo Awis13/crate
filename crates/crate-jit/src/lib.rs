@@ -9,7 +9,11 @@
 
 pub mod asm;
 pub mod backend;
+pub mod cache;
 pub mod decode;
 pub mod emit;
+mod mem;
 pub mod mmu;
+pub mod smp;
 pub mod state;
+pub mod translate;
