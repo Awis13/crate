@@ -21,6 +21,7 @@ crate-jit = { path = "crates/crate-jit" }
 crate-host = { path = "crates/crate-host" }
 crate-hvf = { path = "crates/crate-hvf" }
 crate-virt = { path = "crates/crate-virt" }
+crate-vnc = { path = "crates/crate-vnc" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

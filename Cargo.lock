@@ -30,10 +30,12 @@ name = "crate-ffi"
 version = "0.0.0"
 dependencies = [
  "crate-core",
+ "crate-devices",
  "crate-host",
  "crate-hvf",
  "crate-jit",
  "crate-virt",
+ "crate-vnc",
 ]
 
 [[package]]
@@ -70,6 +72,7 @@ dependencies = [
  "crate-hvf",
  "crate-jit",
  "crate-virt",
+ "crate-vnc",
  "libc",
 ]
 
@@ -81,6 +84,13 @@ dependencies = [
  "crate-devices",
  "crate-host",
  "flate2",
+]
+
+[[package]]
+name = "crate-vnc"
+version = "0.0.0"
+dependencies = [
+ "crate-core",
 ]
 
 [[package]]
