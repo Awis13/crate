@@ -41,7 +41,7 @@ pub const TLB_BITS: u32 = 13;
 pub const TLB_ENTRIES: usize = 1 << TLB_BITS;
 
 /// Entries in each jump cache (a power of two).
-pub const JC_BITS: u32 = 14;
+pub const JC_BITS: u32 = 16;
 
 /// The jump cache's index folds higher PC bits into the low ones (shifted
 /// down this far), so code a power of two apart does not always collide.
@@ -301,8 +301,13 @@ pub struct CpuState {
     /// translations depend on; the dispatcher acts on it after the exit.
     pub flush_cache: u32,
 
-    /// How many jump-cache lookups missed (a statistic).
+    /// How many jump-cache lookups missed, and how many there were (with
+    /// CRATE_JIT_STATS=1) (statistics).
     pub jc_misses: u64,
+    pub jc_lookups: u64,
+    /// XORed into an EL0 jump-cache entry's tag: the context number of the
+    /// address space in its top 16 bits (user addresses have none there).
+    pub jc_context: u64,
     /// The real host stack top, restored into SP before calling back to Rust.
     pub host_sp: u64,
     /// This block's own address, so a helper can be handed it.
@@ -409,6 +414,8 @@ pub mod offsets {
     pub const SYSREG_READ: u32 = offset_of!(CpuState, sysreg_read) as u32;
     pub const HOST_SP: u32 = offset_of!(CpuState, host_sp) as u32;
     pub const JC_MISSES: u32 = offset_of!(CpuState, jc_misses) as u32;
+    pub const JC_LOOKUPS: u32 = offset_of!(CpuState, jc_lookups) as u32;
+    pub const JC_CONTEXT: u32 = offset_of!(CpuState, jc_context) as u32;
     pub const SELF_PTR: u32 = offset_of!(CpuState, self_ptr) as u32;
     pub const CPU_PTR: u32 = offset_of!(CpuState, cpu_ptr) as u32;
     pub const DISPATCH_TARGET: u32 = offset_of!(CpuState, dispatch_target) as u32;

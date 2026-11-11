@@ -128,7 +128,8 @@ impl CodeCache {
         for el in 0..2 {
             let mut asm = Asm::new();
             let base = self.exec(self.cursor);
-            let (at, miss) = emit::jc_stub(&mut asm, el, self.stubs.save);
+            let stats = std::env::var_os("CRATE_JIT_STATS").is_some();
+            let (at, miss) = emit::jc_stub(&mut asm, el, self.stubs.save, stats);
             self.place(asm);
             self.stubs.jc[el as usize] = base + at as u64;
             self.stubs.jc_miss[el as usize] = base + miss as u64;

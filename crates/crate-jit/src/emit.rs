@@ -172,25 +172,40 @@ fn call_rust(asm: &mut Asm, helper: u64, with_site: bool) {
 /// dispatcher -- leaves with a Branch exit to the target.
 ///
 /// Returns (lookup, miss) offsets in the region-relative sense of `asm.here`.
-pub fn jc_stub(asm: &mut Asm, el: u32, save: u64) -> (u32, u32) {
+pub fn jc_stub(asm: &mut Asm, el: u32, save: u64, stats: bool) -> (u32, u32) {
     let at = asm.here();
     let miss = asm.label();
+    let kicked = asm.label();
     asm.emit(str_imm(3, JUMP_REG, SP, offsets::NEXT_PC));
+    if stats {
+        asm.emit(ldr_imm(3, 17, SP, offsets::JC_LOOKUPS));
+        asm.emit(add_imm(true, 17, 17, 1, false));
+        asm.emit(str_imm(3, 17, SP, offsets::JC_LOOKUPS));
+    }
     asm.emit(ldr_imm(2, 17, SP, offsets::EXIT_REQUEST));
-    asm.cbnz(false, 17, miss);
-    asm.emit(eor_reg(true, 17, 16, 16, LSR, crate::state::JC_FOLD));
-    asm.emit(ubfx(17, 17, 2, crate::state::JC_BITS));
-    asm.emit(add_ext(17, SP, 17, EXT_UXTX, 4));
+    asm.cbnz(false, 17, kicked);
+    // The key: the PC, and for EL0 code the address space's context number
+    // in the top bits.
+    if el == 0 {
+        asm.emit(ldr_imm(3, 17, SP, offsets::JC_CONTEXT));
+        asm.emit(eor_reg(true, 17, 17, 16, LSL, 0));
+    } else {
+        asm.emit(mov(17, 16));
+    }
+    asm.emit(eor_reg(true, 15, 17, 17, LSR, crate::state::JC_FOLD));
+    asm.emit(ubfx(15, 15, 2, crate::state::JC_BITS));
+    asm.emit(add_ext(15, SP, 15, EXT_UXTX, 4));
     let off = offsets::jc(el);
     debug_assert_eq!(off & 0xfff, 0);
-    asm.emit(add_imm(true, 17, 17, off >> 12, true));
-    asm.emit(ldp(15, 17, 17, 0));
-    asm.emit(sub_reg(true, 15, 15, 16));
-    asm.cbnz(true, 15, miss);
+    asm.emit(add_imm(true, 15, 15, off >> 12, true));
+    asm.emit(ldp(16, 15, 15, 0)); // x16 = tag, x15 = host
+    asm.emit(sub_reg(true, 16, 16, 17));
+    asm.cbnz(true, 16, miss);
     // The target block computes guest addresses from its page.
-    asm.emit(and_imm(true, 15, 16, !0xfff));
-    asm.emit(str_imm(3, 15, SP, offsets::PAGE_VA));
-    asm.emit(mov(16, 17));
+    asm.emit(ldr_imm(3, 16, SP, offsets::NEXT_PC));
+    asm.emit(and_imm(true, 16, 16, !0xfff));
+    asm.emit(str_imm(3, 16, SP, offsets::PAGE_VA));
+    asm.emit(mov(16, 15));
     asm.emit(ldr_imm(3, 17, SP, offsets::x(17)));
     asm.emit(br(16));
     asm.bind(miss);
@@ -198,6 +213,7 @@ pub fn jc_stub(asm: &mut Asm, el: u32, save: u64) -> (u32, u32) {
     asm.emit(ldr_imm(3, 15, SP, offsets::JC_MISSES));
     asm.emit(add_imm(true, 15, 15, 1, false));
     asm.emit(str_imm(3, 15, SP, offsets::JC_MISSES));
+    asm.bind(kicked);
     asm.emit(ldp(15, 16, SP, offsets::x(15) as i32));
     asm.emit(ldr_imm(3, 17, SP, offsets::x(17)));
     // The exit prefix, with the next PC already in place.

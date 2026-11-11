@@ -279,16 +279,20 @@ impl Smp {
         }
         let asid = op.asid();
         let mut posted = [false; 64];
+        // Every CPU is told (one may hold code of the address space in its
+        // jump cache); only those that run the address space are waited for.
+        let mut waits = [false; 64];
         for (cpu, slot) in self.slots.iter().enumerate() {
             if cpu == from {
                 continue;
             }
-            if let Some(a) = asid {
-                let theirs = slot.asid.load(Ordering::SeqCst);
-                if theirs != NO_ASID && theirs != a as u64 {
-                    continue;
+            waits[cpu.min(63)] = match asid {
+                Some(a) => {
+                    let theirs = slot.asid.load(Ordering::SeqCst);
+                    theirs == NO_ASID || theirs == a as u64
                 }
-            }
+                None => true,
+            };
             let mut q = slot.queue.lock().unwrap();
             match op {
                 Remote::CodePage(pa) => {
@@ -330,7 +334,7 @@ impl Smp {
         }
         let mut running = Vec::new();
         for (cpu, slot) in self.slots.iter().enumerate() {
-            if !posted[cpu.min(63)] {
+            if !posted[cpu.min(63)] || !waits[cpu.min(63)] {
                 continue;
             }
             let g = slot.generation.load(Ordering::SeqCst);

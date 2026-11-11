@@ -9,7 +9,7 @@
 //! cache maintenance, PSCI -- and the CPU backend that runs one host thread
 //! per guest CPU.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -353,6 +353,11 @@ struct JcBook {
     large: [Option<Vec<(u32, u64)>>; 2],
     /// The miss target empty entries point at, for the cache in use.
     miss: [u64; 2],
+    /// EL0 entries are tagged with a context number for the address space
+    /// (ASID and TTBR0) they were filled in, so a context switch keeps them;
+    /// retiring a context's number drops them all at once.
+    contexts: HashMap<(u16, u64), u16, BuildHasherDefault<FastHasher>>,
+    next_context: u16,
 }
 
 /// Debug switches read once from the environment.
@@ -388,6 +393,8 @@ pub(crate) struct Counters {
     pub remote: u64,
     pub jc_flushes: u64,
     pub jc_misses: u64,
+    pub jc_lookups: u64,
+    pub jc_flush_reason: [u64; 6],
     pub chain_exits: u64,
     pub slow_device: u64,
     pub slow_cross: u64,
@@ -462,6 +469,8 @@ impl Cpu {
                 el1_low: false,
                 large: [Some(Vec::new()), Some(Vec::new())],
                 miss: [0; 2],
+                contexts: HashMap::default(),
+                next_context: 1,
             },
             vtimer_line: false,
             ptimer_line: false,
@@ -670,11 +679,13 @@ impl Cpu {
         }
         if cache.fast && !debug && pc & 3 == 0 {
             let el_i = el.min(1) as usize;
-            let i = JcEntry::index(pc);
-            self.state.jc[el_i].entries[i] = JcEntry {
-                tag: pc,
-                host: entry,
+            let tag = if el_i == 0 {
+                pc ^ self.state.jc_context
+            } else {
+                pc
             };
+            let i = JcEntry::index(tag);
+            self.state.jc[el_i].entries[i] = JcEntry { tag, host: entry };
             self.jc.filled[el_i].push(i);
             self.jc.pages[el_i].insert(pc >> 12);
             if size_shift > 12 {
@@ -740,17 +751,22 @@ impl Cpu {
     /// Drops every translation (TLBI VMALLE1, an MMU or translation-control
     /// change).
     pub(crate) fn flush_all(&mut self) {
+        self.counters.jc_flush_reason[0] += 1;
         for t in 0..4 {
             self.tlb_empty(t);
         }
         self.fetch.clear();
         self.jc_flush(0);
         self.jc_flush(1);
+        self.jc.contexts.clear();
+        self.context_changed();
     }
 
-    /// Drops the translations of the lower half of the address space (a
-    /// change of TTBR0).
+    /// Drops the data translations of the lower half of the address space (a
+    /// change of address space). The EL0 jump cache keeps its entries: they
+    /// are tagged with the address space's context number.
     fn flush_low(&mut self) {
+        self.counters.jc_flush_reason[1] += 1;
         self.tlb_empty(2);
         self.tlb_empty(3);
         for t in 0..2 {
@@ -759,14 +775,68 @@ impl Cpu {
             self.tlbs.large[t][0].clear();
         }
         self.fetch.clear();
-        self.jc_flush(0);
         if self.jc.el1_low {
             self.jc_flush(1);
         }
     }
 
-    /// Drops every non-global translation (TLBI ASIDE1).
-    fn flush_user(&mut self) {
+    /// The address space changed (TTBR0, the ASID, TCR or the MMU): publish
+    /// its ASID for other CPUs' TLBIs, and tag EL0 jump-cache entries with
+    /// its context number from now on.
+    fn context_changed(&mut self) {
+        let m = &self.state.mmu;
+        let ttbr = if m.tcr_el1 & (1 << 22) != 0 {
+            m.ttbr1_el1
+        } else {
+            m.ttbr0_el1
+        };
+        let width = if m.tcr_el1 & (1 << 36) != 0 {
+            0xffff
+        } else {
+            0xff
+        };
+        let on = m.sctlr_el1 & 1 != 0;
+        let asid = (ttbr >> 48) as u16 & width;
+        let key = (asid, m.ttbr0_el1 & 0x0000_ffff_ffff_fffe | !on as u64);
+        if let Some(smp) = self.smp() {
+            smp.set_asid(self.cpu, on.then_some(asid));
+        }
+        let ctx = match self.jc.contexts.get(&key) {
+            Some(&c) => c,
+            None => {
+                if self.jc.next_context == u16::MAX {
+                    // Out of numbers: forget every context.
+                    self.jc.contexts.clear();
+                    self.jc.next_context = 1;
+                    self.jc_flush(0);
+                }
+                let c = self.jc.next_context;
+                self.jc.next_context += 1;
+                self.jc.contexts.insert(key, c);
+                c
+            }
+        };
+        self.state.jc_context = (ctx as u64) << 48;
+    }
+
+    /// Retires the context numbers of address space `asid` (every one with
+    /// `None`), so their EL0 jump-cache entries never match again.
+    fn retire_contexts(&mut self, asid: Option<u16>) {
+        match asid {
+            Some(a) => self.jc.contexts.retain(|&(ctx_asid, _), _| ctx_asid != a),
+            None => {
+                self.jc.contexts.clear();
+                self.jc_flush(0);
+            }
+        }
+        self.context_changed();
+    }
+
+    /// Drops every non-global translation of address space `asid` (TLBI
+    /// ASIDE1): the data TLBs hold only the running address space's, and its
+    /// code in the jump cache goes by retiring its context numbers.
+    fn flush_user(&mut self, asid: u16) {
+        self.counters.jc_flush_reason[2] += 1;
         self.tlb_empty(2);
         self.tlb_empty(3);
         for t in 0..2 {
@@ -778,7 +848,7 @@ impl Cpu {
             self.tlb_drop(t, list, |_, meta| meta & META_NG != 0);
         }
         self.fetch.clear();
-        self.jc_flush(0);
+        self.retire_contexts(Some(asid));
         if self.jc.el1_low {
             self.jc_flush(1);
         }
@@ -786,7 +856,7 @@ impl Cpu {
 
     /// Drops the translations of `va` (TLBI VAE1 and friends), including every
     /// piece of a block mapping that covers it.
-    fn flush_va(&mut self, va: u64) {
+    fn flush_va(&mut self, va: u64, asid: Option<u16>) {
         let page = va >> 12;
         let half = ((va >> 55) & 1) as usize;
         for t in 0..4 {
@@ -806,7 +876,12 @@ impl Cpu {
                 None => true,
             };
             if in_large || self.jc.pages[el].contains(&page) {
-                self.jc_flush(el);
+                self.counters.jc_flush_reason[3] += 1;
+                if el == 0 && half == 0 {
+                    self.retire_contexts(asid);
+                } else {
+                    self.jc_flush(el);
+                }
             }
         }
     }
@@ -815,10 +890,11 @@ impl Cpu {
     fn apply(&mut self, op: Remote, cache: &mut CodeCache) {
         match op {
             Remote::FlushAll => self.flush_all(),
-            Remote::FlushVa(va, _) => self.flush_va(va),
-            Remote::FlushUser(_) => self.flush_user(),
+            Remote::FlushVa(va, asid) => self.flush_va(va, asid),
+            Remote::FlushUser(asid) => self.flush_user(asid),
             Remote::CodePage(pa) => {
                 if cache.invalidate_page(pa) {
+                    self.counters.jc_flush_reason[4] += 1;
                     self.jc_flush(0);
                     self.jc_flush(1);
                 }
@@ -840,27 +916,6 @@ impl Cpu {
                     smp.broadcast(self.cpu, op);
                 }
             }
-        }
-    }
-
-    /// The ASID of the address space the CPU runs (TCR.A1 picks the TTBR
-    /// that holds it, TCR.AS its width), published so another CPU's TLBI of
-    /// a different address space can leave this one alone.
-    fn publish_asid(&self) {
-        let m = &self.state.mmu;
-        let ttbr = if m.tcr_el1 & (1 << 22) != 0 {
-            m.ttbr1_el1
-        } else {
-            m.ttbr0_el1
-        };
-        let width = if m.tcr_el1 & (1 << 36) != 0 {
-            0xffff
-        } else {
-            0xff
-        };
-        let asid = (m.sctlr_el1 & 1 != 0).then_some((ttbr >> 48) as u16 & width);
-        if let Some(smp) = self.smp() {
-            smp.set_asid(self.cpu, asid);
         }
     }
 
@@ -1746,6 +1801,7 @@ impl Cpu {
                 let mut c = std::mem::take(&mut self.counters);
                 c.sysregs.clear();
                 c.jc_misses = self.state.jc_misses;
+                c.jc_lookups = self.state.jc_lookups;
                 eprintln!(
                     "crate: cpu{} {c:?} blocks={} code={}K sysregs: {}",
                     self.cpu,
@@ -2028,12 +2084,12 @@ impl Cpu {
                 if (old ^ value) & (1 | 1 << 19 | 1 << 25) != 0 {
                     self.flush_all();
                 }
-                self.publish_asid();
+                self.context_changed();
             }
             r if r == sr::TTBR0_EL1 => {
                 if self.state.mmu.ttbr0_el1 != value {
                     self.state.mmu.ttbr0_el1 = value;
-                    self.publish_asid();
+                    self.context_changed();
                     self.flush_low();
                 }
             }
@@ -2041,19 +2097,18 @@ impl Cpu {
                 let old = self.state.mmu.ttbr1_el1;
                 self.state.mmu.ttbr1_el1 = value;
                 const BADDR: u64 = 0x0000_ffff_ffff_fffe;
-                self.publish_asid();
                 if (old ^ value) & BADDR != 0 {
                     self.flush_all();
                 } else if old != value {
-                    // Only the ASID changed (TCR.A1 puts it here): the
-                    // non-global translations belong to the old one.
-                    self.flush_user();
+                    // Only the ASID changed (TCR.A1 puts it here): another
+                    // address space.
+                    self.context_changed();
+                    self.flush_low();
                 }
             }
             r if r == sr::TCR_EL1 => {
                 if self.state.mmu.tcr_el1 != value {
                     self.state.mmu.tcr_el1 = value;
-                    self.publish_asid();
                     self.flush_all();
                 }
             }
@@ -2388,7 +2443,7 @@ mod tests {
         let host = cpu.state.tlb[0].entries[i].delta.wrapping_add(va + 8);
         // SAFETY: the host address of guest RAM the test owns.
         assert_eq!(unsafe { *(host as *const u64) }, 0x55);
-        cpu.flush_va(va + 0x123);
+        cpu.flush_va(va + 0x123, None);
         assert_eq!(cpu.state.tlb[0].entries[i].tag, TLB_INVALID);
     }
 }
