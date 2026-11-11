@@ -99,6 +99,23 @@ in 3.1-4.3 s (hvf 0.8 s) and loads a 2000-row page with script in 1.4-1.5 s
 (hvf 0.12 s); a WebGL canvas runs at 60 frames a second on both. An idle Xfce
 desktop costs 1.2-1.5% of a host core on `jit` and 0.4% on `hvf`.
 
+Milestone 5 was reached on 2026-11-11. On the same iPhone, aTerm runs crate
+with its display (virgl over the ANGLE and virglrenderer frameworks the app
+embeds, served to the app by crate's VNC server) and keyboard and tablet,
+under the 1950 MiB the app's provisioning profile leaves a guest. Debian
+reaches a root prompt 6.6-7.0 s after launch and a drawn desktop 8.2-8.4 s
+after; all three desktop styles run on the GPU, Chrome composites on it,
+Claude Code runs in a terminal on the desktop, resolution changes work, and
+taps, long presses, two-finger scrolls and the key bar reach the guest.
+Omarchy (Linux 7.3, Hyprland) needed only a generic fix (AIDR_EL1, which
+Linux 7 reads at boot, was undefined); it reaches a prompt in 10-13 s and its
+desktop in 43-56 s (18 s and 77 s on its first boot), with SSH tabs, port
+forwards, Claude Code and resolution changes working. Its first boot once
+stopped responding after two desktop restarts in quick succession, with the
+guest short of memory; it did not happen again on the phone or on a Mac at
+the same memory. Forwarded sockets no longer raise SIGPIPE when a connection's
+other end has gone.
+
 ## How aTerm adopts it
 
 aTerm already chooses an engine at launch. crate becomes another choice beside

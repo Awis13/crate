@@ -18,7 +18,6 @@
  */
 #include <errno.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,9 +246,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     crate_set_log_callback(log_message, NULL, CRATE_LOG_INFO);
-    /* As apps do: user-mode networking writes to forwarded sockets whose
-       other end may be gone, and SIGPIPE would end the process. */
-    signal(SIGPIPE, SIG_IGN);
+    /* SIGPIPE is left as it is, as in an app that does not ignore it: crate
+       must not raise it, even when a forwarded connection's other end has
+       gone. */
     for (unsigned run = 1;; run++) {
         started = now();
         prompted = 0;
