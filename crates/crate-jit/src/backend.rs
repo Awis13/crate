@@ -2124,6 +2124,9 @@ impl Cpu {
             r if r == sr::CTR_EL0 => CTR_EL0,
             r if r == sr::DCZID_EL0 => DCZID_EL0,
             r if r == sr::CLIDR_EL1 => 0, // no cache levels advertised
+            // Implementation defined; nothing to say. Linux 7.x reads it into
+            // its CPU information at boot.
+            r if r == sr::AIDR_EL1 => 0,
             r if r == sr::ID_AA64MMFR0_EL1 => ID_AA64MMFR0,
             r if r == sr::ID_AA64PFR0_EL1 => ID_AA64PFR0,
             r if r == sr::ID_AA64DFR0_EL1 => ID_AA64DFR0,
@@ -2387,6 +2390,7 @@ mod sr {
     pub const CTR_EL0: SysReg = SysReg::new(3, 3, 0, 0, 1);
     pub const DCZID_EL0: SysReg = SysReg::new(3, 3, 0, 0, 7);
     pub const CLIDR_EL1: SysReg = SysReg::new(3, 1, 0, 0, 1);
+    pub const AIDR_EL1: SysReg = SysReg::new(3, 1, 0, 0, 7);
     pub const CSSELR_EL1: SysReg = SysReg::new(3, 2, 0, 0, 0);
     pub const ID_AA64PFR0_EL1: SysReg = SysReg::new(3, 0, 0, 4, 0);
     pub const ID_AA64DFR0_EL1: SysReg = SysReg::new(3, 0, 0, 5, 0);
