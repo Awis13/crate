@@ -56,7 +56,7 @@ Each ends in something that runs.
 | 3 | Full system on `jit`: several CPUs, TLB maintenance across CPUs, exclusives, self-modifying code | Debian boots on 4 CPUs; benchmark outputs byte-identical to native; faster than QEMU's TCG |
 | 4 | GPU, display, input: virtio-gpu 2D and virgl (virglrenderer over ANGLE), keyboard and tablet | aTerm's desktops, Chrome and Claude Code run under `crate-run` on a Mac |
 | 5 | iOS: XCFramework, iOS executable-memory provider, aTerm adopts crate beside its current engines | Debian and Omarchy on a device pass aTerm's checklist: console, SSH tabs, forwards, desktop, resolution change, Claude Code |
-| 6 | Speed: 16 KB-page guest kernels, Linux paravirtual hooks (TLB flushes, idle), guest memory mapped by the host MMU, translations kept across launches | targets set from the milestone 3 measurements |
+| 6 | Speed: the translator's own costs first (scratch registers for loads and stores, cold code apart, predicted returns), then 16 KB-page guest kernels, Linux paravirtual hooks (TLB flushes, idle), guest memory mapped by the host MMU, translations kept across launches | on an M3, jit, 4 CPUs: crate-bench's single pass under 50 s, gcc -O2 under 15 s, four compiles at once under 30 s, every output hash unchanged; on the iPhone, Debian still at its prompt in about 7 s and its desktop in about 8.4 s |
 | 7 | Ready to publish: device and machine interfaces frozen as v1, documentation, a minimal sample app | the owner decides to open the repository |
 | later | Other guests (macOS) as machines of their own | |
 
@@ -115,6 +115,29 @@ stopped responding after two desktop restarts in quick succession, with the
 guest short of memory; it did not happen again on the phone or on a Mac at
 the same memory. Forwarded sockets no longer raise SIGPIPE when a connection's
 other end has gone.
+
+Milestone 6's targets were met on the Mac on 2026-11-11. The speed came from
+the translator's own costs, which a profile of a compile showed were most of
+its time: loads and stores spilled and reloaded four registers each, every
+block entered through the jump cache stalled on its first instruction, and
+half of the code was cold. Guest X15..X17 now live in the state between
+blocks, so the memory fast path has three scratch registers whenever an access
+does not name them, borrows others only otherwise and puts them back lazily,
+and runs every access at its host address with no offset; code that runs once
+or never goes to the far end of a CPU's code region, so the code that runs is
+packed for the instruction cache; and a call is a host BL whose return address
+is the translation of the instruction after it, so a return jumps there with
+RET and the CPU predicts it. On jit with 4 CPUs and 4 GB, crate-bench's single
+pass takes 34.8-36.4 s (milestone 3: 73-81 s; QEMU's TCG 130.5; native 9),
+gcc -O2 10.0-10.6 s (22-26), four compiles at once 15.0-16.8 s (48-49), xz -T4
+16.6 s (34-38) and 1000 spawns 0.7-0.8 s (1.6-2.1), with every output hash
+unchanged and the kvm-unit-tests passing or skipping as before. Debian reaches
+a root prompt in 7.0 s on the Mac (4 CPUs), Chrome's V8 gives the same results
+faster, and Omarchy boots. PLAN's own items for this milestone remain: 16
+KB-page guest kernels, paravirtual TLB flushes and idle, guest memory mapped
+by the host MMU, translations kept across launches; so do a code cache shared
+by the CPUs and chained branches to another page. The largest cost left in a
+compile is the TLB lookup, a load on the path to every access's data.
 
 ## How aTerm adopts it
 
