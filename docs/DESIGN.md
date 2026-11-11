@@ -82,7 +82,10 @@ Block requests read and write guest memory in place with `pread`/`pwrite` on
 the vCPU that submitted them. Network frames go to libslirp, which runs on its
 own thread because it is not thread-safe; frames the guest has posted no
 buffers for wait in a small backlog. No offloads are offered yet, so TCP
-moves about 20 MB/s.
+moves about 20 MB/s. Every host socket libslirp makes is set SO_NOSIGPIPE on
+Apple systems as it is registered, so writing to a forwarded connection whose
+other end has gone fails with EPIPE rather than raising SIGPIPE, which there
+goes to the whole process: an app embedding crate need not ignore it.
 
 ## The GPU, the display and input
 

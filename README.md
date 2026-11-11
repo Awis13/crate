@@ -18,10 +18,11 @@ machine.
 Status: early. The `virt` machine boots Debian to a shell on a Mac through
 Apple's Hypervisor framework (milestone 1) and through the translator, on one
 to four CPUs, faster than QEMU's TCG (milestone 3). The C API is implemented
-and aTerm runs Debian on crate on an iPhone, with executable memory from an
-attached debugger (the first part of milestone 5). A virtio-gpu with virgl
-(virglrenderer over ANGLE) and a keyboard and tablet run aTerm's desktops and
-Chrome with hardware compositing on a Mac, on both backends (milestone 4). See
+and a virtio-gpu with virgl (virglrenderer over ANGLE) and a keyboard and
+tablet run aTerm's desktops and Chrome with hardware compositing on a Mac, on
+both backends (milestone 4). aTerm runs Debian and Omarchy on crate on an
+iPhone, desktops included, with executable memory from an attached debugger
+(milestone 5). See
 [docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
 [docs/DESIGN.md](docs/DESIGN.md).
 
