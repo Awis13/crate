@@ -409,6 +409,11 @@ pub fn ret() -> u32 {
     0xd65f_03c0
 }
 
+/// RET Xn: a branch to Xn the CPU predicts as a subroutine return.
+pub fn ret_reg(rn: Reg) -> u32 {
+    0xd65f_0000 | rn << 5
+}
+
 // ---------------------------------------------------------------- system
 
 /// MRS/MSR with the packed op0:op1:CRn:CRm:op2 encoding crate_core's SysReg uses.

@@ -76,8 +76,8 @@ core::arch::global_asm!(
     "ldp q26, q27, [sp, #({v}+416)]",
     "ldp q28, q29, [sp, #({v}+448)]",
     "ldp q30, q31, [sp, #({v}+480)]",
-    // Load guest X0..X30 but X16 (the jump register, which the block's entry
-    // reloads) and X18 (virtual: it lives in the state).
+    // Load guest X0..X30 but X15..X17 (a block takes them from their slots
+    // when it needs them) and X18 (virtual: it lives in the state).
     "ldp x0,  x1,  [sp, #({x}+0)]",
     "ldp x2,  x3,  [sp, #({x}+16)]",
     "ldp x4,  x5,  [sp, #({x}+32)]",
@@ -85,8 +85,7 @@ core::arch::global_asm!(
     "ldp x8,  x9,  [sp, #({x}+64)]",
     "ldp x10, x11, [sp, #({x}+80)]",
     "ldp x12, x13, [sp, #({x}+96)]",
-    "ldp x14, x15, [sp, #({x}+112)]",
-    "ldr x17, [sp, #({x}+136)]",
+    "ldr x14, [sp, #({x}+112)]",
     "ldr x19, [sp, #({x}+152)]",
     "ldp x20, x21, [sp, #({x}+160)]",
     "ldp x22, x23, [sp, #({x}+176)]",
@@ -94,7 +93,7 @@ core::arch::global_asm!(
     "ldp x26, x27, [sp, #({x}+208)]",
     "ldp x28, x29, [sp, #({x}+224)]",
     "ldr x30, [sp, #({x}+240)]",
-    // Jump to the block, whose entry reloads guest X15 and X16.
+    // Jump to the block.
     "ldr x16, [sp, #{dispatch}]",
     "br x16",
     ".globl _crate_jit_epilogue",

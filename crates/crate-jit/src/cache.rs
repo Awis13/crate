@@ -25,7 +25,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate_host::jit::JitRegion;
 
 use crate::asm::*;
-use crate::emit::{self, CHAIN_ENTRY, Stubs};
+use crate::emit::{self, Stubs};
 use crate::translate::{self, Ctx};
 
 /// Identifies a translation.
@@ -247,8 +247,7 @@ impl CodeCache {
         if site < base || site >= end {
             return;
         }
-        let target = entry + CHAIN_ENTRY;
-        let delta = target.wrapping_sub(site) as i64;
+        let delta = entry.wrapping_sub(site) as i64;
         if !(-(1 << 27)..(1 << 27)).contains(&delta) {
             return;
         }

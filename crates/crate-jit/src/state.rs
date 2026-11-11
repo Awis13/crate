@@ -9,9 +9,13 @@
 //! host's registers of the same number: guest X0..X30 in host X0..X30, the
 //! guest's NZCV flags in the host's, the guest V0..V31 in the host's, and the
 //! guest's FPCR and FPSR in the host's. So a guest instruction that only moves
-//! data between registers is copied into the host block unchanged. The one
-//! exception is X18, the platform register, which the host OS reserves and
-//! clobbers: guest X18 lives in `x[18]` here, like SP.
+//! data between registers is copied into the host block unchanged. The
+//! exceptions are X18, the platform register, which the host OS reserves and
+//! clobbers: guest X18 lives in `x[18]` here, like SP; and X15..X17, which
+//! live in `x[15..18]` wherever one block of code hands over to another, so
+//! the host registers are scratch for the stubs, the jump cache and the
+//! memory fast path. A block loads one of them into its host register when
+//! an instruction names it and stores it back before it leaves.
 //!
 //! The host's stack pointer does not hold the guest's. It points instead at
 //! this block, so translated code can spill a guest register to it with a
@@ -271,8 +275,8 @@ pub struct CpuState {
     /// page: the host address of the branch to patch once the target block
     /// exists (block chaining). Zero otherwise.
     pub chain_site: u64,
-    /// The memory slow path's call site (its literal: the instruction word,
-    /// where to return, and the guest PC).
+    /// The memory slow path's call site (its literal: the instruction word
+    /// and the guest PC's offset in its page).
     pub slow_site: u64,
     /// The exclusive monitor: the address a load-exclusive reserved
     /// (`MONITOR_CLEAR` for none) and the value(s) it read. A store-exclusive
@@ -320,6 +324,9 @@ pub struct CpuState {
     pub dispatch_target: u64,
     /// The host address the exit stubs return through (`crate_jit_epilogue`).
     pub epilogue: u64,
+    /// Where the memory slow path returns to: the instruction after the
+    /// site's call.
+    pub slow_ret: u64,
 
     pub banked: Banked,
     pub mmu: MmuRegs,
@@ -410,6 +417,7 @@ pub mod offsets {
     pub const PAGE_VA: u32 = offset_of!(CpuState, page_va) as u32;
     pub const CHAIN_SITE: u32 = offset_of!(CpuState, chain_site) as u32;
     pub const SLOW_SITE: u32 = offset_of!(CpuState, slow_site) as u32;
+    pub const SLOW_RET: u32 = offset_of!(CpuState, slow_ret) as u32;
     pub const MONITOR: u32 = offset_of!(CpuState, monitor) as u32;
     pub const MONITOR_VALUE: u32 = offset_of!(CpuState, monitor_value) as u32;
     pub const MONITOR_VALUE2: u32 = offset_of!(CpuState, monitor_value2) as u32;
@@ -487,6 +495,7 @@ mod tests {
             offsets::PAGE_VA,
             offsets::CHAIN_SITE,
             offsets::SLOW_SITE,
+            offsets::SLOW_RET,
             offsets::MONITOR,
             offsets::MONITOR_VALUE,
             offsets::FPCR,
