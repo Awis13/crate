@@ -128,7 +128,12 @@ context was current goes back after a readback and after creating a guest
 context, because virglrenderer makes the new context current to set it up yet
 believes the earlier one still is; and its `virgl_box` is taken to be the
 virtio box (six 32-bit fields). `CRATE_GL_DEBUG=1` makes debug contexts and
-logs ANGLE's own messages, which name the failing call.
+logs ANGLE's own messages, which name the failing call. Once started,
+virglrenderer stays for the life of the process, as the iOS code region does:
+`virgl_renderer_cleanup` waits for the thread of its render server, which the
+build crate uses starts even without venus and never finishes. A freed machine
+resets the renderer and releases its context, and the next one takes it up on
+its own GPU thread.
 
 **virtio-input** devices are a keyboard (every key code from KEY_ESC to
 KEY_MICMUTE, with EV_REP so the guest repeats held keys) and a tablet (ABS_X

@@ -220,7 +220,6 @@ functions!(EglFunctions {
     eglCreateContext: fn(EglDisplay, EglConfig, EglContext, *const i32) -> EglContext;
     eglDestroyContext: fn(EglDisplay, EglContext) -> u32;
     eglCreatePbufferSurface: fn(EglDisplay, EglConfig, *const i32) -> EglSurface;
-    eglDestroySurface: fn(EglDisplay, EglSurface) -> u32;
     eglMakeCurrent: fn(EglDisplay, EglSurface, EglSurface, EglContext) -> u32;
     eglGetError: fn() -> i32;
     eglGetCurrentContext: fn() -> EglContext;
@@ -247,7 +246,6 @@ functions!(VirglFunctions {
     virgl_renderer_create_fence: fn(c_int, u32) -> c_int;
     virgl_renderer_ctx_attach_resource: fn(c_int, c_int);
     virgl_renderer_ctx_detach_resource: fn(c_int, c_int);
-    virgl_renderer_cleanup: fn(*mut c_void);
     virgl_renderer_resource_get_info: fn(c_int, *mut ResourceInfo) -> c_int;
     virgl_renderer_reset: fn();
 });
@@ -255,7 +253,6 @@ functions!(VirglFunctions {
 // The OpenGL ES functions this module calls itself, from eglGetProcAddress.
 functions!(GlFunctions {
     glGenFramebuffers: fn(i32, *mut u32);
-    glDeleteFramebuffers: fn(i32, *const u32);
     glBindFramebuffer: fn(u32, u32);
     glFramebufferTexture2D: fn(u32, u32, u32, u32, i32);
     glCheckFramebufferStatus: fn(u32) -> u32;
@@ -487,7 +484,8 @@ const VIRGL_NAMES: &[&str] = &["libvirglrenderer.so.1"];
 #[cfg(not(target_vendor = "apple"))]
 const EGL_NAMES: &[&str] = &["libEGL.so.1"];
 
-pub struct Virgl {
+/// virglrenderer and the EGL state it runs on.
+struct Inner {
     virgl: VirglFunctions,
     functions: GlFunctions,
     /// The primary context's framebuffer for reading resources back.
@@ -503,8 +501,9 @@ pub struct Virgl {
     _libraries: [Library; 2],
 }
 
-impl Virgl {
-    pub fn new() -> Result<Self> {
+impl Inner {
+    /// Loads the libraries and starts virglrenderer.
+    fn start() -> Result<Self> {
         let egl_library = Library::open(&library_names("CRATE_EGL", EGL_NAMES))?;
         let virgl_library = Library::open(&library_names("CRATE_VIRGLRENDERER", VIRGL_NAMES))?;
         let egl = EglFunctions::load(|name| egl_library.symbol(name))?;
@@ -630,7 +629,7 @@ impl Virgl {
                 "virgl_renderer_init failed ({status})"
             )));
         }
-        Ok(Virgl {
+        Ok(Inner {
             virgl,
             functions,
             framebuffer,
@@ -720,29 +719,72 @@ fn open_display(egl: &EglFunctions) -> Result<(EglDisplay, &'static str)> {
     ))
 }
 
+impl Inner {
+    /// Leaves the renderer ready for another machine, on another thread:
+    /// every guest context and resource gone, no context current here.
+    fn park(&mut self) -> Parked {
+        self.reset();
+        let current = self.gl.current();
+        self.gl.make_current(ptr::null_mut());
+        // SAFETY: a plain EGL call; this thread is done with EGL.
+        unsafe { (self.gl.egl.eglReleaseThread)() };
+        Parked(current)
+    }
+
+    /// Takes the renderer up on this thread: what was current when it was
+    /// parked is current again, as virglrenderer believes.
+    fn resume(&mut self, parked: Parked) {
+        self.gl.restore(parked.0);
+        self.gl.retired.borrow_mut().clear();
+    }
+}
+
+/// What was current when a renderer was parked.
+struct Parked((EglContext, EglSurface, EglSurface));
+
+/// A parked renderer, waiting for the next machine.
+struct Kept(Inner, Parked);
+
+// SAFETY: a kept renderer is used by no thread: it was parked with no context
+// current, and the thread that takes it resumes it before any use.
+unsafe impl Send for Kept {}
+
+/// virglrenderer stays for the life of the process once started:
+/// virgl_renderer_cleanup waits for the thread of its render server, which
+/// this build starts even without venus and which never finishes, so freeing
+/// a machine would hang. A machine's renderer is parked here instead, and the
+/// next machine gets it back.
+static KEPT: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
+
+/// The renderer a virtio-gpu uses: virglrenderer, started on the first use
+/// and kept afterwards.
+pub struct Virgl {
+    inner: Option<Inner>,
+}
+
+impl Virgl {
+    pub fn new() -> Result<Self> {
+        let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let inner = match kept {
+            Some(Kept(mut inner, parked)) => {
+                inner.resume(parked);
+                inner
+            }
+            None => Inner::start()?,
+        };
+        Ok(Virgl { inner: Some(inner) })
+    }
+
+    fn inner(&mut self) -> &mut Inner {
+        self.inner.as_mut().expect("a renderer")
+    }
+}
+
 impl Drop for Virgl {
     fn drop(&mut self) {
-        let resources: Vec<u32> = self.backings.keys().copied().collect();
-        for resource in resources {
-            self.detach(resource);
-        }
-        let cookie = &*self.gl as *const Gl as *mut c_void;
-        // SAFETY: the cookie init was given; virglrenderer destroys its
-        // contexts through the callbacks, which are still alive.
-        unsafe { (self.virgl.virgl_renderer_cleanup)(cookie) };
-        let gl = &self.gl;
-        if gl.make_current(gl.primary) {
-            // SAFETY: the framebuffer made in new, in its context.
-            unsafe { (self.functions.glDeleteFramebuffers)(1, &self.framebuffer) };
-        }
-        gl.make_current(ptr::null_mut());
-        // SAFETY: the context and surface made in new, used by nothing now.
-        unsafe {
-            (gl.egl.eglDestroyContext)(gl.display, gl.primary);
-            if !gl.surface.is_null() {
-                (gl.egl.eglDestroySurface)(gl.display, gl.surface);
-            }
-            (gl.egl.eglReleaseThread)();
+        if let Some(mut inner) = self.inner.take() {
+            let parked = inner.park();
+            *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Kept(inner, parked));
         }
     }
 }
@@ -757,9 +799,98 @@ fn status(what: &str, code: c_int) -> RendererResult<()> {
 
 impl Renderer for Virgl {
     fn description(&self) -> String {
-        self.description.clone()
+        self.inner
+            .as_ref()
+            .map(|i| i.description.clone())
+            .unwrap_or_default()
     }
 
+    fn capsets(&self) -> Vec<Capset> {
+        self.inner.as_ref().map(Inner::capsets).unwrap_or_default()
+    }
+
+    fn fill_capset(&mut self, id: u32, version: u32, out: &mut [u8]) {
+        self.inner().fill_capset(id, version, out)
+    }
+
+    fn create_context(&mut self, context: u32, name: &[u8]) -> RendererResult<()> {
+        self.inner().create_context(context, name)
+    }
+
+    fn destroy_context(&mut self, context: u32) {
+        self.inner().destroy_context(context)
+    }
+
+    fn attach_resource(&mut self, context: u32, resource: u32) {
+        self.inner().attach_resource(context, resource)
+    }
+
+    fn detach_resource(&mut self, context: u32, resource: u32) {
+        self.inner().detach_resource(context, resource)
+    }
+
+    fn create_resource(&mut self, resource: &Resource3d) -> RendererResult<()> {
+        self.inner().create_resource(resource)
+    }
+
+    fn destroy_resource(&mut self, resource: u32) {
+        self.inner().destroy_resource(resource)
+    }
+
+    unsafe fn attach_backing(
+        &mut self,
+        resource: u32,
+        backing: Vec<HostSlice>,
+    ) -> RendererResult<()> {
+        // SAFETY: the caller's promise, passed on.
+        unsafe { self.inner().attach_backing(resource, backing) }
+    }
+
+    fn detach_backing(&mut self, resource: u32) {
+        self.inner().detach_backing(resource)
+    }
+
+    fn transfer_to_host(&mut self, transfer: &Transfer) -> RendererResult<()> {
+        self.inner().transfer_to_host(transfer)
+    }
+
+    fn transfer_from_host(&mut self, transfer: &Transfer) -> RendererResult<()> {
+        self.inner().transfer_from_host(transfer)
+    }
+
+    fn submit(&mut self, context: u32, commands: &mut [u32]) -> RendererResult<()> {
+        self.inner().submit(context, commands)
+    }
+
+    fn create_fence(&mut self, fence: u64, context: u32) -> RendererResult<()> {
+        self.inner().create_fence(fence, context)
+    }
+
+    fn poll(&mut self) -> Vec<u64> {
+        self.inner().poll()
+    }
+
+    fn read(
+        &mut self,
+        resource: u32,
+        rect: Rect,
+        out: &mut [u8],
+        stride: u32,
+    ) -> RendererResult<()> {
+        self.inner().read(resource, rect, out, stride)
+    }
+
+    fn cursor_image(&mut self, resource: u32) -> Option<(u32, u32, Vec<u8>)> {
+        self.inner().cursor_image(resource)
+    }
+
+    fn reset(&mut self) {
+        self.inner().reset()
+    }
+}
+
+/// The renderer's work, which `Virgl` passes on.
+impl Inner {
     fn capsets(&self) -> Vec<Capset> {
         [CAPSET_VIRGL, CAPSET_VIRGL2]
             .iter()
