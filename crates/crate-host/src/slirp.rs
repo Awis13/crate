@@ -332,6 +332,32 @@ unsafe extern "C" fn timer_mod(timer: *mut c_void, expire_ms: i64, _opaque: *mut
     unsafe { (*timer.cast::<Timer>()).expire = Some(expire_ms) };
 }
 
+/// Every socket libslirp makes for the host side of a connection, listening
+/// ones and those it accepts or connects included. It writes to them, and a
+/// write to one whose other end has gone raises SIGPIPE, which ends a process
+/// that has not chosen to ignore it: Rust programs ignore it, C and Swift apps
+/// do not. With SO_NOSIGPIPE the write fails with EPIPE instead and slirp
+/// closes that connection. (On Apple systems the signal goes to the process,
+/// so blocking it on this thread alone would not do.)
+unsafe extern "C" fn register_poll_fd(fd: c_int, _opaque: *mut c_void) {
+    #[cfg(target_vendor = "apple")]
+    {
+        let on: c_int = 1;
+        // SAFETY: an int option on a socket libslirp has just made.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw const on).cast(),
+                size_of::<c_int>() as libc::socklen_t,
+            )
+        };
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = fd;
+}
+
 unsafe extern "C" fn no_poll_fd(_fd: c_int, _opaque: *mut c_void) {}
 
 unsafe extern "C" fn notify(_opaque: *mut c_void) {}
@@ -389,7 +415,7 @@ static CALLBACKS: SlirpCb = SlirpCb {
     timer_new,
     timer_free,
     timer_mod,
-    register_poll_fd: no_poll_fd,
+    register_poll_fd,
     unregister_poll_fd: no_poll_fd,
     notify,
     init_completed: None,
@@ -582,6 +608,30 @@ mod tests {
         assert_eq!(offset_of!(SlirpCb, notify), 64);
         assert_eq!(offset_of!(SlirpCb, timer_new_opaque), 80);
         assert_eq!(std::mem::size_of::<SlirpCb>(), 104);
+    }
+
+    /// A socket libslirp registers says EPIPE rather than raising SIGPIPE.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn registered_sockets_do_not_raise_sigpipe() {
+        // SAFETY: a socket of our own, closed at the end.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            register_poll_fd(fd, std::ptr::null_mut());
+            let mut on: c_int = 0;
+            let mut len = size_of::<c_int>() as libc::socklen_t;
+            let r = libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_NOSIGPIPE,
+                (&raw mut on).cast(),
+                &mut len,
+            );
+            libc::close(fd);
+            assert_eq!(r, 0);
+            assert_ne!(on, 0);
+        }
     }
 
     struct Frames(Mutex<Vec<Vec<u8>>>);
