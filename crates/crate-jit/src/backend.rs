@@ -434,11 +434,57 @@ impl Cpu {
                 Some(Exit::Undefined) => {
                     return Stop::Undefined(self.state.exception_syndrome as u32);
                 }
-                Some(Exit::Sysreg) => return Stop::Sysreg,
+                Some(Exit::Sysreg) => {
+                    if !self.el0_sysreg() {
+                        return Stop::Sysreg;
+                    }
+                }
                 Some(Exit::Exception) => return Stop::Exception,
                 None => return Stop::Unknown(code),
             }
         }
+    }
+
+    /// The bare runner's system registers: the ones an EL0 program uses with
+    /// the fast paths off (NZCV, FPCR, FPSR, TPIDR_EL0). Returns false for
+    /// anything else.
+    fn el0_sysreg(&mut self) -> bool {
+        let reg = self.state.sysreg as u16;
+        let rt = self.state.sysreg_rt as usize;
+        let read = self.state.sysreg_read != 0;
+        let value = if rt == 31 { 0 } else { self.state.x[rt] };
+        let got = match reg {
+            r if r == sr::NZCV.0 => {
+                if !read {
+                    self.state.nzcv = value & 0xf000_0000;
+                }
+                self.state.nzcv
+            }
+            r if r == sr::FPCR.0 => {
+                if !read {
+                    set_fpcr(value);
+                }
+                fpcr()
+            }
+            r if r == sr::FPSR.0 => {
+                if !read {
+                    set_fpsr(value);
+                }
+                fpsr()
+            }
+            r if r == sr::TPIDR_EL0.0 => {
+                if !read {
+                    self.state.banked.tpidr_el0 = value;
+                }
+                self.state.banked.tpidr_el0
+            }
+            _ => return false,
+        };
+        if read && rt != 31 {
+            self.state.x[rt] = got;
+        }
+        self.state.pc = self.state.next_pc;
+        true
     }
 
     /// The host entry of the block for the current PC, translating it if
