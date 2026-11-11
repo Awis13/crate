@@ -64,7 +64,7 @@ type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 const MAX_BLOCK: usize = 512;
 
 /// The most of a region a cache uses. Blocks branch to the stubs at the
-/// region's start with B and BL, which reach 128 MiB.
+/// region's start with B and BL, which reach 128 MiB back.
 pub const MAX_REGION: usize = 128 << 20;
 
 /// Translated host code for one CPU.
@@ -219,13 +219,14 @@ impl CodeCache {
         block: translate::Block,
         _debug: bool,
     ) -> Result<u64, TranslateError> {
+        // Before resolving the block's branches: one to the stubs from past
+        // the end of the capacity would not reach them.
+        if self.cursor + block.asm.size_bound() + 16 > self.capacity {
+            return Err(TranslateError::OutOfSpace);
+        }
         let base = self.exec(self.cursor);
         let fetch_faulted = block.fetch_faulted;
         let words = block.asm.finish(base);
-        let bytes = std::mem::size_of_val(words.as_slice());
-        if self.cursor + bytes + 16 > self.capacity {
-            return Err(TranslateError::OutOfSpace);
-        }
         let off = self.cursor;
         self.put(&words);
         if !fetch_faulted {
@@ -293,5 +294,39 @@ impl CodeCache {
     /// Bytes of code in use.
     pub fn used(&self) -> usize {
         self.cursor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_past_the_reach_of_the_stubs_starts_a_new_epoch() {
+        let region = JitRegion::new_dual(MAX_REGION).unwrap();
+        // The helper is never called: nothing here runs.
+        let mut cache = CodeCache::with_region(region, 0x1000, true);
+        // Just short of the end, where the block's branches back to the
+        // stubs would be out of reach.
+        cache.cursor = MAX_REGION - 16;
+        let ctx = Ctx {
+            el: 1,
+            fast: true,
+            debug: false,
+            stubs: *cache.stubs(),
+            mpidr: 0,
+        };
+        // add x0, x0, #1 (500 times); br x1: a long block, whose exit branch
+        // to the stubs lies well past the cursor.
+        let mut words = vec![0x9100_0400u32; 500];
+        words.push(0xd61f_0020);
+        let key = BlockKey {
+            pa: 0x4000_0000,
+            mode: 1,
+        };
+        let entry = cache.translate(key, 0x4000_0000, &words, ctx);
+        assert_eq!(cache.epoch(), 1, "the cache was emptied");
+        assert_eq!(cache.lookup(&key), Some(entry));
+        assert!(cache.used() < 1 << 20);
     }
 }

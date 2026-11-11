@@ -482,6 +482,13 @@ impl Asm {
     }
 
     /// The offset of the next instruction.
+    /// The most bytes `finish` can make of this code: its words, an
+    /// alignment word and the literals.
+    pub fn size_bound(&self) -> usize {
+        let literals: usize = self.literals.iter().map(|(_, v)| v.len() * 8).sum();
+        (self.words.len() + 1) * 4 + literals
+    }
+
     pub fn here(&self) -> u32 {
         (self.words.len() * 4) as u32
     }
