@@ -12,14 +12,33 @@ use std::path::Path;
 use crate_core::block::BlockBackend;
 use crate_core::{Error, Result};
 
+/// What a guest's flush does to the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flush {
+    /// fsync: durable against a crash of this process or the guest, which is
+    /// what a flush promises here, at a fraction of the cost of the next.
+    Data,
+    /// On Apple systems F_FULLFSYNC, which also empties the drive's own cache
+    /// and so survives power loss; elsewhere the same as `Data`.
+    Full,
+    /// Nothing: fastest, for scratch disks, but a host crash can lose recent
+    /// writes.
+    Ignore,
+}
+
 pub struct FileDisk {
     file: File,
     len: u64,
     read_only: bool,
+    flush: Flush,
 }
 
 impl FileDisk {
     pub fn open(path: &Path, read_only: bool) -> Result<Self> {
+        Self::open_with(path, read_only, Flush::Data)
+    }
+
+    pub fn open_with(path: &Path, read_only: bool, flush: Flush) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(!read_only)
@@ -33,6 +52,7 @@ impl FileDisk {
             file,
             len,
             read_only,
+            flush,
         })
     }
 }
@@ -51,10 +71,21 @@ impl BlockBackend for FileDisk {
         self.file.write_all_at(buf, offset)
     }
     fn flush(&self) -> io::Result<()> {
-        // fsync, not F_FULLFSYNC: durable against a crash of this process or
-        // the guest, which is what a flush promises here, at a fraction of the
-        // cost of pushing the drive's own cache.
-        self.file.sync_data()
+        match self.flush {
+            Flush::Data => self.file.sync_data(),
+            #[cfg(target_vendor = "apple")]
+            Flush::Full => {
+                use std::os::fd::AsRawFd;
+                // SAFETY: an fcntl with no argument on our own descriptor.
+                match unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) } {
+                    -1 => Err(io::Error::last_os_error()),
+                    _ => Ok(()),
+                }
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            Flush::Full => self.file.sync_data(),
+            Flush::Ignore => Ok(()),
+        }
     }
 }
 

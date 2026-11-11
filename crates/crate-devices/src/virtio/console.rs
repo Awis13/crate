@@ -20,10 +20,17 @@ const QUEUE_SIZE: u16 = 64;
 const MAX_WRITE: usize = 1 << 20;
 
 pub type Output = Arc<dyn Fn(&[u8]) + Send + Sync>;
+/// Told when the guest posts buffers after `ConsoleInput::write` turned
+/// bytes away.
+pub type InputReady = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct Receiver {
     queue: Option<(Queue, Arc<Interrupt>)>,
+    /// `write` took fewer bytes than it was offered since the guest last
+    /// posted buffers.
+    starved: bool,
+    ready: Option<InputReady>,
 }
 
 /// The app's side of the console's input.
@@ -35,6 +42,18 @@ impl ConsoleInput {
     /// posted, possibly nothing, and returns how many that was.
     pub fn write(&self, bytes: &[u8]) -> usize {
         let mut rx = self.0.lock().unwrap();
+        let taken = Self::fill(&mut rx, bytes);
+        rx.starved |= taken < bytes.len();
+        taken
+    }
+
+    /// Calls `ready` (on the vCPU that posted them) when the guest posts
+    /// receive buffers after `write` turned bytes away.
+    pub fn set_input_ready(&self, ready: InputReady) {
+        self.0.lock().unwrap().ready = Some(ready);
+    }
+
+    fn fill(rx: &mut Receiver, bytes: &[u8]) -> usize {
         let Some((queue, interrupt)) = &mut rx.queue else {
             return 0;
         };
@@ -110,6 +129,19 @@ impl VirtioDevice for Console {
     }
 
     fn notify(&mut self, index: u16) {
+        if index == 0 {
+            // New receive buffers.
+            let mut rx = self.rx.0.lock().unwrap();
+            if rx.starved {
+                rx.starved = false;
+                let ready = rx.ready.clone();
+                drop(rx);
+                if let Some(ready) = ready {
+                    ready();
+                }
+            }
+            return;
+        }
         if index != 1 {
             return;
         }
@@ -180,8 +212,21 @@ mod tests {
         assert_eq!(&*printed.lock().unwrap(), b"login: ");
         assert_eq!(driver.take_used(), Some((0, 0)));
 
+        let ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ready.clone();
+        input.set_input_ready(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
         driver.offer(&[(DATA + 0x100, 4, true)]);
         assert_eq!(input.write(b"root\n"), 4, "one 4-byte buffer posted");
+        dev.notify(0);
+        assert_eq!(
+            ready.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "ready once more buffers come"
+        );
+        dev.notify(0);
+        assert_eq!(ready.load(std::sync::atomic::Ordering::Relaxed), 1);
         let mut got = [0; 4];
         memory.read(DATA + 0x100, &mut got).unwrap();
         assert_eq!(&got, b"root");

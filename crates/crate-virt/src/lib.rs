@@ -51,6 +51,15 @@ pub struct ConsoleConfig {
     pub kind: ConsoleKind,
     /// Gets what the guest writes, on whichever thread it was written.
     pub output: Output,
+    /// Told when the console can take bytes again after `console_write`
+    /// took fewer than it was offered.
+    pub input_ready: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub struct NetworkConfig {
+    pub backend: Arc<dyn NetBackend>,
+    /// Without one, network n gets 02:63:72:61:74:65+n, the same every run.
+    pub mac: Option<[u8; 6]>,
 }
 
 pub struct VirtConfig {
@@ -66,7 +75,7 @@ pub struct VirtConfig {
     pub cmdline: String,
     /// virtio block devices: vda, vdb, ... in this order.
     pub disks: Vec<Arc<dyn BlockBackend>>,
-    pub networks: Vec<Arc<dyn NetBackend>>,
+    pub networks: Vec<NetworkConfig>,
     pub consoles: Vec<ConsoleConfig>,
 }
 
@@ -200,16 +209,25 @@ impl VirtMachine {
         }
         for (i, net) in config.networks.iter().enumerate() {
             devices.push(Box::new(Net::new(
-                net.clone(),
-                [0x02, 0x63, 0x72, 0x61, 0x74, 0x65 + i as u8],
+                net.backend.clone(),
+                net.mac
+                    .unwrap_or([0x02, 0x63, 0x72, 0x61, 0x74, 0x65 + i as u8]),
             )));
         }
         let mut consoles = Vec::new();
         for console in &config.consoles {
             match console.kind {
-                ConsoleKind::Serial => consoles.push(ConsoleHandle::Serial(uart.clone())),
+                ConsoleKind::Serial => {
+                    if let Some(ready) = &console.input_ready {
+                        uart.set_input_ready(ready.clone());
+                    }
+                    consoles.push(ConsoleHandle::Serial(uart.clone()))
+                }
                 ConsoleKind::Virtio => {
                     let device = Console::new(console.output.clone());
+                    if let Some(ready) = &console.input_ready {
+                        device.input().set_input_ready(ready.clone());
+                    }
                     consoles.push(ConsoleHandle::Virtio(device.input()));
                     devices.push(Box::new(device));
                 }

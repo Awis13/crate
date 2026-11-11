@@ -68,6 +68,19 @@ impl Hvf {
     pub fn new() -> Self {
         Hvf { _private: () }
     }
+
+    /// Whether this process may use the framework: it runs on a Mac that
+    /// has it and is signed with the entitlement. Asks by making a VM and
+    /// throwing it away, so not while one runs.
+    pub fn available() -> bool {
+        // SAFETY: a NULL configuration asks for the default one.
+        let ok = unsafe { hv_vm_create(std::ptr::null_mut()) } == HV_SUCCESS;
+        if ok {
+            // SAFETY: the VM just made, with no vCPUs or mappings.
+            unsafe { hv_vm_destroy() };
+        }
+        ok
+    }
 }
 
 impl Default for Hvf {
