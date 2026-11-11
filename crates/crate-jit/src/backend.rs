@@ -441,6 +441,10 @@ pub struct Cpu {
     timer_fired: [bool; 2],
     /// An interrupt was pending but masked when last looked at.
     masked_pending: bool,
+    /// When that was found: PSTATE's I and F bits, and the interrupt
+    /// controller's wake count. Until either changes, nothing new can be
+    /// taken, so the dispatcher does not ask the controller again.
+    masked_at: Option<(u64, u32)>,
     trace: Trace,
 }
 
@@ -476,6 +480,7 @@ impl Cpu {
             ptimer_line: false,
             timer_fired: [false; 2],
             masked_pending: false,
+            masked_at: None,
             trace: Trace::from_env(),
         });
         cpu.state.epilogue = epilogue_addr();
@@ -1044,9 +1049,7 @@ impl Cpu {
                     self.dump();
                 }
             }
-            if self.state.irq_hint().load(Ordering::Relaxed) != 0
-                && self.take_pending_interrupt(board)
-            {
+            if self.interrupt_may_be_taken() && self.take_pending_interrupt(board) {
                 chain = None;
                 continue;
             }
@@ -1206,6 +1209,8 @@ impl Cpu {
     /// while one is pending but masked, so unmasking looks again.
     fn take_pending_interrupt(&mut self, board: &Board) -> bool {
         self.state.irq_hint().store(0, Ordering::Relaxed);
+        self.masked_at = None;
+        let wakes = self.state.irq_wakes().load(Ordering::Acquire);
         let irq = board.interrupts.irq_pending(self.cpu);
         let fiq = board.interrupts.fiq_pending(self.cpu);
         let pstate = self.state.pstate;
@@ -1232,13 +1237,30 @@ impl Cpu {
         self.masked_pending = irq || fiq;
         if self.masked_pending {
             self.state.irq_hint().store(1, Ordering::Relaxed);
+            self.masked_at = Some((pstate & (PSTATE_I | PSTATE_F), wakes));
         }
         false
+    }
+
+    /// Whether an interrupt could be taken now that was not when last looked
+    /// at: a hint is set, and the mask or the controller's state changed.
+    fn interrupt_may_be_taken(&self) -> bool {
+        if self.state.irq_hint().load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        match self.masked_at {
+            Some((mask, wakes)) => {
+                mask != self.state.pstate & (PSTATE_I | PSTATE_F)
+                    || wakes != self.state.irq_wakes().load(Ordering::Acquire)
+            }
+            None => true,
+        }
     }
 
     /// After anything that may unmask an interrupt or change what is
     /// pending: look again before the next block.
     fn recheck_interrupts(&mut self) {
+        self.masked_at = None;
         self.state.irq_hint().store(1, Ordering::Relaxed);
     }
 

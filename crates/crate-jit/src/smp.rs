@@ -400,6 +400,7 @@ impl Smp {
 impl CpuWaker for Smp {
     fn wake(&self, cpu: usize) {
         if let Some(s) = self.state(cpu) {
+            s.irq_wakes().fetch_add(1, Ordering::Release);
             s.irq_hint().store(1, Ordering::Release);
         }
         self.kick(cpu);

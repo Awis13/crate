@@ -253,8 +253,12 @@ pub struct CpuState {
     /// dispatcher when the interrupt controller says nothing is. Inline code
     /// that unmasks interrupts tests it.
     pub irq_hint: u32,
+    /// Bumped by the interrupt controller's waker each time it signals this
+    /// CPU, so the dispatcher can tell a new interrupt from one still masked.
+    pub irq_wakes: u32,
     /// Where a block puts its exit code before returning.
     pub exit: u32,
+    pub _pad0: u32,
     /// The guest PC to resume at on a Branch/WFI/Call exit.
     pub next_pc: u64,
     /// The guest virtual address of the 4 KiB page the running block's code
@@ -277,8 +281,6 @@ pub struct CpuState {
     pub monitor: u64,
     pub monitor_value: u64,
     pub monitor_value2: u64,
-    /// Keeps `v` 16-byte aligned, as pair loads of Q registers need.
-    pub _pad1: u64,
 
     /// Guest V0..V31, 16 bytes each.
     pub v: [[u8; 16]; 32],
@@ -371,6 +373,11 @@ impl CpuState {
         unsafe { AtomicU32::from_ptr(&self.sync_request as *const u32 as *mut u32) }
     }
 
+    pub fn irq_wakes(&self) -> &AtomicU32 {
+        // SAFETY: as for exit_request.
+        unsafe { AtomicU32::from_ptr(&self.irq_wakes as *const u32 as *mut u32) }
+    }
+
     pub fn irq_hint(&self) -> &AtomicU32 {
         // SAFETY: as for exit_request.
         unsafe { AtomicU32::from_ptr(&self.irq_hint as *const u32 as *mut u32) }
@@ -381,6 +388,9 @@ impl CpuState {
         self.exit_request().store(1, Ordering::Release);
     }
 }
+
+// Pair loads and stores of Q registers need `v` 16-byte aligned.
+const _: () = assert!(offsets::V % 16 == 0);
 
 /// Byte offsets into `CpuState`, the contract with emitted code.
 pub mod offsets {
