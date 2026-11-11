@@ -21,6 +21,8 @@ use crate_core::memory::GuestMemory;
 
 pub mod block;
 pub mod console;
+pub mod gpu;
+pub mod input;
 pub mod mmio;
 pub mod net;
 pub mod queue;
