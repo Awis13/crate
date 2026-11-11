@@ -78,7 +78,40 @@ struct SlowSite {
     word: u32,
     pc: u64,
     victims: [Reg; 4],
-    regs: Vec<Reg>,
+    regs: Regs,
+}
+
+/// A short list of registers, without allocating.
+#[derive(Clone, Copy, Default)]
+struct Regs {
+    r: [u32; 8],
+    n: usize,
+}
+
+impl Regs {
+    /// Adds a register; the zero register (31) and repeats are dropped.
+    fn push(&mut self, r: u32) {
+        if r != 31 && !self.as_slice().contains(&r) && self.n < 8 {
+            self.r[self.n] = r;
+            self.n += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.r[..self.n]
+    }
+
+    /// The ones among X19..X29, which the slow path's call preserves and so
+    /// a call site stores and reloads itself.
+    fn callee_saved(&self) -> Regs {
+        let mut out = Regs::default();
+        for &r in self.as_slice() {
+            if (19..=29).contains(&r) {
+                out.push(r);
+            }
+        }
+        out
+    }
 }
 
 /// One block being built.
@@ -172,7 +205,14 @@ pub fn fetch_fault(ctx: Ctx, pc: u64, fsc: u8) -> Block {
 impl Block {
     /// Emits an exit to the save stub.
     fn exit(&mut self, code: u32, next: Next, info: ExitInfo) {
-        emit::exit(&mut self.asm, self.ctx.stubs.save, code, next, info);
+        emit::exit(
+            &mut self.asm,
+            self.ctx.stubs.save,
+            self.page << 12,
+            code,
+            next,
+            info,
+        );
         self.terminated = true;
     }
 
@@ -185,7 +225,7 @@ impl Block {
             }
             Op::Nop => false,
             Op::PcRel { rd, imm, .. } => {
-                self.set_reg_const(rd, imm as u64);
+                self.set_reg_va(rd, imm as u64);
                 false
             }
             Op::AddSubSpImm {
@@ -355,6 +395,33 @@ impl Block {
     /// any in `avoid`.
     fn victim(avoid: &[u32]) -> u32 {
         (9..=15).find(|r| !avoid.contains(r)).unwrap()
+    }
+
+    /// Rd = a guest virtual address in or near this block's page (an ADR or
+    /// ADRP result), computed from the run-time page; Rd may be virtual X18
+    /// or the zero register.
+    fn set_reg_va(&mut self, rd: u32, va: u64) {
+        let page = self.page << 12;
+        let far =
+            va.wrapping_sub(page) as i64 >= 1 << 24 || (va.wrapping_sub(page) as i64) <= -(1 << 24);
+        match rd {
+            31 => {}
+            18 => {
+                let v = Self::victim(&[]);
+                let t = Self::victim(&[v]);
+                self.asm.emit(stp(v, t, SP, offsets::scratch(0) as i32));
+                emit::guest_va(&mut self.asm, v, va, page, t);
+                self.asm.emit(str_imm(3, v, SP, offsets::x(18)));
+                self.asm.emit(ldp(v, t, SP, offsets::scratch(0) as i32));
+            }
+            r if far => {
+                let t = Self::victim(&[r]);
+                self.asm.emit(str_imm(3, t, SP, offsets::scratch(0)));
+                emit::guest_va(&mut self.asm, r, va, page, t);
+                self.asm.emit(ldr_imm(3, t, SP, offsets::scratch(0)));
+            }
+            r => emit::guest_va(&mut self.asm, r, va, page, 31),
+        }
     }
 
     /// Rd = a constant, where Rd may be virtual X18 (or the zero register).
@@ -564,11 +631,9 @@ impl Block {
 
     /// The general registers an access names (each role that is a general
     /// register; register 31 dropped).
-    fn gpr_operands(m: &Mem) -> Vec<u32> {
-        let mut v = Vec::new();
-        if m.rn != 31 {
-            v.push(m.rn);
-        }
+    fn gpr_operands(m: &Mem) -> Regs {
+        let mut v = Regs::default();
+        v.push(m.rn);
         if let Some((rm, _, _)) = m.index_reg {
             v.push(rm);
         }
@@ -587,7 +652,6 @@ impl Block {
         if m.kind == MemKind::CasPair {
             v.push(m.rs + 1);
         }
-        v.retain(|&r| r != 31);
         v
     }
 
@@ -604,30 +668,21 @@ impl Block {
             | MemKind::LoadAcquire
             | MemKind::StoreRelease => false,
             MemKind::LoadExclusive | MemKind::StoreExclusive if m.rt2 != 31 => true,
-            _ => {
-                let mut regs = vec![m.rt, m.rs];
-                if m.kind == MemKind::CasPair {
-                    regs.extend([m.rt + 1, m.rs + 1]);
-                }
-                regs.contains(&18)
-            }
+            MemKind::CasPair => [m.rt, m.rs, m.rt + 1, m.rs + 1].contains(&18),
+            _ => m.rt == 18 || m.rs == 18,
         }
     }
 
     fn emit_memory_with(&mut self, m: Mem, literal: Option<u64>, word: u32, pc: u64) {
         let ops = Self::gpr_operands(&m);
-        let regs: Vec<Reg> = ops
-            .iter()
-            .copied()
-            .filter(|r| (19..=29).contains(r))
-            .collect();
+        let regs = ops.callee_saved();
         if !self.ctx.fast_paths() || Self::needs_slow(&m) {
-            self.emit_slow_inline(word, pc, &regs);
+            self.emit_slow_inline(word, pc, regs.as_slice());
             return;
         }
-        let mut avoid = ops.clone();
+        let mut avoid = ops;
         avoid.push(18);
-        let vs = victims(&avoid);
+        let vs = victims(avoid.as_slice());
         let [a, b, c, d] = vs;
         let slow = self.asm.label();
         let resume = self.asm.label();
@@ -669,7 +724,7 @@ impl Block {
     /// temporary.
     fn emit_address(&mut self, m: &Mem, literal: Option<u64>, a: Reg, c: Reg) {
         if let Some(addr) = literal {
-            self.asm.mov_imm(a, addr);
+            emit::guest_va(&mut self.asm, a, addr, self.page << 12, c);
             return;
         }
         let base = match m.rn {
@@ -881,13 +936,12 @@ impl Block {
     }
 
     fn emit_dc_zva(&mut self, word: u32, rt: u32, pc: u64) {
-        let regs: Vec<Reg> = if (19..=29).contains(&rt) {
-            vec![rt]
-        } else {
-            Vec::new()
-        };
+        let mut regs = Regs::default();
+        if (19..=29).contains(&rt) {
+            regs.push(rt);
+        }
         if !self.ctx.fast_paths() {
-            self.emit_slow_inline(word, pc, &regs);
+            self.emit_slow_inline(word, pc, regs.as_slice());
             return;
         }
         let vs = victims(&[rt, 18]);
@@ -934,8 +988,9 @@ impl Block {
         self.asm.bl_abs(self.ctx.stubs.mem);
         self.asm.emit(word);
         self.asm.emit(16); // return 16 bytes past the literal's start
-        self.asm.emit(pc as u32);
-        self.asm.emit((pc >> 32) as u32);
+        let off = pc.wrapping_sub(self.page << 12);
+        self.asm.emit(off as u32);
+        self.asm.emit((off >> 32) as u32);
         self.asm
             .emit(ldr_imm(3, JUMP_REG, SP, offsets::x(JUMP_REG)));
         for &r in regs {
@@ -955,7 +1010,7 @@ impl Block {
             let [a, b, c, d] = site.victims;
             self.asm.emit(ldp(c, d, SP, offsets::scratch(2) as i32));
             self.asm.emit(ldp(a, b, SP, offsets::scratch(0) as i32));
-            self.emit_slow_call(site.word, site.pc, &site.regs);
+            self.emit_slow_call(site.word, site.pc, site.regs.as_slice());
             self.asm.b(site.resume);
         }
     }
@@ -999,7 +1054,7 @@ impl Block {
             return;
         }
         if let Some(ret) = link {
-            self.asm.mov_imm(30, ret);
+            emit::guest_va(&mut self.asm, 30, ret, self.page << 12, 31);
         }
         if target >> 12 == self.page && target & 3 == 0 {
             // Same page: a branch the dispatcher can patch to the target block.
@@ -1044,7 +1099,7 @@ impl Block {
         // Another page: through the jump cache.
         self.asm.emit(stp(15, 16, SP, offsets::x(15) as i32));
         self.asm.emit(str_imm(3, 17, SP, offsets::x(17)));
-        self.asm.mov_imm(JUMP_REG, target);
+        emit::guest_va(&mut self.asm, JUMP_REG, target, self.page << 12, 17);
         self.asm
             .b_abs(self.ctx.stubs.jc[self.ctx.el.min(1) as usize]);
         self.terminated = true;
@@ -1071,7 +1126,7 @@ impl Block {
             r => self.asm.emit(mov(JUMP_REG, r)),
         }
         if let Some(ret) = link {
-            self.asm.mov_imm(30, ret);
+            emit::guest_va(&mut self.asm, 30, ret, self.page << 12, 31);
         }
         self.asm
             .b_abs(self.ctx.stubs.jc[self.ctx.el.min(1) as usize]);

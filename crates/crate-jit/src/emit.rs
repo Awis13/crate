@@ -50,13 +50,16 @@ pub fn block_entry(asm: &mut Asm) {
 pub const CHAIN_ENTRY: u64 = 4;
 
 /// Emits the shared stub that saves the guest registers a block leaves live
-/// (X1..X29 but X18, NZCV, FPCR, FPSR and the SIMD registers) and returns
+/// (X1..X29 but X18, NZCV and the SIMD registers; FPCR and FPSR stay in the
+/// host's) and returns
 /// through the epilogue. The prefix each exit emits has already saved X0 and
 /// X30 and set the exit code, so this stub is the same for every exit.
 pub fn save_stub(asm: &mut Asm) {
     asm.emit(str_imm(3, 1, SP, offsets::x(1)));
     save_x2_to_x29(asm);
-    save_flags_and_vectors(asm, SCRATCH1);
+    asm.emit(mrs(SCRATCH1, NZCV));
+    asm.emit(str_imm(3, SCRATCH1, SP, offsets::NZCV));
+    save_vectors(asm);
     asm.emit(ldr_imm(3, SCRATCH1, SP, offsets::EPILOGUE));
     asm.emit(br(SCRATCH1));
 }
@@ -75,16 +78,6 @@ fn save_x2_to_x29(asm: &mut Asm) {
     }
 }
 
-fn save_flags_and_vectors(asm: &mut Asm, tmp: Reg) {
-    asm.emit(mrs(tmp, NZCV));
-    asm.emit(str_imm(3, tmp, SP, offsets::NZCV));
-    asm.emit(mrs(tmp, FPCR));
-    asm.emit(str_imm(3, tmp, SP, offsets::FPCR));
-    asm.emit(mrs(tmp, FPSR));
-    asm.emit(str_imm(3, tmp, SP, offsets::FPSR));
-    save_vectors(asm);
-}
-
 fn save_vectors(asm: &mut Asm) {
     for q in (0..32).step_by(2) {
         asm.emit(stp_q(q, q + 1, SP, offsets::v(q) as i32));
@@ -101,7 +94,8 @@ fn load_vectors(asm: &mut Asm) {
 /// reaches it with `BL` after storing guest X30 (and any operand registers it
 /// names among X19..X29) to the state; the BL's return address is the site's
 /// literal: the instruction word, the offset from the literal to where to
-/// return, and the guest PC.
+/// return, and the instruction's offset in its page (the guest PC is the
+/// block's run-time page plus that).
 ///
 /// The stub saves what a call into Rust may clobber -- by the procedure call
 /// standard X0..X17, the flags, and the SIMD registers (all of V0..V7 and
@@ -145,10 +139,6 @@ pub fn mem_stub(asm: &mut Asm, helper: u64) {
         n += 2;
     }
     asm.emit(str_imm(3, 29, SP, offsets::x(29)));
-    asm.emit(mrs(0, FPCR));
-    asm.emit(str_imm(3, 0, SP, offsets::FPCR));
-    asm.emit(mrs(0, FPSR));
-    asm.emit(str_imm(3, 0, SP, offsets::FPSR));
     asm.emit(ldr_imm(3, 0, SP, offsets::EPILOGUE));
     asm.emit(br(0));
 }
@@ -196,6 +186,9 @@ pub fn jc_stub(asm: &mut Asm, el: u32, save: u64) -> (u32, u32) {
     asm.emit(ldp(15, 17, 17, 0));
     asm.emit(sub_reg(true, 15, 15, 16));
     asm.cbnz(true, 15, miss);
+    // The target block computes guest addresses from its page.
+    asm.emit(and_imm(true, 15, 16, !0xfff));
+    asm.emit(str_imm(3, 15, SP, offsets::PAGE_VA));
     asm.emit(mov(16, 17));
     asm.emit(ldr_imm(3, 17, SP, offsets::x(17)));
     asm.emit(br(16));
@@ -240,23 +233,28 @@ pub struct ExitInfo {
 }
 
 /// Emits the exit prefix: saves X0 and X30, sets the exit code, the next PC
-/// and any extra fields, then branches to the save stub. Uses only X0 as
-/// scratch, so the other live guest registers are still in their host
-/// registers for the stub to save.
-pub fn exit(asm: &mut Asm, save: u64, code: u32, next: Next, info: ExitInfo) {
-    // Save guest X0; from here X0 is scratch.
+/// and any extra fields, then branches to the save stub. Uses only X0 and
+/// X30 (once saved) as scratch, so the other live guest registers are still
+/// in their host registers for the stub to save.
+///
+/// Guest addresses (the next PC, a link value, the PC) are given as virtual
+/// addresses in the page whose translation-time base is `page`; the code
+/// computes them from the block's run-time page (`PAGE_VA`), so one
+/// translation serves every virtual address its physical page is mapped at.
+pub fn exit(asm: &mut Asm, save: u64, page: u64, code: u32, next: Next, info: ExitInfo) {
+    // Save guest X0 and X30; from here both are scratch (a link value
+    // overwrites the X30 slot below).
     asm.emit(str_imm(3, 0, SP, offsets::x(0)));
-    // The next PC first: an indirect branch through X30 (BLR X30) reads it
-    // before the link overwrites it.
+    asm.emit(str_imm(3, 30, SP, offsets::x(30)));
     match next {
         Next::Const(pc) => {
-            asm.mov_imm(SCRATCH0, pc);
+            guest_va(asm, SCRATCH0, pc, page, 30);
             asm.emit(str_imm(3, SCRATCH0, SP, offsets::NEXT_PC));
         }
         Next::Reg(rn) => {
-            // X0 is already saved; X18 is virtual (it never lives in the
+            // X0 and X30 are saved; X18 is virtual (it never lives in the
             // host's reserved x18) and is read from the state block.
-            if rn == 0 || rn == 18 {
+            if rn == 0 || rn == 18 || rn == 30 {
                 asm.emit(ldr_imm(3, SCRATCH0, SP, offsets::x(rn)));
             } else if rn == 31 {
                 asm.emit(movz(true, SCRATCH0, 0, 0));
@@ -267,16 +265,12 @@ pub fn exit(asm: &mut Asm, save: u64, code: u32, next: Next, info: ExitInfo) {
         }
         Next::None => {}
     }
-    // Guest X30: a link value, or its live value.
-    match info.link {
-        Some(ret) => {
-            asm.mov_imm(SCRATCH0, ret);
-            asm.emit(str_imm(3, SCRATCH0, SP, offsets::x(30)));
-        }
-        None => asm.emit(str_imm(3, 30, SP, offsets::x(30))),
+    if let Some(ret) = info.link {
+        guest_va(asm, SCRATCH0, ret, page, 30);
+        asm.emit(str_imm(3, SCRATCH0, SP, offsets::x(30)));
     }
     if let Some(pc) = info.pc {
-        asm.mov_imm(SCRATCH0, pc);
+        guest_va(asm, SCRATCH0, pc, page, 30);
         asm.emit(str_imm(3, SCRATCH0, SP, offsets::PC));
     }
     if let Some((reg, rt, read)) = info.sysreg {
@@ -298,6 +292,18 @@ pub fn exit(asm: &mut Asm, save: u64, code: u32, next: Next, info: ExitInfo) {
     asm.emit(movz(true, SCRATCH0, code, 0));
     asm.emit(str_imm(2, SCRATCH0, SP, offsets::EXIT));
     asm.b_abs(save);
+}
+
+/// Rd = the guest virtual address `va`, which translation found at a page
+/// whose base was `page`: the block's run-time page base plus the same
+/// offset. `tmp` (distinct from Rd) is used only for offsets of 16 MiB or
+/// more.
+pub fn guest_va(asm: &mut Asm, rd: Reg, va: u64, page: u64, tmp: Reg) {
+    asm.emit(ldr_imm(3, rd, SP, offsets::PAGE_VA));
+    let delta = va.wrapping_sub(page) as i64;
+    if delta != 0 {
+        asm.emit_all(add_const(rd, rd, delta, tmp));
+    }
 }
 
 /// The host instruction that makes `rd` the page number of `rn` (the tag a

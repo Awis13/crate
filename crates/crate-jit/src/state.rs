@@ -249,6 +249,12 @@ pub struct CpuState {
     pub _pad0: u32,
     /// The guest PC to resume at on a Branch/WFI/Call exit.
     pub next_pc: u64,
+    /// The guest virtual address of the 4 KiB page the running block's code
+    /// is in. A translation depends only on the code's physical page; the
+    /// guest addresses it computes (PC-relative values, link values, branch
+    /// targets) are this plus an offset. Set by whoever enters a block from
+    /// outside its page: the dispatcher, and the jump cache.
+    pub page_va: u64,
     /// For a Branch exit from a direct branch whose target is in the same
     /// page: the host address of the branch to patch once the target block
     /// exists (block chaining). Zero otherwise.
@@ -263,9 +269,14 @@ pub struct CpuState {
     pub monitor: u64,
     pub monitor_value: u64,
     pub monitor_value2: u64,
+    /// Keeps `v` 16-byte aligned, as pair loads of Q registers need.
+    pub _pad1: u64,
 
     /// Guest V0..V31, 16 bytes each.
     pub v: [[u8; 16]; 32],
+    /// Unused: the guest's FPCR and FPSR stay in the host's registers of the
+    /// CPU's thread (reading and writing them stalls the host, so the
+    /// trampoline does neither).
     pub fpcr: u64,
     pub fpsr: u64,
 
@@ -366,6 +377,7 @@ pub mod offsets {
     pub const IRQ_HINT: u32 = offset_of!(CpuState, irq_hint) as u32;
     pub const EXIT: u32 = offset_of!(CpuState, exit) as u32;
     pub const NEXT_PC: u32 = offset_of!(CpuState, next_pc) as u32;
+    pub const PAGE_VA: u32 = offset_of!(CpuState, page_va) as u32;
     pub const CHAIN_SITE: u32 = offset_of!(CpuState, chain_site) as u32;
     pub const SLOW_SITE: u32 = offset_of!(CpuState, slow_site) as u32;
     pub const MONITOR: u32 = offset_of!(CpuState, monitor) as u32;
@@ -433,6 +445,7 @@ mod tests {
             offsets::NZCV,
             offsets::PSTATE,
             offsets::NEXT_PC,
+            offsets::PAGE_VA,
             offsets::CHAIN_SITE,
             offsets::SLOW_SITE,
             offsets::MONITOR,

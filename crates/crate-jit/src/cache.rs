@@ -5,13 +5,13 @@
 //! Translated code: one region of executable memory per CPU, the shared stubs
 //! at its start, and the blocks after them.
 //!
-//! A block is found by its guest PC, the physical address that PC translated
-//! to, and the mode it was translated for (its exception level, and whether
-//! debug made it a single instruction). Keying by both addresses is what lets
-//! two processes run different code at the same virtual address, and one
-//! physical page of code run at two virtual addresses: a translation depends
-//! on both (PC-relative values come from the virtual address, the code from
-//! the physical page).
+//! A block is found by the physical address its guest PC translated to and
+//! the mode it was translated for (its exception level, and whether debug
+//! made it a single instruction). Translated code computes every guest
+//! virtual address it needs (PC-relative values, link values, branch
+//! targets) from the run-time page of the block, so one translation serves
+//! every virtual address its physical page is mapped at: the same library
+//! code in every process, at whatever address each process's layout puts it.
 //!
 //! The cache also keeps, per 4 KiB physical page, the blocks translated from
 //! it, so an instruction-cache invalidation of that page drops exactly those.
@@ -31,7 +31,6 @@ use crate::translate::{self, Ctx};
 /// Identifies a translation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BlockKey {
-    pub va: u64,
     pub pa: u64,
     /// The exception level in bits 1:0, and bit 2 for single-instruction
     /// (debug) blocks.
@@ -161,12 +160,13 @@ impl CodeCache {
         self.blocks.get(key).map(|&off| self.exec(off))
     }
 
-    /// Translates the block for `key` from `words` (the guest code from the
-    /// PC to the end of its page) and returns its entry. On a full region the
-    /// cache is emptied first (which the caller sees as a new epoch).
-    pub fn translate(&mut self, key: BlockKey, words: &[u32], ctx: Ctx) -> u64 {
+    /// Translates the block for `key`, at guest `pc`, from `words` (the guest
+    /// code from the PC to the end of its page) and returns its entry. On a
+    /// full region the cache is emptied first (which the caller sees as a new
+    /// epoch).
+    pub fn translate(&mut self, key: BlockKey, pc: u64, words: &[u32], ctx: Ctx) -> u64 {
         let limit = if ctx.debug { 1 } else { MAX_BLOCK };
-        let block = translate::translate(ctx, key.va, words, limit);
+        let block = translate::translate(ctx, pc, words, limit);
         self.install(key, block, ctx.debug).unwrap_or_else(|_| {
             self.reset();
             let block = translate::translate(
@@ -174,7 +174,7 @@ impl CodeCache {
                     stubs: self.stubs,
                     ..ctx
                 },
-                key.va,
+                pc,
                 words,
                 limit,
             );
@@ -187,7 +187,6 @@ impl CodeCache {
     pub fn fetch_fault(&mut self, pc: u64, fsc: u8, ctx: Ctx) -> u64 {
         let block = translate::fetch_fault(ctx, pc, fsc);
         let key = BlockKey {
-            va: pc,
             pa: u64::MAX,
             mode: 0,
         };

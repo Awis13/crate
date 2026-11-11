@@ -31,8 +31,8 @@ use crate::state::{
 /// # Safety
 ///
 /// `cpu` is the `*mut Cpu` the state names and `site` a translated call
-/// site's literal (word, return offset, guest PC); both are valid while the
-/// block runs.
+/// site's literal (word, return offset, offset in the page); both are valid
+/// while the block runs.
 pub(crate) unsafe extern "C" fn jit_mem(
     cpu: *mut Cpu,
     site: *const u8,
@@ -40,13 +40,14 @@ pub(crate) unsafe extern "C" fn jit_mem(
 ) -> u64 {
     // SAFETY: the dispatcher owns the Cpu for the block's whole run, and the
     // site literal is 16 bytes of the block's code.
-    let (cpu, word, pc) = unsafe {
+    let (cpu, word, off) = unsafe {
         (
             &mut *cpu,
             std::ptr::read_unaligned(site as *const u32),
             std::ptr::read_unaligned(site.add(8) as *const u64),
         )
     };
+    let pc = cpu.state.page_va.wrapping_add(off);
     cpu.state.pc = pc;
     match cpu.memory_access(word, pc) {
         Ok(()) => 0,

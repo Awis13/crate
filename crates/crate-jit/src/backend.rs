@@ -10,6 +10,7 @@
 //! per guest CPU.
 
 use std::collections::HashSet;
+use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -17,8 +18,8 @@ use crate_core::board::Board;
 use crate_core::memory::GuestMemory;
 use crate_host::jit::JitRegion;
 
-use crate::cache::BlockKey;
 pub use crate::cache::CodeCache;
+use crate::cache::{BlockKey, FastHasher};
 use crate::mmu::{self, Access};
 use crate::smp::{Remote, Smp};
 use crate::state::{
@@ -53,13 +54,12 @@ core::arch::global_asm!(
     "mov x9, sp",
     "str x9, [x0, #{host_sp}]",
     "mov sp, x0",
-    // Load the guest's flags, FP control and SIMD registers.
+    // Load the guest's flags and SIMD registers. The guest's FPCR and FPSR
+    // stay in the host's registers between runs (the dispatcher does no
+    // floating point, and reading or writing them stalls the pipeline), so
+    // they are neither loaded here nor saved on the way out.
     "ldr x9, [sp, #{nzcv}]",
     "msr nzcv, x9",
-    "ldr x9, [sp, #{fpcr}]",
-    "msr fpcr, x9",
-    "ldr x9, [sp, #{fpsr}]",
-    "msr fpsr, x9",
     "ldp q0,  q1,  [sp, #({v}+0)]",
     "ldp q2,  q3,  [sp, #({v}+32)]",
     "ldp q4,  q5,  [sp, #({v}+64)]",
@@ -116,13 +116,34 @@ core::arch::global_asm!(
     "ret",
     host_sp = const offsets::HOST_SP,
     nzcv = const offsets::NZCV,
-    fpcr = const offsets::FPCR,
-    fpsr = const offsets::FPSR,
     v = const offsets::V,
     x = const offsets::X,
     dispatch = const offsets::DISPATCH_TARGET,
     exit = const offsets::EXIT,
 );
+
+// The guest's FPCR and FPSR live in the host's registers of this thread (see
+// the trampoline); the dispatcher reads and writes them there.
+fn fpcr() -> u64 {
+    let v: u64;
+    // SAFETY: reads a register.
+    unsafe { std::arch::asm!("mrs {}, fpcr", out(reg) v, options(nomem, nostack)) };
+    v
+}
+fn fpsr() -> u64 {
+    let v: u64;
+    // SAFETY: reads a register.
+    unsafe { std::arch::asm!("mrs {}, fpsr", out(reg) v, options(nomem, nostack)) };
+    v
+}
+fn set_fpcr(v: u64) {
+    // SAFETY: the guest's FPCR, which the dispatcher's own code does not rely on.
+    unsafe { std::arch::asm!("msr fpcr, {}", in(reg) v, options(nomem, nostack)) };
+}
+fn set_fpsr(v: u64) {
+    // SAFETY: as for set_fpcr.
+    unsafe { std::arch::asm!("msr fpsr, {}", in(reg) v, options(nomem, nostack)) };
+}
 
 fn epilogue_addr() -> u64 {
     let f: unsafe extern "C" fn() = crate_jit_epilogue;
@@ -140,8 +161,10 @@ impl CodeCache {
     pub fn with_mode(bytes: usize, fast: bool) -> crate_core::Result<Self> {
         let helper: unsafe extern "C" fn(*mut Cpu, *const u8, *mut CpuState) -> u64 =
             crate::mem::jit_mem;
+        // Two mappings of the same pages, one writable and one executable, so
+        // translating and patching never switch a thread's W^X state.
         Ok(CodeCache::with_region(
-            JitRegion::new(bytes)?,
+            JitRegion::new_dual(bytes)?,
             helper as usize as u64,
             fast,
         ))
@@ -249,7 +272,7 @@ impl TlbBook {
 /// cache leaves it alone.
 struct JcBook {
     filled: [Filled; 2],
-    pages: [HashSet<u64>; 2],
+    pages: [HashSet<u64, BuildHasherDefault<FastHasher>>; 2],
     /// The EL1 cache holds code from the lower half of the address space
     /// (TTBR0), which a change of TTBR0 makes stale.
     el1_low: bool,
@@ -323,7 +346,7 @@ impl Cpu {
             tlbs: TlbBook::new(),
             jc: JcBook {
                 filled: [Filled::new(), Filled::new()],
-                pages: [HashSet::new(), HashSet::new()],
+                pages: [HashSet::default(), HashSet::default()],
                 el1_low: false,
                 large: [false; 2],
                 miss: [0; 2],
@@ -385,6 +408,7 @@ impl Cpu {
         loop {
             let (target, cacheable) = self.next_block(cache, chain.take());
             self.state.dispatch_target = target;
+            self.state.page_va = self.state.pc & !0xfff;
             self.state.chain_site = 0;
             let epoch = cache.epoch();
             // SAFETY: the state is a stable heap box; the enter trampoline runs
@@ -435,7 +459,6 @@ impl Cpu {
             Err(f) => return (cache.fetch_fault(pc, f.fsc, ctx), false),
         };
         let key = BlockKey {
-            va: pc,
             pa: t.pa,
             mode: el | (debug as u32) << 2,
         };
@@ -461,7 +484,7 @@ impl Cpu {
                     );
                 }
                 let epoch = cache.epoch();
-                let e = cache.translate(key, &words[..n], ctx);
+                let e = cache.translate(key, pc, &words[..n], ctx);
                 if cache.epoch() != epoch {
                     // The region filled and was emptied: every jump-cache
                     // entry points at code that is gone.
@@ -700,8 +723,8 @@ impl Cpu {
         s.nzcv = 0;
         s.pstate = (1 << PSTATE_EL_SHIFT) | PSTATE_SPSEL | PSTATE_DAIF; // EL1h, masked
         s.v = [[0; 16]; 32];
-        s.fpcr = 0;
-        s.fpsr = 0;
+        set_fpcr(0);
+        set_fpsr(0);
         s.monitor = MONITOR_CLEAR;
         s.banked = Default::default();
         s.mmu = MmuRegs {
@@ -778,6 +801,7 @@ impl Cpu {
             let stepping_now = step_on && self.state.pstate & PSTATE_SS != 0;
             let (target, cacheable) = self.next_block(cache, chain.take());
             self.state.dispatch_target = target;
+            self.state.page_va = pc & !0xfff;
             self.state.chain_site = 0;
             LAST_PC[self.cpu.min(LAST_PC.len() - 1)].store(pc, Ordering::Relaxed);
             let epoch = cache.epoch();
@@ -1670,8 +1694,8 @@ impl Cpu {
             }
             r if r == sr::NZCV => self.state.nzcv,
             r if r == sr::DAIF => self.state.pstate & (0xf << 6),
-            r if r == sr::FPCR => self.state.fpcr,
-            r if r == sr::FPSR => self.state.fpsr,
+            r if r == sr::FPCR => fpcr(),
+            r if r == sr::FPSR => fpsr(),
             r if r == sr::CURRENT_EL => (self.el() as u64) << 2,
             r if r == sr::SPSEL => self.state.pstate & PSTATE_SPSEL,
             r if r == sr::MPIDR_EL1 => board.mpidrs[self.cpu],
@@ -1796,8 +1820,8 @@ impl Cpu {
                 self.state.pstate = (self.state.pstate & !(0xf << 6)) | (value & (0xf << 6));
                 self.recheck_interrupts();
             }
-            r if r == sr::FPCR => self.state.fpcr = value,
-            r if r == sr::FPSR => self.state.fpsr = value,
+            r if r == sr::FPCR => set_fpcr(value),
+            r if r == sr::FPSR => set_fpsr(value),
             r if r == sr::SPSEL => {
                 self.state.pstate = (self.state.pstate & !PSTATE_SPSEL) | (value & PSTATE_SPSEL)
             }
