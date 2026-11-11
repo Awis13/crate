@@ -445,24 +445,31 @@ impl Cpu {
         self.write_device(t.pa, n, value)
     }
 
+    /// Not RAM: a device, if the board has one here. The bus takes a byte
+    /// count, not the log2 size the access carries. Where no device answers,
+    /// a read is zero and a write is ignored, as on hvf, which runs the same
+    /// machine. Without a board (the bare test runner) it is an external
+    /// abort.
     fn read_device(&self, pa: u64, n: u64, write: bool) -> Result<u64, mmu::Fault> {
-        // Not RAM: a device, if the board has one here. The bus takes a byte
-        // count, not the log2 size the access carries.
-        if let Some(board) = self.board_opt() {
-            if let Some(v) = board.mmio.read(pa, n as u8) {
-                return Ok(v);
-            }
+        match self.board_opt() {
+            Some(board) => Ok(board.mmio.read(pa, n as u8).unwrap_or_else(|| {
+                crate_core::debug!("reads of {pa:#x}, where nothing is, read as zero");
+                0
+            })),
+            None => Err(external_abort(write)),
         }
-        Err(external_abort(write))
     }
 
     fn write_device(&self, pa: u64, n: u64, value: u64) -> Result<(), mmu::Fault> {
-        if let Some(board) = self.board_opt() {
-            if board.mmio.write(pa, n as u8, value) {
-                return Ok(());
+        match self.board_opt() {
+            Some(board) => {
+                if !board.mmio.write(pa, n as u8, value) {
+                    crate_core::debug!("writes to {pa:#x}, where nothing is, ignored");
+                }
+                Ok(())
             }
+            None => Err(external_abort(true)),
         }
-        Err(external_abort(true))
     }
 
     /// Reads `buf.len()` bytes at guest VA `addr`, re-walking the page tables at

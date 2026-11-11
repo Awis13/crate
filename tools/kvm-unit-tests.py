@@ -11,10 +11,11 @@ directories. This drives our own `crate-run` on each image -- it does not run
 any kvm-unit-tests script -- and reads the `EXIT: STATUS=` line it prints:
 1 = PASS, 3 = FAIL, 77 = SKIP, 127 = abort.
 
-Every single-CPU test runs on the jit backend at 4 KiB and 16 KiB pages and on
-hvf (the reference) at 4 KiB. A test that needs more than one CPU is listed and
-left for milestone 3. gicv2-* (the machine has only a GICv3) and the *-migration
-tests (they block waiting to be migrated) are scored "n/a".
+Every test runs on the jit backend at 4 KiB and 16 KiB pages and on hvf (the
+reference) at 4 KiB, with the number of CPUs its configuration asks for
+($MAX_SMP is the host's CPU count, or --max-smp). gicv2-* (the machine has
+only a GICv3) and the *-migration tests (they block waiting to be migrated)
+are scored "n/a".
 
 Example:
 
@@ -49,28 +50,29 @@ def parse_cfg(path):
     return tests
 
 
-def is_single_cpu(t):
-    smp = t.get("smp")
-    if smp is None:
-        return True
-    if "$" in smp:  # $MAX_SMP or $((...)) -> more than one
-        return False
-    try:
-        return int(smp) <= 1
-    except ValueError:
-        return False
+def cpu_count(t, max_smp):
+    """The CPUs a test asks for: a number, $MAX_SMP, or the configuration's
+    $((($MAX_SMP < N)?$MAX_SMP:N)) form."""
+    smp = t.get("smp", "1").replace("$MAX_SMP", str(max_smp))
+    m = re.fullmatch(r"\$\(\(\(?\s*(\d+)\s*<\s*(\d+)\s*\)?\s*\?\s*(\d+)\s*:\s*(\d+)\s*\)\)", smp)
+    if m:
+        a, b, x, y = map(int, m.groups())
+        return x if a < b else y
+    return int(smp)
 
 
-def not_applicable(name):
-    # Only a GICv3 is modelled, and the migration tests block for a migration
-    # that never comes.
-    return name.startswith("gicv2-") or name.endswith("-migration")
+def not_applicable(t):
+    # Only a GICv3 is modelled, and the migration tests (the "migration"
+    # group) block for a migration that never comes.
+    name = t["name"]
+    return name.startswith("gicv2-") or "migration" in t.get("groups", "").split()
 
 
-def run(crate_run, flat, args, backend, env, timeout):
+def run(crate_run, flat, args, backend, env, timeout, cpus):
     cmd = [
         crate_run, "--raw", "--backend", backend, "--kernel", flat,
         "--initrd", env, "--cmdline", args, "--memory", "256", "--log", "warn",
+        "--cpus", str(cpus),
     ]
     try:
         p = subprocess.Popen(
@@ -102,6 +104,8 @@ def main():
         "~/Repos/crate/target/debug/crate-run"), help="the signed crate-run binary")
     ap.add_argument("--timeout", type=float, default=30.0)
     ap.add_argument("--only", help="run only tests whose name contains this")
+    ap.add_argument("--max-smp", type=int, default=os.cpu_count(),
+                    help="$MAX_SMP (default: the host's CPU count)")
     args = ap.parse_args()
 
     build4 = args.build_4k or (args.kut and os.path.join(args.kut, "build-4k"))
@@ -118,25 +122,20 @@ def main():
     env.close()
 
     tests = parse_cfg(cfg)
-    single = [t for t in tests if is_single_cpu(t)]
-    multi = [t["name"] for t in tests if not is_single_cpu(t)]
-    print(f"# single-CPU tests: {len(single)}; multi-CPU (deferred to M3): {len(multi)}")
-    print(f"# deferred: {', '.join(multi)}\n")
-    hdr = f"{'test':28} {'jit-4k':10} {'jit-16k':10} {'hvf':10}"
+    print(f"# {len(tests)} tests; $MAX_SMP = {args.max_smp}\n")
+    hdr = f"{'test':34} {'cpus':>4}  {'jit-4k':10} {'jit-16k':10} {'hvf':10}"
     print(hdr)
     print("-" * len(hdr))
 
     tallies = {"jit-4k": {}, "jit-16k": {}, "hvf": {}}
-    for t in single:
+    for t in tests:
         name = t["name"]
         if args.only and args.only not in name:
             continue
-        if not_applicable(name):
-            print(f"{name:28} {'n/a (only GICv3 / migration)'}")
+        if not_applicable(t):
+            print(f"{name:34} {'':>4}  n/a (only GICv3 / migration)")
             continue
-        if t.get("accel") == "kvm":
-            print(f"{name:28} {'n/a (needs kvm)'}")
-            continue
+        cpus = cpu_count(t, args.max_smp)
         flat, cmdline = t["file"], t.get("test_args", "")
         res = {}
         for label, backend, bdir in [("jit-4k", "jit", build4),
@@ -146,9 +145,10 @@ def main():
             if not os.path.exists(path):
                 res[label] = "no-build"
             else:
-                res[label], _ = run(args.crate_run, path, cmdline, backend, env.name, args.timeout)
+                res[label], _ = run(args.crate_run, path, cmdline, backend, env.name,
+                                    args.timeout, cpus)
             tallies[label][res[label]] = tallies[label].get(res[label], 0) + 1
-        print(f"{name:28} {res['jit-4k']:10} {res['jit-16k']:10} {res['hvf']:10}")
+        print(f"{name:34} {cpus:>4}  {res['jit-4k']:10} {res['jit-16k']:10} {res['hvf']:10}")
 
     os.unlink(env.name)
     print()
