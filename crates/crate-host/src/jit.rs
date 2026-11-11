@@ -13,10 +13,11 @@
 //! `write_base` and branches to addresses inside `exec_base`.
 //!
 //! On iOS an app may not make memory executable on its own. A debugger that
-//! has attached to it can: the app maps its region twice, then stops on
-//! `brk #0x69` with the executable alias's address in x0 and its length in
-//! x1, and the debugger prepares those pages and resumes it past the
-//! instruction. That is the convention StikDebug's scripts follow, and a
+//! has attached to it can: the app maps its region executable, stops on
+//! `brk #0x69` with the region's address in x0 and its length in x1, and the
+//! debugger prepares those pages and resumes it past the instruction; only
+//! then does the app map the same pages a second time, writable. That is the
+//! convention StikDebug's scripts follow, and a
 //! script handles one such stop per launch, so `JitRegion::shared` asks once
 //! and keeps the region for the life of the process. A machine with several
 //! CPUs carves it into slices (`JitRegion::split`), one per CPU.
@@ -319,26 +320,99 @@ fn authorized(len: usize) -> Result<Arc<JitRegion>> {
                 .into(),
         ));
     }
-    let region = JitRegion::new_dual(len)?;
+    let len = len.div_ceil(page_size()) * page_size();
+    // SAFETY: a fresh mapping of `len` bytes, a whole number of pages.
+    let (exec, write) = unsafe { authorized_map(len)? };
+    let region = Arc::new(JitRegion {
+        exec,
+        write,
+        len,
+        kind: Kind::Dual,
+    });
+    *slot = Some(region.clone());
+    Ok(region)
+}
+
+/// The two mappings of an authorized region, in the order iOS accepts: the
+/// executable one first, which the debugger prepares, and the writable one
+/// made from it afterwards. Made the other way round, from a writable mapping
+/// with an executable alias, the debugger's pages fault on execution.
+///
+/// # Safety
+///
+/// `len` is a non-zero multiple of the page size, and a debugger that
+/// answers `brk #0x69` is attached.
+#[cfg(target_os = "ios")]
+unsafe fn authorized_map(len: usize) -> Result<(*mut u8, *mut u8)> {
+    let fail = |what: &str| Error::Jit(format!("{what}: {}", std::io::Error::last_os_error()));
+    // SAFETY: a fresh anonymous mapping aliases nothing.
+    let exec = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if exec == libc::MAP_FAILED {
+        return Err(fail("mapping the executable region"));
+    }
     crate_core::info!(
         "asking the debugger to authorize {} MiB of code at {:#x}",
-        region.len >> 20,
-        region.exec as usize
+        len >> 20,
+        exec as usize
     );
-    // SAFETY: stops for the debugger, which prepares the executable alias's
-    // pages and resumes past the instruction. Nothing has been written to
-    // the region yet, so the bytes it writes into each page do no harm.
+    // SAFETY: stops for the debugger, which prepares the region's pages and
+    // resumes past the instruction. Nothing is in the region yet, so the
+    // bytes it writes into each page do no harm.
     unsafe {
         std::arch::asm!(
             "brk #0x69",
-            inout("x0") region.exec as u64 => _,
-            in("x1") region.len as u64,
+            inout("x0") exec as u64 => _,
+            in("x1") len as u64,
             options(nostack),
         )
     };
-    let region = Arc::new(region);
-    *slot = Some(region.clone());
-    Ok(region)
+    let mut write = 0u64;
+    let (mut cur, mut max) = (0, 0);
+    // SAFETY: remaps our own region, sharing its pages (copy = false), into a
+    // new range of our own task.
+    let kr = unsafe {
+        let task = mach::mach_task_self_;
+        mach::mach_vm_remap(
+            task,
+            &mut write,
+            len as u64,
+            0,
+            mach::VM_FLAGS_ANYWHERE,
+            task,
+            exec as u64,
+            0,
+            &mut cur,
+            &mut max,
+            mach::VM_INHERIT_NONE,
+        )
+    };
+    if kr != mach::KERN_SUCCESS {
+        // SAFETY: mapped above.
+        unsafe { libc::munmap(exec, len) };
+        return Err(Error::Jit(format!(
+            "mach_vm_remap of the authorized region: {kr:#x}"
+        )));
+    }
+    // SAFETY: the alias was just made and is ours.
+    if unsafe { libc::mprotect(write as *mut _, len, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
+        let e = fail("making the alias writable");
+        // SAFETY: both mapped above.
+        unsafe {
+            libc::munmap(write as *mut _, len);
+            libc::munmap(exec, len);
+        }
+        return Err(e);
+    }
+    Ok((exec.cast(), write as *mut u8))
 }
 
 /// Whether a debugger is tracing this process (P_TRACED), the one that would
