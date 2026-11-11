@@ -68,13 +68,16 @@ typedef enum crate_log_level {
 typedef void (*crate_log_fn)(void *context, crate_log_level level, const char *message);
 
 /* For the whole process. Messages less important than `max` are not made at
-   all. A NULL fn restores the default, which writes to stderr. */
+   all. A NULL fn restores the default, which writes to stderr. Messages come
+   from whichever thread made them. */
 void crate_set_log_callback(crate_log_fn fn, void *context, crate_log_level max);
 
 /* ---------------------------------------------------------------- the machine's description */
 
 /* `machine` names a machine type. "virt" is the only one so far: a generic
-   arm64 board for Linux, with its hardware described by a device tree. */
+   arm64 board for Linux, with its hardware described by a device tree. A new
+   config has one CPU, 1 GiB of memory and an empty command line. Returns NULL
+   for an unknown type. */
 crate_config *crate_config_new(const char *machine);
 void crate_config_free(crate_config *config);
 
@@ -97,17 +100,31 @@ crate_status crate_config_set_memory(crate_config *config, uint64_t bytes);
 
 /* Executable memory for the translator.
  *
- * By default crate gets its own: MAP_JIT on macOS, and on iOS a region mapped
- * twice (once writable, once executable) that an attached debugger is asked to
- * authorize, the convention StikDebug's scripts follow. An app that gets
- * executable memory some other way passes it here: `executable` is where code
- * runs, `writable` an alias of the same pages where it is written (the same
- * address where the host allows both at once). It must stay valid until the
- * machine is freed. */
+ * By default crate gets its own: a region mapped twice (once writable, once
+ * executable). On iOS an attached debugger is asked to authorize it, the
+ * convention StikDebug's scripts follow: crate stops on `brk #0x69` with the
+ * executable alias's address in x0 and its length in x1, and the debugger
+ * prepares those pages and resumes it past the instruction. A script handles
+ * one such stop per launch, so crate asks once and keeps the region for the
+ * life of the process; a later machine gets the same region back, and one
+ * that wants a larger region fails. Without a debugger attached creating the
+ * machine fails with CRATE_ERR_JIT instead of stopping, which would kill the
+ * process.
+ *
+ * An app that gets executable memory some other way passes it here:
+ * `executable` is where code runs, `writable` an alias of the same pages where
+ * it is written (the same address where the host allows both at once). It
+ * must stay valid until the machine is freed.
+ *
+ * Either way the region is split between the CPUs, an equal slice each; a CPU
+ * uses at most 128 MiB, the reach of a branch. */
 crate_status crate_config_set_jit_region(crate_config *config, void *executable, void *writable,
                                          size_t size);
 
-/* How much executable memory crate asks for when it gets its own. */
+/* How much executable memory crate asks for when it gets its own, for the
+   whole machine: by default 128 MiB per CPU. On iOS every page is made
+   resident when it is authorized, so it counts against the app's memory
+   limit from the start. */
 crate_status crate_config_set_jit_size(crate_config *config, size_t bytes);
 
 /* Linux's boot protocol: an arm64 Image (raw or gzip-compressed), an optional
@@ -131,7 +148,8 @@ crate_status crate_config_set_cmdline(crate_config *config, const char *cmdline)
 #define CRATE_DISK_NO_FLUSH (1u << 2)
 
 /* The guest may discard blocks it no longer uses, and the file gives that space
-   back to the host (a sparse file's hole). */
+   back to the host (a sparse file's hole). Not implemented yet:
+   CRATE_ERR_UNSUPPORTED. */
 #define CRATE_DISK_DISCARD (1u << 3)
 
 /* A virtio block device on a raw image file. Disks appear to the guest in the
@@ -160,8 +178,9 @@ typedef enum crate_protocol {
 } crate_protocol;
 
 /* Connections to host_address:host_port on the host go to guest_port in the
-   guest. A port that cannot be bound when the machine starts is logged and
-   skipped, not fatal. */
+   guest. host_address is an IPv4 address; NULL or "" means every interface.
+   A port that cannot be bound when the machine starts is logged and skipped,
+   not fatal. */
 crate_status crate_config_add_port_forward(crate_config *config, uint32_t network,
                                            crate_protocol protocol, const char *host_address,
                                            uint16_t host_port, uint16_t guest_port);
@@ -179,13 +198,18 @@ typedef struct crate_console_callbacks {
     /* Bytes the guest wrote, valid only during the call. */
     void (*output)(void *context, uint32_t console, const uint8_t *bytes, size_t length);
     /* The console can take bytes again, after a crate_console_write took fewer
-       than it was offered. May be NULL; the app then retries on its own. */
+       than it was offered: once per such refusal, on the thread of the guest
+       CPU that made room (for the serial console, by reading its last byte;
+       for a virtio console, by posting buffers). It may call
+       crate_console_write. May be NULL; the app then retries on its own. */
     void (*input_ready)(void *context, uint32_t console);
 } crate_console_callbacks;
 
 /* A machine has at most one serial console; a second is
    CRATE_ERR_INVALID_ARGUMENT. Virtio consoles become hvc0, hvc1, ... in the
-   order they are added. */
+   order they are added. `index` receives the console's number, counted over
+   both kinds in the order they are added, which crate_console_write and the
+   callbacks use. */
 crate_status crate_config_add_console(crate_config *config, crate_console_kind kind,
                                       const crate_console_callbacks *callbacks, uint32_t *index);
 
@@ -222,6 +246,7 @@ typedef struct crate_display_callbacks {
     void (*frame)(void *context, uint32_t display, const crate_frame *frame);
 } crate_display_callbacks;
 
+/* Not in this build yet: CRATE_ERR_UNSUPPORTED. */
 crate_status crate_config_add_display(crate_config *config, crate_gpu gpu,
                                       const crate_display_callbacks *callbacks, uint32_t *index);
 
@@ -235,6 +260,7 @@ void crate_display_set_active(crate_machine *machine, uint32_t display, bool act
 #define CRATE_INPUT_KEYBOARD (1u << 0)
 #define CRATE_INPUT_TABLET (1u << 1) /* an absolute pointer: positions, not movements */
 
+/* Not in this build yet: CRATE_ERR_UNSUPPORTED. */
 crate_status crate_config_add_input(crate_config *config, uint32_t devices);
 
 /* Keys are Linux input event codes (KEY_A is 30), the guest's own names for them. */
@@ -276,21 +302,27 @@ crate_status crate_machine_create(const crate_config *config, crate_machine **ma
 
 /* Returns at once; the guest runs on the engine's threads. */
 crate_status crate_machine_start(crate_machine *machine);
+
+/* Not in this build yet: CRATE_ERR_UNSUPPORTED. */
 crate_status crate_machine_pause(crate_machine *machine);
 crate_status crate_machine_resume(crate_machine *machine);
 
-/* Asks the guest to shut down, as pressing a power button does. */
+/* Asks the guest to shut down, as pressing a power button does. virt has no
+   power button yet: CRATE_ERR_UNSUPPORTED. */
 crate_status crate_machine_request_shutdown(crate_machine *machine);
 
 /* Stops the machine at once, as pulling the plug does. */
 crate_status crate_machine_kill(crate_machine *machine);
 
-/* Waits for the machine to stop: up to timeout_ms, or for good if negative. */
+/* Waits for the machine to stop: up to timeout_ms, or for good if negative.
+   Returns once the state callback reporting the stop has returned;
+   CRATE_ERR_STATE if the machine was never started. */
 crate_status crate_machine_wait(crate_machine *machine, int64_t timeout_ms);
 
 crate_state crate_machine_state(const crate_machine *machine);
 
-/* Kills the machine if it is running, then frees it. */
+/* Kills the machine if it is running, then frees it. Called from one of the
+   machine's own callbacks, it does not wait for the machine's thread. */
 void crate_machine_free(crate_machine *machine);
 
 /*

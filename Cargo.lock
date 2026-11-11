@@ -28,6 +28,13 @@ dependencies = [
 [[package]]
 name = "crate-ffi"
 version = "0.0.0"
+dependencies = [
+ "crate-core",
+ "crate-host",
+ "crate-hvf",
+ "crate-jit",
+ "crate-virt",
+]
 
 [[package]]
 name = "crate-host"
