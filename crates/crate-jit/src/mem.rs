@@ -49,9 +49,11 @@ pub(crate) unsafe extern "C" fn jit_mem(
     };
     let pc = cpu.state.page_va.wrapping_add(off);
     cpu.state.pc = pc;
+    cpu.counters.slow_mem += 1;
     match cpu.memory_access(word, pc) {
         Ok(()) => 0,
         Err(fault) => {
+            cpu.counters.slow_fault += 1;
             // A watchpoint has already recorded its own exception kind.
             if cpu.state.exception_kind != WATCHPOINT_KIND {
                 cpu.take_data_abort(fault);
@@ -409,6 +411,7 @@ impl Cpu {
         self.state.exception_far = addr;
         let t = mmu::translate(&self.mem, regs, el, addr, Access::Read)?;
         if crosses_page(addr, n, TLB_SHIFT) {
+            self.counters.slow_cross += 1;
             let mut buf = [0u8; 8];
             self.gather(addr, &mut buf[..n as usize], el, regs)?;
             return Ok(u64::from_le_bytes(buf));
@@ -434,6 +437,7 @@ impl Cpu {
         self.state.exception_far = addr;
         let t = mmu::translate(&self.mem, regs, el, addr, Access::Write)?;
         if crosses_page(addr, n, TLB_SHIFT) {
+            self.counters.slow_cross += 1;
             return self.scatter(addr, &value.to_le_bytes()[..n as usize], el, regs);
         }
         if let Ok(ptr) = self.mem.host_range(t.pa, n) {
@@ -450,7 +454,8 @@ impl Cpu {
     /// a read is zero and a write is ignored, as on hvf, which runs the same
     /// machine. Without a board (the bare test runner) it is an external
     /// abort.
-    fn read_device(&self, pa: u64, n: u64, write: bool) -> Result<u64, mmu::Fault> {
+    fn read_device(&mut self, pa: u64, n: u64, write: bool) -> Result<u64, mmu::Fault> {
+        self.counters.slow_device += 1;
         match self.board_opt() {
             Some(board) => Ok(board.mmio.read(pa, n as u8).unwrap_or_else(|| {
                 crate_core::debug!("reads of {pa:#x}, where nothing is, read as zero");
@@ -460,7 +465,8 @@ impl Cpu {
         }
     }
 
-    fn write_device(&self, pa: u64, n: u64, value: u64) -> Result<(), mmu::Fault> {
+    fn write_device(&mut self, pa: u64, n: u64, value: u64) -> Result<(), mmu::Fault> {
+        self.counters.slow_device += 1;
         match self.board_opt() {
             Some(board) => {
                 if !board.mmio.write(pa, n as u8, value) {
@@ -668,7 +674,7 @@ impl Cpu {
         let pair =
             m.rt2 != 31 && matches!(m.kind, MemKind::LoadExclusive | MemKind::StoreExclusive);
         // Reads and writes `size`-sized values at an offset into the access.
-        let read_at = |cpu: &Cpu, off: u64, sz: u32| -> Result<u64, mmu::Fault> {
+        let read_at = |cpu: &mut Cpu, off: u64, sz: u32| -> Result<u64, mmu::Fault> {
             match ram {
                 // SAFETY: inside the span host_range checked, aligned (the
                 // alignment check passed).
@@ -887,7 +893,7 @@ impl Cpu {
                 tag: TlbEntry::tag_for(va),
                 delta,
             };
-            self.tlbs.filled(ti, i, t.size_shift, t.global);
+            self.tlbs.filled(ti, i, va, t.size_shift, t.global);
         }
     }
 }

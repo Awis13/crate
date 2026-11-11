@@ -35,12 +35,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// guest's 16 or 64 KiB page simply takes several entries.
 pub const TLB_SHIFT: u32 = 12;
 
-/// Entries in each direct-mapped software TLB (a power of two).
-pub const TLB_BITS: u32 = 11;
+/// Entries in each direct-mapped software TLB (a power of two): 32 MiB of
+/// 4 KiB pages each.
+pub const TLB_BITS: u32 = 13;
 pub const TLB_ENTRIES: usize = 1 << TLB_BITS;
 
 /// Entries in each jump cache (a power of two).
-pub const JC_BITS: u32 = 12;
+pub const JC_BITS: u32 = 14;
+
+/// The jump cache's index folds higher PC bits into the low ones (shifted
+/// down this far), so code a power of two apart does not always collide.
+pub const JC_FOLD: u32 = 16;
 pub const JC_ENTRIES: usize = 1 << JC_BITS;
 
 /// The tag of an empty TLB entry. A tag is a guest page number, which never
@@ -103,7 +108,7 @@ pub struct JcEntry {
 
 impl JcEntry {
     pub fn index(pc: u64) -> usize {
-        ((pc >> 2) as usize) & (JC_ENTRIES - 1)
+        (((pc ^ (pc >> JC_FOLD)) >> 2) as usize) & (JC_ENTRIES - 1)
     }
 }
 
@@ -240,13 +245,16 @@ pub struct CpuState {
     /// Translated code tests it at backward branches, jump-cache lookups and
     /// ISB; the dispatcher clears it.
     pub exit_request: u32,
+    /// Set when another CPU invalidated code this CPU may have translated:
+    /// it must look at its queue at its next ISB (with `exit_request`, which
+    /// is next to it, in one load) or dispatcher entry.
+    pub sync_request: u32,
     /// Set when an interrupt may be pending for this CPU; cleared only by the
     /// dispatcher when the interrupt controller says nothing is. Inline code
     /// that unmasks interrupts tests it.
     pub irq_hint: u32,
     /// Where a block puts its exit code before returning.
     pub exit: u32,
-    pub _pad0: u32,
     /// The guest PC to resume at on a Branch/WFI/Call exit.
     pub next_pc: u64,
     /// The guest virtual address of the 4 KiB page the running block's code
@@ -293,6 +301,8 @@ pub struct CpuState {
     /// translations depend on; the dispatcher acts on it after the exit.
     pub flush_cache: u32,
 
+    /// How many jump-cache lookups missed (a statistic).
+    pub jc_misses: u64,
     /// The real host stack top, restored into SP before calling back to Rust.
     pub host_sp: u64,
     /// This block's own address, so a helper can be handed it.
@@ -351,6 +361,11 @@ impl CpuState {
         unsafe { AtomicU32::from_ptr(&self.exit_request as *const u32 as *mut u32) }
     }
 
+    pub fn sync_request(&self) -> &AtomicU32 {
+        // SAFETY: as for exit_request.
+        unsafe { AtomicU32::from_ptr(&self.sync_request as *const u32 as *mut u32) }
+    }
+
     pub fn irq_hint(&self) -> &AtomicU32 {
         // SAFETY: as for exit_request.
         unsafe { AtomicU32::from_ptr(&self.irq_hint as *const u32 as *mut u32) }
@@ -393,6 +408,7 @@ pub mod offsets {
     pub const SYSREG_RT: u32 = offset_of!(CpuState, sysreg_rt) as u32;
     pub const SYSREG_READ: u32 = offset_of!(CpuState, sysreg_read) as u32;
     pub const HOST_SP: u32 = offset_of!(CpuState, host_sp) as u32;
+    pub const JC_MISSES: u32 = offset_of!(CpuState, jc_misses) as u32;
     pub const SELF_PTR: u32 = offset_of!(CpuState, self_ptr) as u32;
     pub const CPU_PTR: u32 = offset_of!(CpuState, cpu_ptr) as u32;
     pub const DISPATCH_TARGET: u32 = offset_of!(CpuState, dispatch_target) as u32;
@@ -402,6 +418,12 @@ pub mod offsets {
     pub const TPIDRRO_EL0: u32 = BANKED + offset_of!(Banked, tpidrro_el0) as u32;
     pub const TPIDR_EL1: u32 = BANKED + offset_of!(Banked, tpidr_el1) as u32;
     pub const SP_EL0: u32 = BANKED + offset_of!(Banked, sp_el0) as u32;
+    pub const MMU: u32 = offset_of!(CpuState, mmu) as u32;
+
+    /// The offset of a banked register, from its offset in `Banked`.
+    pub const fn banked(off: usize) -> u32 {
+        BANKED + off as u32
+    }
     pub const TLB: u32 = offset_of!(CpuState, tlb) as u32;
     pub const JC: u32 = offset_of!(CpuState, jc) as u32;
 
@@ -463,8 +485,13 @@ mod tests {
             assert_eq!(off % 8, 0, "offset {off} not 8-aligned");
             assert!(off < 32 * 1024, "offset {off} out of LDR range");
         }
-        // Word fields other threads write and code tests with LDR W.
-        assert_eq!(offsets::EXIT_REQUEST % 4, 0);
+        // Word fields other threads write and code tests with LDR W, and the
+        // two requests ISB tests with one LDR X.
+        assert_eq!(offsets::EXIT_REQUEST % 8, 0);
+        assert_eq!(
+            std::mem::offset_of!(CpuState, sync_request) as u32,
+            offsets::EXIT_REQUEST + 4
+        );
         assert_eq!(offsets::IRQ_HINT % 4, 0);
         // Pairs of X registers and the scratch slots: STP reaches 504.
         assert!(offsets::x(29) <= 504 && offsets::scratch(2) <= 504);

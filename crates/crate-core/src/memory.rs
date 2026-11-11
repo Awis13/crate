@@ -81,24 +81,35 @@ unsafe impl RamBlock for HeapRam {
 
 pub struct MemoryRegion {
     guest_base: u64,
-    block: Arc<dyn RamBlock>,
+    /// The block's host pointer and length, read once (they never change).
+    ptr: *mut u8,
+    len: u64,
+    /// Keeps the host memory alive as long as the region.
+    _block: Arc<dyn RamBlock>,
 }
+
+// SAFETY: the pointer is the block's own, valid for the block's life (which
+// the region holds); guest memory is shared by design and only reached
+// through raw pointers.
+unsafe impl Send for MemoryRegion {}
+// SAFETY: as for Send.
+unsafe impl Sync for MemoryRegion {}
 
 impl MemoryRegion {
     pub fn guest_base(&self) -> u64 {
         self.guest_base
     }
     pub fn size(&self) -> u64 {
-        self.block.len() as u64
+        self.len
     }
     pub fn host_ptr(&self) -> *mut u8 {
-        self.block.as_ptr()
+        self.ptr
     }
     fn contains(&self, addr: u64, len: u64) -> bool {
-        addr >= self.guest_base
+        addr.wrapping_sub(self.guest_base) < self.len
             && addr
                 .checked_add(len)
-                .is_some_and(|end| end <= self.guest_base + self.size())
+                .is_some_and(|end| end <= self.guest_base + self.len)
     }
 }
 
@@ -131,7 +142,12 @@ impl GuestMemory {
     pub fn new(regions: Vec<(u64, Arc<dyn RamBlock>)>) -> Result<Self> {
         let mut regions: Vec<MemoryRegion> = regions
             .into_iter()
-            .map(|(guest_base, block)| MemoryRegion { guest_base, block })
+            .map(|(guest_base, block)| MemoryRegion {
+                guest_base,
+                ptr: block.as_ptr(),
+                len: block.len() as u64,
+                _block: block,
+            })
             .collect();
         regions.sort_by_key(|r| r.guest_base);
         for pair in regions.windows(2) {

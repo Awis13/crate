@@ -202,7 +202,7 @@ struct Filled {
 }
 
 impl Filled {
-    const MAX: usize = 512;
+    const MAX: usize = 2048;
 
     fn new() -> Self {
         Filled {
@@ -236,33 +236,104 @@ impl Filled {
 
 /// What the Rust side keeps about each software-TLB entry beyond what the
 /// fast path needs: the size of the mapping it came from and whether that
-/// mapping was global.
+/// mapping was global, and lists of the entries an invalidation must visit,
+/// so a TLBI of a user address does not scan what only the kernel uses.
 pub(crate) struct TlbBook {
     /// Per TLB and entry: log2 of the mapping size (64 with the MMU off), and
     /// bit 7 set for a non-global mapping.
     meta: Box<[[u8; TLB_ENTRIES]; 4]>,
+    /// Every entry filled.
     filled: [Filled; 4],
-    /// Some entry of the TLB came from a mapping larger than its 4 KiB.
-    large: [bool; 4],
+    /// Entries for the lower half of the address space (TTBR0); for the EL0
+    /// TLBs that is every entry.
+    low: [Filled; 4],
+    /// Entries from mappings larger than a TLB entry, by half of the address
+    /// space (0 lower, 1 upper): a TLBI of one address drops every piece.
+    large: [[Filled; 2]; 4],
+    /// Some upper-half entry is non-global (only with a split kernel map).
+    ng_high: [bool; 4],
 }
 
 const META_NG: u8 = 1 << 7;
 
 impl TlbBook {
     fn new() -> Self {
+        let f = || [Filled::new(), Filled::new(), Filled::new(), Filled::new()];
         TlbBook {
             meta: Box::new([[0; TLB_ENTRIES]; 4]),
-            filled: [Filled::new(), Filled::new(), Filled::new(), Filled::new()],
-            large: [false; 4],
+            filled: f(),
+            low: f(),
+            large: [
+                [Filled::new(), Filled::new()],
+                [Filled::new(), Filled::new()],
+                [Filled::new(), Filled::new()],
+                [Filled::new(), Filled::new()],
+            ],
+            ng_high: [false; 4],
         }
     }
 
-    pub(crate) fn filled(&mut self, tlb: usize, i: usize, size_shift: u32, global: bool) {
+    pub(crate) fn filled(&mut self, tlb: usize, i: usize, va: u64, size_shift: u32, global: bool) {
         let shift = size_shift.min(64) as u8;
         self.meta[tlb][i] = shift | if global { 0 } else { META_NG };
         self.filled[tlb].push(i);
+        let high = (va >> 55) & 1 == 1;
+        if !high {
+            self.low[tlb].push(i);
+        } else if !global {
+            self.ng_high[tlb] = true;
+        }
         if shift > crate::state::TLB_SHIFT as u8 {
-            self.large[tlb] = true;
+            self.large[tlb][high as usize].push(i);
+        }
+    }
+
+    fn clear(&mut self, tlb: usize) {
+        self.filled[tlb].clear();
+        self.low[tlb].clear();
+        self.large[tlb][0].clear();
+        self.large[tlb][1].clear();
+        self.ng_high[tlb] = false;
+    }
+}
+
+/// Which of a TLB's entry lists an invalidation visits.
+#[derive(Clone, Copy)]
+enum TlbList {
+    All,
+    Low,
+    Large(usize),
+}
+
+/// A cache of instruction-fetch translations for the dispatcher's block
+/// lookups, emptied (by moving to a new generation) by every TLB
+/// invalidation.
+struct FetchTlb {
+    /// Per EL and entry: (page | 1 for valid, physical page, mapping size,
+    /// generation).
+    entries: Box<[[FetchEntry; 256]; 2]>,
+    generation: u32,
+}
+
+type FetchEntry = (u64, u64, u32, u32);
+
+impl FetchTlb {
+    fn lookup(&self, el: u32, va: u64) -> Option<(u64, u32)> {
+        let e = &self.entries[el.min(1) as usize][((va >> 12) & 255) as usize];
+        (e.0 == (va >> 12 << 1 | 1) && e.3 == self.generation).then_some((e.1 | (va & 0xfff), e.2))
+    }
+
+    fn insert(&mut self, el: u32, va: u64, pa: u64, size_shift: u32) {
+        self.entries[el.min(1) as usize][((va >> 12) & 255) as usize] =
+            (va >> 12 << 1 | 1, pa & !0xfff, size_shift, self.generation);
+    }
+
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Wrapped: forget every entry for real.
+            self.entries.iter_mut().for_each(|t| t.fill((0, 0, 0, 0)));
+            self.generation = 1;
         }
     }
 }
@@ -276,8 +347,10 @@ struct JcBook {
     /// The EL1 cache holds code from the lower half of the address space
     /// (TTBR0), which a change of TTBR0 makes stale.
     el1_low: bool,
-    /// Some cached code came from a mapping larger than a page.
-    large: [bool; 2],
+    /// The blocks (mapping size, VA >> size) larger than a page that cached
+    /// code came from, so a TLBI inside one drops the cache; `None` once too
+    /// many to track, when any TLBI does.
+    large: [Option<Vec<(u32, u64)>>; 2],
     /// The miss target empty entries point at, for the cache in use.
     miss: [u64; 2],
 }
@@ -293,6 +366,34 @@ struct Trace {
     mem: bool,
     /// `CRATE_TRACE_IRQ=1`: log interrupts taken and timer lines driven.
     irq: bool,
+    /// `CRATE_JIT_STATS=1`: count exits and slow-path calls, printed when
+    /// the CPU stops.
+    stats: bool,
+}
+
+/// Counters `CRATE_JIT_STATS=1` keeps.
+#[derive(Default, Debug)]
+pub(crate) struct Counters {
+    pub branch: u64,
+    pub sysreg: u64,
+    pub system_word: u64,
+    pub call: u64,
+    pub exception: u64,
+    pub eret: u64,
+    pub irq: u64,
+    pub wfi: u64,
+    pub wfe: u64,
+    pub slow_mem: u64,
+    pub translated: u64,
+    pub remote: u64,
+    pub jc_flushes: u64,
+    pub jc_misses: u64,
+    pub chain_exits: u64,
+    pub slow_device: u64,
+    pub slow_cross: u64,
+    pub slow_fault: u64,
+    /// Exits by system register.
+    pub sysregs: std::collections::BTreeMap<u16, u64>,
 }
 
 impl Trace {
@@ -304,6 +405,7 @@ impl Trace {
                 .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok()),
             mem: std::env::var_os("CRATE_TRAP_MEM").is_some(),
             irq: std::env::var_os("CRATE_TRACE_IRQ").is_some(),
+            stats: std::env::var_os("CRATE_JIT_STATS").is_some(),
         }
     }
 }
@@ -320,7 +422,11 @@ pub struct Cpu {
     smp: *const Smp,
     /// Which CPU this is (its index into the board), for the GIC and PSCI.
     cpu: usize,
+    /// Its MPIDR_EL1.
+    mpidr: u64,
     pub(crate) tlbs: TlbBook,
+    pub(crate) counters: Counters,
+    fetch: FetchTlb,
     jc: JcBook,
     /// The PPI levels the timers last drove, and their conditions then.
     vtimer_line: bool,
@@ -343,12 +449,18 @@ impl Cpu {
             board: std::ptr::null(),
             smp: std::ptr::null(),
             cpu: 0,
+            mpidr: 0x8000_0000,
             tlbs: TlbBook::new(),
+            counters: Counters::default(),
+            fetch: FetchTlb {
+                entries: Box::new([[(0, 0, 0, 0); 256]; 2]),
+                generation: 1,
+            },
             jc: JcBook {
                 filled: [Filled::new(), Filled::new()],
                 pages: [HashSet::default(), HashSet::default()],
                 el1_low: false,
-                large: [false; 2],
+                large: [Some(Vec::new()), Some(Vec::new())],
                 miss: [0; 2],
             },
             vtimer_line: false,
@@ -392,7 +504,7 @@ impl Cpu {
                 });
                 self.jc.filled[el].clear();
                 self.jc.pages[el].clear();
-                self.jc.large[el] = false;
+                self.jc.large[el] = Some(Vec::new());
             }
             self.jc.el1_low = false;
         }
@@ -499,24 +611,36 @@ impl Cpu {
             fast: cache.fast,
             debug,
             stubs: *cache.stubs(),
+            mpidr: self.mpidr,
         };
-        let t = match mmu::translate(&self.mem, &self.state.mmu, el, pc, Access::Execute) {
-            Ok(t) => t,
-            Err(f) => return (cache.fetch_fault(pc, f.fsc, ctx), false),
+        let (pa, size_shift) = match self.fetch.lookup(el, pc) {
+            Some(hit) => hit,
+            None => match mmu::translate(&self.mem, &self.state.mmu, el, pc, Access::Execute) {
+                Ok(t) => {
+                    self.fetch.insert(el, pc, t.pa, t.size_shift);
+                    (t.pa, t.size_shift)
+                }
+                Err(f) => return (cache.fetch_fault(pc, f.fsc, ctx), false),
+            },
         };
         let key = BlockKey {
-            pa: t.pa,
+            pa,
             mode: el | (debug as u32) << 2,
         };
         let entry = match cache.lookup(&key) {
             Some(e) => e,
             None => {
-                let page = t.pa & !0xfff;
+                let page = pa & !0xfff;
                 let off = (pc & 0xfff) as usize;
                 let Ok(host) = self.mem.host_range(page, 0x1000) else {
                     // The fetch translated but missed RAM: an external abort.
                     return (cache.fetch_fault(pc, 0x10, ctx), false);
                 };
+                // Tell the other CPUs before reading the code, so one that
+                // rewrites it and does not see this sends the invalidation.
+                if let Some(smp) = self.smp() {
+                    smp.note_code(page);
+                }
                 let n = ((0x1000 - off) / 4).min(512);
                 let mut words = [0u32; 512];
                 // SAFETY: inside the page host_range checked; guest code may be
@@ -530,6 +654,7 @@ impl Cpu {
                     );
                 }
                 let epoch = cache.epoch();
+                self.counters.translated += 1;
                 let e = cache.translate(key, pc, &words[..n], ctx);
                 if cache.epoch() != epoch {
                     // The region filled and was emptied: every jump-cache
@@ -552,8 +677,17 @@ impl Cpu {
             };
             self.jc.filled[el_i].push(i);
             self.jc.pages[el_i].insert(pc >> 12);
-            if t.size_shift > 12 {
-                self.jc.large[el_i] = true;
+            if size_shift > 12 {
+                let region = (size_shift.min(63), pc >> size_shift.min(63));
+                if let Some(list) = &mut self.jc.large[el_i] {
+                    if !list.contains(&region) {
+                        if list.len() >= 32 {
+                            self.jc.large[el_i] = None;
+                        } else {
+                            list.push(region);
+                        }
+                    }
+                }
             }
             if el_i == 1 && pc >> 55 == 0 {
                 self.jc.el1_low = true;
@@ -566,6 +700,7 @@ impl Cpu {
 
     /// Empties the jump cache for `el`.
     fn jc_flush(&mut self, el: usize) {
+        self.counters.jc_flushes += 1;
         let miss = self.jc.miss[el];
         let entries = &mut self.state.jc[el].entries;
         self.jc.filled[el].each(JC_ENTRIES, |i| {
@@ -573,18 +708,23 @@ impl Cpu {
         });
         self.jc.filled[el].clear();
         self.jc.pages[el].clear();
-        self.jc.large[el] = false;
+        self.jc.large[el] = Some(Vec::new());
         if el == 1 {
             self.jc.el1_low = false;
         }
     }
 
     /// Empties software TLB `t` of the entries `drop` picks (given an entry's
-    /// tag and its book byte).
-    fn tlb_drop(&mut self, t: usize, mut drop: impl FnMut(u64, u8) -> bool) {
+    /// tag and its book byte), visiting those `list` holds.
+    fn tlb_drop(&mut self, t: usize, list: TlbList, mut drop: impl FnMut(u64, u8) -> bool) {
         let entries = &mut self.state.tlb[t].entries;
         let meta = &self.tlbs.meta[t];
-        self.tlbs.filled[t].each(TLB_ENTRIES, |i| {
+        let filled = match list {
+            TlbList::All => &self.tlbs.filled[t],
+            TlbList::Low => &self.tlbs.low[t],
+            TlbList::Large(half) => &self.tlbs.large[t][half],
+        };
+        filled.each(TLB_ENTRIES, |i| {
             let e = &mut entries[i];
             if e.tag != TLB_INVALID && drop(e.tag, meta[i]) {
                 e.tag = TLB_INVALID;
@@ -593,9 +733,8 @@ impl Cpu {
     }
 
     fn tlb_empty(&mut self, t: usize) {
-        self.tlb_drop(t, |_, _| true);
-        self.tlbs.filled[t].clear();
-        self.tlbs.large[t] = false;
+        self.tlb_drop(t, TlbList::All, |_, _| true);
+        self.tlbs.clear(t);
     }
 
     /// Drops every translation (TLBI VMALLE1, an MMU or translation-control
@@ -604,6 +743,7 @@ impl Cpu {
         for t in 0..4 {
             self.tlb_empty(t);
         }
+        self.fetch.clear();
         self.jc_flush(0);
         self.jc_flush(1);
     }
@@ -614,8 +754,11 @@ impl Cpu {
         self.tlb_empty(2);
         self.tlb_empty(3);
         for t in 0..2 {
-            self.tlb_drop(t, |tag, _| tag >> (55 - 12) & 1 == 0);
+            self.tlb_drop(t, TlbList::Low, |tag, _| tag >> (55 - 12) & 1 == 0);
+            self.tlbs.low[t].clear();
+            self.tlbs.large[t][0].clear();
         }
+        self.fetch.clear();
         self.jc_flush(0);
         if self.jc.el1_low {
             self.jc_flush(1);
@@ -627,8 +770,14 @@ impl Cpu {
         self.tlb_empty(2);
         self.tlb_empty(3);
         for t in 0..2 {
-            self.tlb_drop(t, |_, meta| meta & META_NG != 0);
+            let list = if self.tlbs.ng_high[t] {
+                TlbList::All
+            } else {
+                TlbList::Low
+            };
+            self.tlb_drop(t, list, |_, meta| meta & META_NG != 0);
         }
+        self.fetch.clear();
         self.jc_flush(0);
         if self.jc.el1_low {
             self.jc_flush(1);
@@ -639,20 +788,24 @@ impl Cpu {
     /// piece of a block mapping that covers it.
     fn flush_va(&mut self, va: u64) {
         let page = va >> 12;
+        let half = ((va >> 55) & 1) as usize;
         for t in 0..4 {
             let i = TlbEntry::index(va);
             if self.state.tlb[t].entries[i].tag == page {
                 self.state.tlb[t].entries[i].tag = TLB_INVALID;
             }
-            if self.tlbs.large[t] {
-                self.tlb_drop(t, |tag, meta| {
-                    let shift = (meta & !META_NG) as u32;
-                    shift >= 64 || (shift > 12 && (tag << 12) >> shift == va >> shift)
-                });
-            }
+            self.tlb_drop(t, TlbList::Large(half), |tag, meta| {
+                let shift = (meta & !META_NG) as u32;
+                shift >= 64 || (shift > 12 && (tag << 12) >> shift == va >> shift)
+            });
         }
+        self.fetch.clear();
         for el in 0..2 {
-            if self.jc.large[el] || self.jc.pages[el].contains(&page) {
+            let in_large = match &self.jc.large[el] {
+                Some(list) => list.iter().any(|&(shift, base)| va >> shift == base),
+                None => true,
+            };
+            if in_large || self.jc.pages[el].contains(&page) {
                 self.jc_flush(el);
             }
         }
@@ -662,8 +815,8 @@ impl Cpu {
     fn apply(&mut self, op: Remote, cache: &mut CodeCache) {
         match op {
             Remote::FlushAll => self.flush_all(),
-            Remote::FlushVa(va) => self.flush_va(va),
-            Remote::FlushUser => self.flush_user(),
+            Remote::FlushVa(va, _) => self.flush_va(va),
+            Remote::FlushUser(_) => self.flush_user(),
             Remote::CodePage(pa) => {
                 if cache.invalidate_page(pa) {
                     self.jc_flush(0);
@@ -684,10 +837,30 @@ impl Cpu {
         if broadcast {
             if let Some(smp) = self.smp() {
                 if smp.cpus() > 1 {
-                    let wait = !matches!(op, Remote::CodePage(_) | Remote::CodeAll);
-                    smp.broadcast(self.cpu, op, wait);
+                    smp.broadcast(self.cpu, op);
                 }
             }
+        }
+    }
+
+    /// The ASID of the address space the CPU runs (TCR.A1 picks the TTBR
+    /// that holds it, TCR.AS its width), published so another CPU's TLBI of
+    /// a different address space can leave this one alone.
+    fn publish_asid(&self) {
+        let m = &self.state.mmu;
+        let ttbr = if m.tcr_el1 & (1 << 22) != 0 {
+            m.ttbr1_el1
+        } else {
+            m.ttbr0_el1
+        };
+        let width = if m.tcr_el1 & (1 << 36) != 0 {
+            0xffff
+        } else {
+            0xff
+        };
+        let asid = (m.sctlr_el1 & 1 != 0).then_some((ttbr >> 48) as u16 & width);
+        if let Some(smp) = self.smp() {
+            smp.set_asid(self.cpu, asid);
         }
     }
 
@@ -697,6 +870,7 @@ impl Cpu {
             None => return,
         };
         for op in ops {
+            self.counters.remote += 1;
             self.apply(op, cache);
         }
     }
@@ -755,6 +929,7 @@ impl Cpu {
         c.board = board as *const Board;
         c.smp = smp as *const Smp;
         c.cpu = cpu;
+        c.mpidr = board.mpidrs[cpu];
         c.reset(0, [0; 4]);
         c
     }
@@ -801,7 +976,12 @@ impl Cpu {
                 return Flow::Stop;
             }
             // Whatever another thread asked for: remote maintenance, the timer.
-            if self.state.exit_request().swap(0, Ordering::Acquire) != 0 {
+            let kicked = self.state.exit_request().swap(0, Ordering::Acquire) != 0;
+            if self.state.sync_request().swap(0, Ordering::Acquire) != 0 && !kicked {
+                self.apply_remote(cache);
+                chain = None;
+            }
+            if kicked {
                 chain = None;
                 self.apply_remote(cache);
                 self.service_timer(board);
@@ -869,6 +1049,32 @@ impl Cpu {
                 )
             {
                 self.state.pstate &= !PSTATE_SS;
+            }
+            if self.trace.stats {
+                let c = &mut self.counters;
+                match Exit::from_u32(code) {
+                    Some(Exit::Branch) => {
+                        c.branch += 1;
+                        if self.state.chain_site != 0 {
+                            c.chain_exits += 1;
+                        }
+                    }
+                    Some(Exit::Sysreg) if self.state.sysreg as u16 == SYSTEM_WORD_MARKER => {
+                        c.system_word += 1
+                    }
+                    Some(Exit::Sysreg) => {
+                        c.sysreg += 1;
+                        *c.sysregs.entry(self.state.sysreg as u16).or_default() += 1;
+                    }
+                    Some(Exit::Call) => c.call += 1,
+                    Some(Exit::Exception) if self.state.exception_syndrome & ERET_MARKER != 0 => {
+                        c.eret += 1
+                    }
+                    Some(Exit::Exception) => c.exception += 1,
+                    Some(Exit::WaitForInterrupt) => c.wfi += 1,
+                    Some(Exit::WaitForEvent) => c.wfe += 1,
+                    _ => {}
+                }
             }
             match Exit::from_u32(code) {
                 Some(Exit::Branch) => {
@@ -957,6 +1163,7 @@ impl Cpu {
         }
         if irq && pstate & PSTATE_I == 0 {
             let pc = self.state.pc;
+            self.counters.irq += 1;
             self.masked_pending = false;
             self.take_exception_kind(ExcKind::Irq, Some(0), None, pc);
             return true;
@@ -1448,7 +1655,7 @@ pub struct Jit {
 impl Jit {
     pub fn new() -> Self {
         Jit {
-            jit_bytes: 64 << 20,
+            jit_bytes: 256 << 20,
             fast: !slow_from_env(),
         }
     }
@@ -1526,7 +1733,28 @@ impl Cpu {
             };
             crate_core::debug!("CPU {} starts at {pc:#x}", self.cpu);
             self.reset(pc, x);
-            match self.dispatch(cache) {
+            let flow = self.dispatch(cache);
+            if self.trace.stats {
+                let top: Vec<String> = {
+                    let mut v: Vec<_> = self.counters.sysregs.iter().collect();
+                    v.sort_by(|a, b| b.1.cmp(a.1));
+                    v.iter()
+                        .take(12)
+                        .map(|(r, n)| format!("{:?}={n}", SysReg(**r)))
+                        .collect()
+                };
+                let mut c = std::mem::take(&mut self.counters);
+                c.sysregs.clear();
+                c.jc_misses = self.state.jc_misses;
+                eprintln!(
+                    "crate: cpu{} {c:?} blocks={} code={}K sysregs: {}",
+                    self.cpu,
+                    cache.block_count(),
+                    cache.used() >> 10,
+                    top.join(" ")
+                );
+            }
+            match flow {
                 Flow::Stop => return,
                 Flow::CpuOff => {
                     if self.vtimer_line {
@@ -1623,12 +1851,20 @@ impl Cpu {
         } else if crn == 0b1000 && op1 == 0 {
             // TLBI at EL1: CRm 0011 inner shareable (and 0001 outer), 0111 local.
             let broadcast = crm != 0b0111;
-            // VA[55:12] is in bits 43:0, sign-extended from VA bit 55.
+            // VA[55:12] is in bits 43:0, sign-extended from VA bit 55; the ASID
+            // in bits 63:48.
             let va = (((xt << 20) as i64) >> 8) as u64 & !0xfff;
+            let width = if self.state.mmu.tcr_el1 & (1 << 36) != 0 {
+                0xffff
+            } else {
+                0xff
+            };
+            let asid = (xt >> 48) as u16 & width;
             let op = match (crm, op2) {
                 (0b0011 | 0b0111 | 0b0001, 0) => Remote::FlushAll, // VMALLE1
-                (0b0011 | 0b0111 | 0b0001, 1 | 3 | 5 | 7) => Remote::FlushVa(va),
-                (0b0011 | 0b0111 | 0b0001, 2) => Remote::FlushUser, // ASIDE1
+                (0b0011 | 0b0111 | 0b0001, 1 | 5) => Remote::FlushVa(va, Some(asid)), // VA(L)E1
+                (0b0011 | 0b0111 | 0b0001, 3 | 7) => Remote::FlushVa(va, None), // VAA(L)E1
+                (0b0011 | 0b0111 | 0b0001, 2) => Remote::FlushUser(asid), // ASIDE1
                 _ => Remote::FlushAll, // range forms and the rest: everything
             };
             self.maintain(op, broadcast, cache);
@@ -1744,15 +1980,16 @@ impl Cpu {
             r if r == sr::FPSR => fpsr(),
             r if r == sr::CURRENT_EL => (self.el() as u64) << 2,
             r if r == sr::SPSEL => self.state.pstate & PSTATE_SPSEL,
-            r if r == sr::MPIDR_EL1 => board.mpidrs[self.cpu],
-            r if r == sr::MIDR_EL1 => 0x410f_d080, // a generic Cortex-A
+            r if r == sr::MPIDR_EL1 => self.mpidr,
+            r if r == sr::MIDR_EL1 => MIDR_EL1,
             r if r == sr::CTR_EL0 => CTR_EL0,
-            r if r == sr::DCZID_EL0 => 0x4, // 64-byte zero block, DC ZVA allowed
-            r if r == sr::CLIDR_EL1 => 0,   // no cache levels advertised
+            r if r == sr::DCZID_EL0 => DCZID_EL0,
+            r if r == sr::CLIDR_EL1 => 0, // no cache levels advertised
             r if r == sr::ID_AA64MMFR0_EL1 => ID_AA64MMFR0,
             r if r == sr::ID_AA64PFR0_EL1 => ID_AA64PFR0,
             r if r == sr::ID_AA64DFR0_EL1 => ID_AA64DFR0,
             r if r == sr::ID_AA64ISAR0_EL1 => ID_AA64ISAR0,
+            r if r == sr::ID_AA64ISAR1_EL1 => ID_AA64ISAR1,
             r if r == sr::OSLSR_EL1 => {
                 // OSLM = 0b10 (the v8 model), OSLK (bit 1) from the OS lock.
                 0b1000 | (self.state.debug.oslock & 2)
@@ -1791,10 +2028,12 @@ impl Cpu {
                 if (old ^ value) & (1 | 1 << 19 | 1 << 25) != 0 {
                     self.flush_all();
                 }
+                self.publish_asid();
             }
             r if r == sr::TTBR0_EL1 => {
                 if self.state.mmu.ttbr0_el1 != value {
                     self.state.mmu.ttbr0_el1 = value;
+                    self.publish_asid();
                     self.flush_low();
                 }
             }
@@ -1802,6 +2041,7 @@ impl Cpu {
                 let old = self.state.mmu.ttbr1_el1;
                 self.state.mmu.ttbr1_el1 = value;
                 const BADDR: u64 = 0x0000_ffff_ffff_fffe;
+                self.publish_asid();
                 if (old ^ value) & BADDR != 0 {
                     self.flush_all();
                 } else if old != value {
@@ -1813,6 +2053,7 @@ impl Cpu {
             r if r == sr::TCR_EL1 => {
                 if self.state.mmu.tcr_el1 != value {
                     self.state.mmu.tcr_el1 = value;
+                    self.publish_asid();
                     self.flush_all();
                 }
             }
@@ -1936,7 +2177,11 @@ fn debug_reg(r: SysReg) -> Option<(DebugReg, usize)> {
 /// left 0 so the guest issues IC after writing code, which the dispatcher
 /// honours by dropping the page's translations; without that, rewritten code
 /// would run the stale translation.
-const CTR_EL0: u64 = (1 << 31) | (1 << 28) | (3 << 24) | (4 << 16) | (3 << 14) | 4;
+pub(crate) const CTR_EL0: u64 = (1 << 31) | (1 << 28) | (3 << 24) | (4 << 16) | (3 << 14) | 4;
+/// DCZID_EL0: DC ZVA allowed, 64-byte blocks (4 words << 4).
+pub(crate) const DCZID_EL0: u64 = 0x4;
+/// MIDR_EL1: a generic Cortex-A.
+pub(crate) const MIDR_EL1: u64 = 0x410f_d080;
 /// ID_AA64MMFR0_EL1: PARange 40-bit (2) and all three granules supported —
 /// 4 KiB (TGran4=0), 16 KiB (TGran16=1) and 64 KiB (TGran64=0) — but **without**
 /// the 52-bit (LPA2) variants (TGran4=1 / TGran16=2), which the MMU does not
@@ -1947,8 +2192,15 @@ const ID_AA64PFR0: u64 = 0x0000_0000_0000_0011;
 /// ID_AA64DFR0_EL1: debug architecture v8, 6 breakpoints and 4 watchpoints,
 /// PMUVer 0 (so the PMU tests skip rather than fail).
 const ID_AA64DFR0: u64 = 0x0000_0000_1035_0006;
-/// ID_AA64ISAR0_EL1: nothing beyond Armv8.0 yet.
-const ID_AA64ISAR0: u64 = 0;
+/// ID_AA64ISAR0_EL1: the instructions the host runs as they are, copied --
+/// AES with PMULL (AES 2), SHA1 (1), SHA256 (SHA2 1), CRC32 (1), RDM (1) and
+/// the dot product (DP 1) -- and the LSE atomics (Atomic 2), which the
+/// translator turns into the host's own on the host address.
+const ID_AA64ISAR0: u64 =
+    (1 << 44) | (1 << 28) | (2 << 20) | (1 << 16) | (1 << 12) | (1 << 8) | (2 << 4);
+/// ID_AA64ISAR1_EL1: DC CVAP (DPB 1, a no-op here), FJCVTZS (JSCVT 1), the
+/// complex-number instructions (FCMA 1) and LDAPR (LRCPC 1).
+const ID_AA64ISAR1: u64 = (1 << 20) | (1 << 16) | (1 << 12) | 1;
 
 fn is_id_space(r: SysReg) -> bool {
     r.op0() == 3 && r.op1() == 0 && r.crn() == 0 && (0..8).contains(&r.crm())
@@ -2001,6 +2253,7 @@ mod sr {
     pub const ID_AA64PFR0_EL1: SysReg = SysReg::new(3, 0, 0, 4, 0);
     pub const ID_AA64DFR0_EL1: SysReg = SysReg::new(3, 0, 0, 5, 0);
     pub const ID_AA64ISAR0_EL1: SysReg = SysReg::new(3, 0, 0, 6, 0);
+    pub const ID_AA64ISAR1_EL1: SysReg = SysReg::new(3, 0, 0, 6, 1);
     pub const ID_AA64MMFR0_EL1: SysReg = SysReg::new(3, 0, 0, 7, 0);
     pub const MDSCR_EL1: SysReg = SysReg::new(2, 0, 0, 2, 2);
     pub const OSLAR_EL1: SysReg = SysReg::new(2, 0, 1, 0, 4);

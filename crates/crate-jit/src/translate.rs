@@ -32,7 +32,9 @@
 use crate::asm::*;
 use crate::decode::{self, CallKind, CondKind, Mem, MemKind, Op};
 use crate::emit::{self, ExitInfo, JUMP_REG, Next, Stubs};
-use crate::state::{Exit, TLB_BITS, TLB_SHIFT, TlbKind, offsets, tlb_index};
+use std::mem::offset_of;
+
+use crate::state::{Banked, Exit, MmuRegs, TLB_BITS, TLB_SHIFT, TlbKind, offsets, tlb_index};
 
 /// What every block of one translation context shares.
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +49,8 @@ pub struct Ctx {
     /// store through the slow path (which checks watchpoints), no chaining.
     pub debug: bool,
     pub stubs: Stubs,
+    /// The CPU's MPIDR_EL1, which its code reads as a constant.
+    pub mpidr: u64,
 }
 
 impl Ctx {
@@ -1023,12 +1027,12 @@ impl Block {
         let go = self.asm.label();
         let cont = self.asm.label();
         self.asm.emit(str_imm(3, 16, SP, offsets::scratch(0)));
-        // Order the request after the loads before the ISB: a CPU that read
+        // Order the requests after the loads before the ISB: a CPU that read
         // another's "code is ready" flag must also see the invalidation that
-        // came before it.
+        // came before it. The exit and sync requests are one doubleword.
         self.asm.emit(DMB_ISHLD);
-        self.asm.emit(ldr_imm(2, 16, SP, offsets::EXIT_REQUEST));
-        self.asm.cbnz(false, 16, go);
+        self.asm.emit(ldr_imm(3, 16, SP, offsets::EXIT_REQUEST));
+        self.asm.cbnz(true, 16, go);
         self.asm.emit(ldr_imm(3, 16, SP, offsets::scratch(0)));
         self.asm.b(cont);
         self.asm.bind(go);
@@ -1175,11 +1179,26 @@ impl Block {
     fn emit_inline_sysreg(&mut self, read: bool, reg: u16, rt: u32, word: u32, _pc: u64) -> bool {
         use crate::state::offsets as o;
         let el1 = self.ctx.el == 1;
+        // Registers that are plain fields of the state: the dispatcher reads
+        // them where it needs them (ELR, SPSR and VBAR when it takes an
+        // exception or returns from one).
         let state_slot = match reg {
             r if r == sr::TPIDR_EL0 => Some(o::TPIDR_EL0),
             r if r == sr::TPIDRRO_EL0 && (read || el1) => Some(o::TPIDRRO_EL0),
-            r if r == sr::TPIDR_EL1 && el1 => Some(o::TPIDR_EL1),
-            r if r == sr::SP_EL0 && el1 => Some(o::SP_EL0),
+            _ if !el1 => None,
+            r if r == sr::TPIDR_EL1 => Some(o::TPIDR_EL1),
+            r if r == sr::SP_EL0 => Some(o::SP_EL0),
+            r if r == sr::ELR_EL1 => Some(o::banked(offset_of!(Banked, elr_el1))),
+            r if r == sr::SPSR_EL1 => Some(o::banked(offset_of!(Banked, spsr_el1))),
+            r if r == sr::ESR_EL1 => Some(o::banked(offset_of!(Banked, esr_el1))),
+            r if r == sr::FAR_EL1 => Some(o::banked(offset_of!(Banked, far_el1))),
+            r if r == sr::VBAR_EL1 => Some(o::banked(offset_of!(Banked, vbar_el1))),
+            r if r == sr::PAR_EL1 => Some(o::banked(offset_of!(Banked, par_el1))),
+            r if r == sr::CPACR_EL1 => Some(o::banked(offset_of!(Banked, cpacr_el1))),
+            r if r == sr::CONTEXTIDR_EL1 => {
+                Some(o::MMU + offset_of!(MmuRegs, contextidr_el1) as u32)
+            }
+            r if r == sr::MDSCR_EL1 && read => Some(o::banked(offset_of!(Banked, mdscr_el1))),
             _ => None,
         };
         if let Some(off) = state_slot {
@@ -1204,8 +1223,34 @@ impl Block {
             }
             return true;
         }
-        if read && reg == sr::CURRENT_EL && el1 {
-            self.set_reg_const(rt, 1 << 2);
+        // Registers that are constants of the machine or of this CPU.
+        let constant = match reg {
+            _ if !read => None,
+            r if r == sr::CURRENT_EL && el1 => Some(1 << 2),
+            r if r == sr::DCZID_EL0 => Some(crate::backend::DCZID_EL0),
+            r if r == sr::CTR_EL0 => Some(crate::backend::CTR_EL0),
+            r if r == sr::MIDR_EL1 && el1 => Some(crate::backend::MIDR_EL1),
+            r if r == sr::MPIDR_EL1 && el1 => Some(self.ctx.mpidr),
+            _ => None,
+        };
+        if let Some(v) = constant {
+            self.set_reg_const(rt, v);
+            return true;
+        }
+        // The translation controls read back as their fields (writes change
+        // what translations hold, so they go to the dispatcher).
+        let mmu = |off: usize| Some(o::MMU + off as u32);
+        let mmu_slot = match reg {
+            _ if !read || !el1 => None,
+            r if r == sr::SCTLR_EL1 => mmu(offset_of!(MmuRegs, sctlr_el1)),
+            r if r == sr::TTBR0_EL1 => mmu(offset_of!(MmuRegs, ttbr0_el1)),
+            r if r == sr::TTBR1_EL1 => mmu(offset_of!(MmuRegs, ttbr1_el1)),
+            r if r == sr::TCR_EL1 => mmu(offset_of!(MmuRegs, tcr_el1)),
+            r if r == sr::MAIR_EL1 => mmu(offset_of!(MmuRegs, mair_el1)),
+            _ => None,
+        };
+        if let Some(off) = mmu_slot {
+            self.load_state_into(rt, off);
             return true;
         }
         if reg == sr::DAIF && el1 {
@@ -1374,6 +1419,24 @@ mod sr {
     pub const CNTFRQ_EL0: u16 = enc(3, 3, 14, 0, 0);
     pub const CNTPCT_EL0: u16 = enc(3, 3, 14, 0, 1);
     pub const CNTVCT_EL0: u16 = enc(3, 3, 14, 0, 2);
+    pub const ELR_EL1: u16 = enc(3, 0, 4, 0, 1);
+    pub const SPSR_EL1: u16 = enc(3, 0, 4, 0, 0);
+    pub const ESR_EL1: u16 = enc(3, 0, 5, 2, 0);
+    pub const FAR_EL1: u16 = enc(3, 0, 6, 0, 0);
+    pub const VBAR_EL1: u16 = enc(3, 0, 12, 0, 0);
+    pub const PAR_EL1: u16 = enc(3, 0, 7, 4, 0);
+    pub const CPACR_EL1: u16 = enc(3, 0, 1, 0, 2);
+    pub const CONTEXTIDR_EL1: u16 = enc(3, 0, 13, 0, 1);
+    pub const MDSCR_EL1: u16 = enc(2, 0, 0, 2, 2);
+    pub const DCZID_EL0: u16 = enc(3, 3, 0, 0, 7);
+    pub const CTR_EL0: u16 = enc(3, 3, 0, 0, 1);
+    pub const MIDR_EL1: u16 = enc(3, 0, 0, 0, 0);
+    pub const MPIDR_EL1: u16 = enc(3, 0, 0, 0, 5);
+    pub const SCTLR_EL1: u16 = enc(3, 0, 1, 0, 0);
+    pub const TTBR0_EL1: u16 = enc(3, 0, 2, 0, 0);
+    pub const TTBR1_EL1: u16 = enc(3, 0, 2, 0, 1);
+    pub const TCR_EL1: u16 = enc(3, 0, 2, 0, 2);
+    pub const MAIR_EL1: u16 = enc(3, 0, 10, 2, 0);
 }
 
 /// The bit-positions of the GPR operand fields a verbatim-copied instruction

@@ -178,7 +178,8 @@ pub fn jc_stub(asm: &mut Asm, el: u32, save: u64) -> (u32, u32) {
     asm.emit(str_imm(3, JUMP_REG, SP, offsets::NEXT_PC));
     asm.emit(ldr_imm(2, 17, SP, offsets::EXIT_REQUEST));
     asm.cbnz(false, 17, miss);
-    asm.emit(ubfx(17, 16, 2, crate::state::JC_BITS));
+    asm.emit(eor_reg(true, 17, 16, 16, LSR, crate::state::JC_FOLD));
+    asm.emit(ubfx(17, 17, 2, crate::state::JC_BITS));
     asm.emit(add_ext(17, SP, 17, EXT_UXTX, 4));
     let off = offsets::jc(el);
     debug_assert_eq!(off & 0xfff, 0);
@@ -194,6 +195,9 @@ pub fn jc_stub(asm: &mut Asm, el: u32, save: u64) -> (u32, u32) {
     asm.emit(br(16));
     asm.bind(miss);
     let miss_at = asm.here();
+    asm.emit(ldr_imm(3, 15, SP, offsets::JC_MISSES));
+    asm.emit(add_imm(true, 15, 15, 1, false));
+    asm.emit(str_imm(3, 15, SP, offsets::JC_MISSES));
     asm.emit(ldp(15, 16, SP, offsets::x(15) as i32));
     asm.emit(ldr_imm(3, 17, SP, offsets::x(17)));
     // The exit prefix, with the next PC already in place.
