@@ -15,12 +15,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate_core::display::Mode;
 use crate_core::log::Level;
 use crate_core::run::StopReason;
 use crate_core::{Error, Result};
 use crate_host::disk::FileDisk;
 use crate_host::slirp::{PortForward, UserNet};
-use crate_virt::{ConsoleConfig, ConsoleKind, NetworkConfig, VirtConfig, VirtMachine};
+use crate_virt::{
+    ConsoleConfig, ConsoleKind, DisplayConfig, InputConfig, NetworkConfig, VirtConfig, VirtMachine,
+};
+use crate_vnc::VncServer;
 
 const USAGE: &str = "\
 usage: crate-run --kernel IMAGE [options]
@@ -36,6 +40,14 @@ usage: crate-run --kernel IMAGE [options]
                            forward a host port into the guest (implies --net;
                            ADDR defaults to 127.0.0.1)
   --virtio-console PATH    a virtio console (hvc0) on a Unix socket at PATH
+  --display 2d|virgl       a virtio-gpu screen, with a keyboard and a tablet;
+                           virgl renders the guest's OpenGL ES on the host's
+                           GPU (falls back to 2d if it cannot start)
+  --modes WxH[,WxH...]     the display's modes, the preferred first (default
+                           1024x768,640x480,800x600,1280x960)
+  --vnc PATH               a VNC server for the display on a Unix socket
+  --vnc-tcp ADDR:PORT      a VNC server on a TCP port (no authentication: keep
+                           it on 127.0.0.1)
   --dump-dtb PATH          write the device tree to PATH and exit (as text if
                            PATH ends in .dts)
   --log LEVEL              error, warn, info (default) or debug
@@ -52,10 +64,37 @@ struct Args {
     net: bool,
     forwards: Vec<PortForward>,
     virtio_console: Option<PathBuf>,
+    display: Option<Gpu>,
+    modes: Vec<Mode>,
+    vnc: Option<PathBuf>,
+    vnc_tcp: Option<std::net::SocketAddr>,
     dump_dtb: Option<PathBuf>,
     log: Level,
     raw: bool,
     backend: Backend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gpu {
+    TwoD,
+    Virgl,
+}
+
+fn parse_modes(spec: &str) -> std::result::Result<Vec<Mode>, String> {
+    spec.split(',')
+        .map(|m| {
+            let (w, h) = m
+                .split_once('x')
+                .ok_or_else(|| format!("--modes: {m} is not WxH"))?;
+            let n = |v: &str| {
+                v.parse::<u32>()
+                    .ok()
+                    .filter(|&v| (16..=4095).contains(&v))
+                    .ok_or_else(|| format!("--modes: {m} is not WxH from 16 to 4095"))
+            };
+            Ok(Mode::new(n(w)?, n(h)?))
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,6 +146,10 @@ fn parse(mut it: impl Iterator<Item = String>) -> std::result::Result<Args, Stri
         net: false,
         forwards: Vec::new(),
         virtio_console: None,
+        display: None,
+        modes: crate_virt::DEFAULT_MODES.to_vec(),
+        vnc: None,
+        vnc_tcp: None,
         dump_dtb: None,
         log: Level::Info,
         raw: false,
@@ -147,6 +190,22 @@ fn parse(mut it: impl Iterator<Item = String>) -> std::result::Result<Args, Stri
             }
             "--forward" => args.forwards.push(parse_forward(&value()?)?),
             "--virtio-console" => args.virtio_console = Some(value()?.into()),
+            "--display" => {
+                args.display = Some(match value()?.as_str() {
+                    "2d" => Gpu::TwoD,
+                    "virgl" => Gpu::Virgl,
+                    other => return Err(format!("--display {other}: expected 2d or virgl")),
+                })
+            }
+            "--modes" => args.modes = parse_modes(&value()?)?,
+            "--vnc" => args.vnc = Some(value()?.into()),
+            "--vnc-tcp" => {
+                let v = value()?;
+                args.vnc_tcp = Some(
+                    v.parse()
+                        .map_err(|_| format!("--vnc-tcp {v}: expected ADDR:PORT"))?,
+                )
+            }
             "--dump-dtb" => args.dump_dtb = Some(value()?.into()),
             "--log" => {
                 args.log = match value()?.as_str() {
@@ -166,6 +225,9 @@ fn parse(mut it: impl Iterator<Item = String>) -> std::result::Result<Args, Stri
         }
     }
     args.kernel = kernel.ok_or("--kernel is required")?;
+    if (args.vnc.is_some() || args.vnc_tcp.is_some()) && args.display.is_none() {
+        return Err("--vnc needs --display".into());
+    }
     args.net |= !args.forwards.is_empty();
     Ok(args)
 }
@@ -316,6 +378,20 @@ fn run(args: Args) -> Result<StopReason> {
         None => None,
     };
 
+    // The screen goes to a VNC server, which has no clients, and so asks for
+    // no frames, without --vnc.
+    let mut displays = Vec::new();
+    let vnc = args.display.map(|gpu| {
+        let preferred = args.modes[0];
+        let server = VncServer::new("crate", preferred.width, preferred.height);
+        displays.push(DisplayConfig {
+            modes: args.modes.clone(),
+            sink: server.clone(),
+            renderer: (gpu == Gpu::Virgl).then(crate_host::virgl::factory),
+        });
+        server
+    });
+
     let machine = Arc::new(VirtMachine::new(VirtConfig {
         cpus: args.cpus,
         memory: args.memory_mib << 20,
@@ -326,7 +402,22 @@ fn run(args: Args) -> Result<StopReason> {
         disks,
         networks,
         consoles,
+        displays,
+        input: InputConfig {
+            keyboard: args.display.is_some(),
+            tablet: args.display.is_some(),
+        },
     })?);
+
+    if let (Some(server), Some(control)) = (&vnc, machine.display(0)) {
+        server.attach(Arc::new(control.clone()), machine.input());
+        if let Some(path) = &args.vnc {
+            server.listen_unix(path)?;
+        }
+        if let Some(address) = args.vnc_tcp {
+            server.listen_tcp(address)?;
+        }
+    }
 
     if let Some(path) = &args.dump_dtb {
         let blob = machine.device_tree();
@@ -460,5 +551,11 @@ mod tests {
             parse(["--cpus", "4"].iter().map(|s| s.to_string())).is_err(),
             "no kernel"
         );
+        assert_eq!(
+            parse_modes("800x600,1280x960").unwrap(),
+            [Mode::new(800, 600), Mode::new(1280, 960)]
+        );
+        assert!(parse_modes("800x").is_err());
+        assert!(parse_modes("5000x600").is_err());
     }
 }
