@@ -89,10 +89,9 @@ pub fn call_kind_code(kind: CallKind) -> u32 {
 }
 
 /// A load or store's out-of-line call into the slow path, in the cold
-/// section; the fast path branches to it through `tramp`, a branch after the
-/// block's code (a conditional branch reaches only 1 MiB).
+/// section; a fast path in the code section branches to it through a branch
+/// after the block's code (a conditional branch reaches only 1 MiB).
 struct SlowSite {
-    tramp: Label,
     label: Label,
     resume: Label,
     word: u32,
@@ -102,6 +101,10 @@ struct SlowSite {
     cache: RegCache,
     /// The instruction's operands among X19..X29.
     regs: Regs,
+    /// Registers pinned by a group of accesses (see `Group`), which the call
+    /// destroys: they are zeroed after it, which sends the group's later
+    /// accesses to their own checks.
+    pinned: u32,
 }
 
 /// A short list of registers, without allocating.
@@ -188,6 +191,15 @@ fn emit_sync(asm: &mut Asm, c: RegCache) {
             ldr_imm(3, r, SP, offsets::x(r))
         })
     });
+}
+
+/// Zeroes the registers of `mask`.
+fn zero(asm: &mut Asm, mut mask: u32) {
+    while mask != 0 {
+        let r = mask.trailing_zeros();
+        asm.emit(movz(true, r, 0, 0));
+        mask &= !(1 << r);
+    }
 }
 
 /// Calls `f(r, true)` for each pair of neighbours r, r+1 in `mask` and
@@ -320,6 +332,191 @@ fn ends_block_always(op: &Op) -> bool {
     )
 }
 
+/// Loads and stores off one base register, in one stretch of a block, that
+/// one TLB check covers. The group's base is the register's value after its
+/// first access (which may be pre-indexed; its last may be post-indexed), and
+/// every byte any of them touches lies `lo..=hi` from it, so when the check
+/// finds that range in one page each access is a single host instruction at
+/// `hb`, the base's host address, kept in one of X15..X17 for the stretch. A
+/// failed check, or any slow path in the stretch, leaves `hb` zero, and each
+/// access then takes its own check, in the cold section.
+#[derive(Clone, Copy, Debug)]
+struct Group {
+    first: usize,
+    last: usize,
+    base: u32,
+    lo: i64,
+    hi: i64,
+    store: bool,
+    hb: Reg,
+}
+
+/// Whether an access can be in a group: one or two registers at a base
+/// register plus an immediate, not X18 (as base or data, which take scratch
+/// registers of their own), and with a writeback only if its data registers
+/// are not the base.
+fn groupable(m: &Mem) -> bool {
+    let gpr = matches!(m.kind, MemKind::Gpr | MemKind::Pair);
+    let pair = matches!(m.kind, MemKind::Pair | MemKind::VecPair);
+    matches!(
+        m.kind,
+        MemKind::Gpr | MemKind::Vec | MemKind::Pair | MemKind::VecPair
+    ) && m.index_reg.is_none()
+        && m.rn != 18
+        && !m.unprivileged
+        && m.align <= 1
+        && !(gpr && (m.rt == 18 || (pair && m.rt2 == 18)))
+        && !(m.writeback && gpr && (m.rt == m.rn || (pair && m.rt2 == m.rn)))
+}
+
+/// Whether an access loads into register `r`.
+fn loads_into(m: &Mem, r: u32) -> bool {
+    let pair = matches!(m.kind, MemKind::Pair | MemKind::LoadExclusive);
+    m.load
+        && matches!(
+            m.kind,
+            MemKind::Gpr | MemKind::Pair | MemKind::LoadExclusive | MemKind::LoadAcquire
+        )
+        && (m.rt == r || (pair && m.rt2 == r))
+}
+
+/// Whether an instruction changes guest register `r` (31: SP).
+fn changes(op: &Op, word: u32, r: u32) -> bool {
+    match *op {
+        Op::Memory(m) => {
+            (m.writeback && m.rn == r)
+                || (r != 31
+                    && (loads_into(&m, r)
+                        || (matches!(m.kind, MemKind::StoreExclusive | MemKind::Cas) && m.rs == r)
+                        || (m.kind == MemKind::CasPair && (m.rs == r || m.rs + 1 == r))
+                        || (m.kind == MemKind::Atomic && m.rt == r)))
+        }
+        Op::AddSubSpImm { rd, set_flags, .. } | Op::AddSubSpExt { rd, set_flags, .. } => {
+            rd == r && !(r == 31 && set_flags)
+        }
+        Op::LogicalSpImm { .. } => r == 31,
+        Op::LiteralLoad { rt, vector, .. } => !vector && rt == r,
+        _ if r == 31 => false,
+        _ => uses(op, word).1 & 1 << r != 0,
+    }
+}
+
+/// Whether a group cannot reach past an instruction: anything that may leave
+/// the block, call, or take a slow path inline.
+fn stops_group(op: &Op) -> bool {
+    match op {
+        Op::Memory(m) => Block::needs_slow(m),
+        Op::Sysreg { .. }
+        | Op::MsrImm { .. }
+        | Op::System { .. }
+        | Op::Isb
+        | Op::Call { .. }
+        | Op::Wait { .. }
+        | Op::Eret
+        | Op::Undefined
+        | Op::Branch { .. }
+        | Op::CondBranch { .. }
+        | Op::IndBranch { .. } => true,
+        _ => false,
+    }
+}
+
+/// The groups among a block's instructions, greedily from the first access
+/// of each, and the group each instruction belongs to. Groups do not
+/// overlap: a second host base would leave the other accesses of the stretch
+/// one free register (measured: slower).
+fn plan_groups(ops: &[(Op, u32, u64)]) -> (Vec<Group>, Vec<Option<usize>>) {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut member = vec![None; ops.len()];
+    let mut i = 0;
+    while i < ops.len() {
+        let Op::Memory(m0) = ops[i].0 else {
+            i += 1;
+            continue;
+        };
+        if !groupable(&m0) || (m0.writeback && !m0.pre) || loads_into(&m0, m0.rn) {
+            i += 1;
+            continue;
+        }
+        let base = m0.rn;
+        let off0 = if m0.writeback { 0 } else { m0.offset };
+        let (mut lo, mut hi, mut store) = (off0, off0 + m0.total as i64 - 1, !m0.load);
+        let mut members = vec![i];
+        for (j, &(op, word, _)) in ops.iter().enumerate().skip(i + 1) {
+            if stops_group(&op) {
+                break;
+            }
+            if let Op::Memory(m) = op {
+                if m.rn == base && groupable(&m) && !(m.writeback && m.pre) {
+                    let off = if m.writeback { 0 } else { m.offset };
+                    let (l, h) = (lo.min(off), hi.max(off + m.total as i64 - 1));
+                    if h - l >= MAX_GROUP_SPAN {
+                        break;
+                    }
+                    (lo, hi) = (l, h);
+                    store |= !m.load;
+                    members.push(j);
+                    if m.writeback || loads_into(&m, base) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if changes(&op, word, base) {
+                break;
+            }
+        }
+        let last = *members.last().unwrap();
+        // The host base needs one of X15..X17 that nothing in the stretch
+        // names, and the stretch must leave another free for the sequences
+        // that need one; X18 operands, which need more, end the idea.
+        let named = ops[i..=last].iter().fold(0u32, |n, (op, word, _)| {
+            let (r, w) = uses(op, *word);
+            n | r | w
+        });
+        let free: Vec<Reg> = [17, 16, 15]
+            .into_iter()
+            .filter(|&r| named & 1 << r == 0)
+            .collect();
+        if members.len() >= 2 && free.len() >= 2 && named & 1 << 18 == 0 {
+            let g = groups.len();
+            for &k in &members {
+                member[k] = Some(g);
+            }
+            groups.push(Group {
+                first: i,
+                last,
+                base,
+                lo,
+                hi,
+                store,
+                hb: free[0],
+            });
+            i = last + 1;
+        } else {
+            i += 1;
+        }
+    }
+    (groups, member)
+}
+
+/// The most bytes a group's accesses may span. A wider group crosses a page
+/// boundary, and so fails its check, more often.
+const MAX_GROUP_SPAN: i64 = 4096;
+
+/// An access with its writeback taken out: a pre-indexed one at its base plus
+/// its offset, a post-indexed one at its base.
+fn without_writeback(m: &Mem) -> u32 {
+    let w = m.word;
+    let pair = matches!(m.kind, MemKind::Pair | MemKind::VecPair);
+    match (pair, m.pre) {
+        (false, true) => w & !(3 << 10),
+        (false, false) => w & !(3 << 10) & !(0x1ff << 12),
+        (true, true) => (w & !(7 << 23)) | 0b010 << 23,
+        (true, false) => (w & !(7 << 23) & !(0x7f << 15)) | 0b010 << 23,
+    }
+}
+
 /// One block being built.
 pub struct Block {
     pub asm: Asm,
@@ -354,6 +551,15 @@ pub struct Block {
     /// The link value of a call just translated: the next instruction, if it
     /// is translated right after the call, is an entry.
     returns_to: Option<u64>,
+    /// Branches after the block's code to labels in the cold section (or out
+    /// of reach of a conditional branch): (where, to).
+    tramps: Vec<(Label, Label)>,
+    /// Host registers no scratch choice may take: a group's host base.
+    pinned: u32,
+    /// The groups of accesses one TLB check covers, and for each instruction
+    /// of the block the group it belongs to.
+    groups: Vec<Group>,
+    member: Vec<Option<usize>>,
 }
 
 /// Translates guest code at `pc`, whose words up to the end of its 4 KiB page
@@ -371,6 +577,9 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize) -> Block {
             break;
         }
         cur = cur.wrapping_add(4);
+    }
+    if ctx.fast_paths() {
+        (t.groups, t.member) = plan_groups(&ops);
     }
     t.ahead = vec![(0, 0); ops.len()];
     let (mut named, mut dead) = (0u32, 0u32);
@@ -437,6 +646,10 @@ impl Block {
             entries: Vec::new(),
             calls: Vec::new(),
             returns_to: None,
+            tramps: Vec::new(),
+            pinned: 0,
+            groups: Vec::new(),
+            member: Vec::new(),
         }
     }
 
@@ -496,7 +709,10 @@ impl Block {
                 false
             }
             Op::Memory(m) => {
-                self.emit_memory(m, None, pc);
+                match self.member.get(self.at).copied().flatten() {
+                    Some(g) => self.emit_member(self.groups[g], m, pc),
+                    None => self.emit_memory(m, None, pc),
+                }
                 false
             }
             Op::LiteralLoad {
@@ -688,6 +904,7 @@ impl Block {
     /// first if the block changed it), or None if the instruction names all
     /// three.
     fn temp(&mut self, avoid: u32) -> Option<Reg> {
+        let avoid = avoid | self.pinned;
         let r = [16, 17, 15].into_iter().find(|&r| avoid & 1 << r == 0)?;
         let bit = 1 << r;
         if self.cache.dirty & bit != 0 {
@@ -698,6 +915,13 @@ impl Block {
         Some(r)
     }
 
+    /// Two scratch registers, as `scratch` chooses them.
+    fn scratch2(&mut self, avoid: u32) -> [Reg; 2] {
+        let mut out = [0; 2];
+        self.scratch_into(avoid, &mut out);
+        out
+    }
+
     /// Three host registers for a fast path to compute with, none of them in
     /// `avoid` (which needs not name X18, X30 or SP): X16, X17 and X15 when
     /// free (a dirty one is stored first), then registers the block already
@@ -705,11 +929,18 @@ impl Block {
     /// them: best one it overwrites before reading (it never needs reloading),
     /// then one it does not name again (reloaded once, as the block leaves).
     fn scratch(&mut self, avoid: u32) -> [Reg; 3] {
-        let avoid = avoid | 1 << 18;
         let mut out = [0; 3];
+        self.scratch_into(avoid, &mut out);
+        out
+    }
+
+    /// Fills `out` with scratch registers, as `scratch` chooses them.
+    fn scratch_into(&mut self, avoid: u32, out: &mut [Reg]) {
+        let want = out.len();
+        let avoid = avoid | 1 << 18 | self.pinned;
         let mut n = 0;
         for r in [16, 17, 15] {
-            if avoid & 1 << r == 0 {
+            if n < want && avoid & 1 << r == 0 {
                 let bit = 1 << r;
                 if self.cache.dirty & bit != 0 {
                     self.asm.emit(str_imm(3, r, SP, offsets::x(r)));
@@ -721,12 +952,12 @@ impl Block {
             }
         }
         for &r in BORROWABLE.iter() {
-            if n < 3 && avoid & 1 << r == 0 && self.cache.borrowed & 1 << r != 0 {
+            if n < want && avoid & 1 << r == 0 && self.cache.borrowed & 1 << r != 0 {
                 out[n] = r;
                 n += 1;
             }
         }
-        if n < 3 {
+        if n < want {
             let (named, dead) = self.ahead.get(self.at).copied().unwrap_or((!0, 0));
             let mut fresh = 0u32;
             for rank in 0..3 {
@@ -737,7 +968,7 @@ impl Block {
                         1 => named & bit == 0,
                         _ => true,
                     };
-                    if n < 3 && fits && (avoid | self.cache.borrowed | fresh) & bit == 0 {
+                    if n < want && fits && (avoid | self.cache.borrowed | fresh) & bit == 0 {
                         out[n] = r;
                         n += 1;
                         fresh |= bit;
@@ -753,7 +984,6 @@ impl Block {
             });
             self.cache.borrowed |= fresh;
         }
-        out
     }
 
     /// Rd = a guest virtual address in or near this block's page (an ADR or
@@ -1079,8 +1309,8 @@ impl Block {
         }
         let [a, b, c] = self.scratch(ops.mask());
         let cache = self.cache;
-        let tramp = self.asm.label();
         let slow = self.asm.label();
+        let tramp = self.reach(slow);
         let resume = self.asm.label();
 
         let va = self.emit_va(&m, literal, a, c);
@@ -1117,14 +1347,167 @@ impl Block {
         self.emit_writeback(&m, va, c, free);
         self.asm.bind(resume);
         self.slow.push(SlowSite {
-            tramp,
             label: slow,
             resume,
             word,
             pc,
             cache,
             regs,
+            pinned: self.pinned,
         });
+    }
+
+    /// An access of a group (see `Group`): the group's check before its
+    /// first, then the access at the host base, or through its own check
+    /// once the host base is zero.
+    fn emit_member(&mut self, g: Group, m: Mem, pc: u64) {
+        let ops = Self::gpr_operands(&m);
+        for &r in ops.as_slice() {
+            self.need(r, true, true);
+        }
+        if self.at == g.first {
+            // Nothing in the group names it, but the block may hold a guest
+            // value there from before.
+            let hb = self.temp(!(1 << g.hb)).unwrap();
+            debug_assert_eq!(hb, g.hb);
+            self.pinned |= 1 << g.hb;
+            self.emit_group_check(&g, &m, ops.mask());
+        }
+        let alt = self.asm.label();
+        let back = self.asm.label();
+        let to_alt = self.reach(alt);
+        self.asm.cbz(true, g.hb, to_alt);
+        let hb = g.hb;
+        self.asm.emit(match (m.writeback, m.kind) {
+            // A pre-indexed first or post-indexed last access is at the
+            // group's base itself.
+            (true, MemKind::Pair | MemKind::VecPair) => {
+                (m.word & 0xc440_0000) | 0x2900_0000 | m.rt2 << 10 | hb << 5 | m.rt
+            }
+            (true, _) => (m.word & 0xc4c0_0000) | 0x3800_0000 | hb << 5 | m.rt,
+            (false, _) => (m.word & !(0x1f << 5)) | hb << 5,
+        });
+        self.asm.bind(back);
+        // Its own check, as any access outside a group, in the cold section;
+        // then every register back where the code at `back` has it.
+        let cache = self.cache;
+        let word = if m.writeback {
+            without_writeback(&m)
+        } else {
+            m.word
+        };
+        let Op::Memory(plain) = decode::decode(word, pc) else {
+            unreachable!("an access decodes as one")
+        };
+        self.asm.set_cold(true);
+        self.asm.bind(alt);
+        self.emit_memory_with(plain, None, word, pc);
+        self.reconcile(cache);
+        self.asm.b(back);
+        self.asm.set_cold(false);
+        if m.writeback {
+            match m.rn {
+                31 => {
+                    let t = self.temp(0).unwrap();
+                    self.asm.emit(ldr_imm(3, t, SP, offsets::SP));
+                    self.asm.emit_all(add_const(t, t, m.offset, t));
+                    self.asm.emit(str_imm(3, t, SP, offsets::SP));
+                }
+                rn => {
+                    self.need(rn, true, true);
+                    self.asm.emit_all(add_const(rn, rn, m.offset, rn));
+                }
+            }
+        }
+        if self.at == g.last {
+            self.pinned &= !(1 << g.hb);
+        }
+    }
+
+    /// The group's TLB check, with its first access's operands (`avoid`) in
+    /// place: the entry for the page of the highest byte any access touches,
+    /// its tag compared with the page of the lowest; `hb` gets the host
+    /// address of the group's base, or zero.
+    fn emit_group_check(&mut self, g: &Group, m0: &Mem, avoid: u32) {
+        let hb = g.hb;
+        let [b, c] = self.scratch2(avoid);
+        // The lowest address, from the base before the first access's
+        // writeback.
+        let low = if m0.writeback { m0.offset } else { 0 } + g.lo;
+        let anchor = match g.base {
+            31 => {
+                self.asm.emit(ldr_imm(3, c, SP, offsets::SP));
+                if low != 0 {
+                    self.asm.emit_all(add_const(c, c, low, b));
+                }
+                c
+            }
+            r if low == 0 => r,
+            r => {
+                self.asm.emit_all(add_const(c, r, low, b));
+                c
+            }
+        };
+        let span = (g.hi - g.lo) as u32;
+        if span > 0 {
+            self.asm.emit(add_imm(true, b, anchor, span, false));
+            self.asm.emit(ubfx(b, b, TLB_SHIFT, TLB_BITS));
+        } else {
+            self.asm.emit(ubfx(b, anchor, TLB_SHIFT, TLB_BITS));
+        }
+        self.asm.emit(add_ext(b, SP, b, EXT_UXTX, 4));
+        let kind = if g.store {
+            TlbKind::Store
+        } else {
+            TlbKind::Load
+        };
+        let off = offsets::tlb(tlb_index(self.ctx.el, kind));
+        self.asm.emit(add_imm(true, b, b, off >> 12, true));
+        self.asm.emit(ldp(hb, b, b, 0));
+        self.asm
+            .emit(emit::sub_reg_shifted(hb, hb, anchor, LSR, TLB_SHIFT));
+        let fail = self.asm.label();
+        let ok = self.asm.label();
+        let to_fail = self.reach(fail);
+        self.asm.cbnz(true, hb, to_fail);
+        self.asm.emit(add_reg(true, hb, b, anchor, LSL, 0));
+        if g.lo != 0 {
+            self.asm.emit_all(add_const(hb, hb, -g.lo, b));
+        }
+        self.asm.bind(ok);
+        self.asm.set_cold(true);
+        self.asm.bind(fail);
+        self.asm.emit(movz(true, hb, 0, 0));
+        self.asm.b(ok);
+        self.asm.set_cold(false);
+    }
+
+    /// Emits what brings the registers from where they are now to `target`,
+    /// a state this one took scratch registers from (an access's own check,
+    /// in the cold section, rejoining a group's code).
+    fn reconcile(&mut self, target: RegCache) {
+        let reload =
+            (target.loaded & !self.cache.loaded) | (self.cache.borrowed & !target.borrowed);
+        pairs(reload, |r, both| {
+            self.asm.emit(if both {
+                ldp(r, r + 1, SP, offsets::x(r) as i32)
+            } else {
+                ldr_imm(3, r, SP, offsets::x(r))
+            })
+        });
+        self.cache = target;
+    }
+
+    /// A label a conditional branch here can reach that leads to `to`, a
+    /// label in the cold section: `to` itself from cold code, else a branch
+    /// after the block's code.
+    fn reach(&mut self, to: Label) -> Label {
+        if self.asm.is_cold() {
+            return to;
+        }
+        let tramp = self.asm.label();
+        self.tramps.push((tramp, to));
+        tramp
     }
 
     /// The guest virtual address of the access's first byte: the base
@@ -1335,8 +1718,8 @@ impl Block {
         let avoid = if rt < 31 { 1 << rt } else { 0 };
         let [a, b, c] = self.scratch(avoid);
         let cache = self.cache;
-        let tramp = self.asm.label();
         let slow = self.asm.label();
+        let tramp = self.reach(slow);
         let resume = self.asm.label();
         match rt {
             31 => self.asm.emit(movz(true, a, 0, 0)),
@@ -1355,13 +1738,13 @@ impl Block {
         }
         self.asm.bind(resume);
         self.slow.push(SlowSite {
-            tramp,
             label: slow,
             resume,
             word,
             pc,
             cache,
             regs,
+            pinned: self.pinned,
         });
     }
 
@@ -1389,6 +1772,7 @@ impl Block {
         self.sync();
         self.emit_slow_call(word, pc, regs);
         self.cache.loaded = 0;
+        zero(&mut self.asm, self.pinned);
     }
 
     /// The out-of-line slow paths of the block's fast loads and stores, in
@@ -1396,9 +1780,9 @@ impl Block {
     /// then the literals of every slow-path call, in the section of the call.
     fn emit_slow_sites(&mut self) {
         let sites = std::mem::take(&mut self.slow);
-        for site in &sites {
-            self.asm.bind(site.tramp);
-            self.asm.b(site.label);
+        for (tramp, to) in std::mem::take(&mut self.tramps) {
+            self.asm.bind(tramp);
+            self.asm.b(to);
         }
         self.asm.set_cold(true);
         for site in sites {
@@ -1414,6 +1798,7 @@ impl Block {
                     ldr_imm(3, r, SP, offsets::x(r))
                 })
             });
+            zero(&mut self.asm, site.pinned);
             self.asm.b(site.resume);
         }
         for cold in [true, false] {
@@ -2072,6 +2457,53 @@ mod tests {
                 borrowed: 0
             }
         );
+    }
+
+    #[test]
+    fn a_prologue_and_struct_fields_take_one_check_each() {
+        let pc = 0x4000_0000u64;
+        let words = [
+            0xa9bd7bfd, // stp x29, x30, [sp, #-48]!
+            0x910003fd, // mov x29, sp
+            0xa90153f3, // stp x19, x20, [sp, #16]
+            0xf9400420, // ldr x0, [x1, #8]
+            0xb9401022, // ldr w2, [x1, #16]
+            0xf9400021, // ldr x1, [x1]: loads into its base, so it ends that group
+            0xf9400423, // ldr x3, [x1, #8]: the new x1, alone
+            0xa8c37bfd, // ldp x29, x30, [sp], #48
+        ];
+        let ops: Vec<_> = words
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| {
+                let at = pc + 4 * i as u64;
+                (decode::decode(w, at), w, at)
+            })
+            .collect();
+        let (groups, member) = plan_groups(&ops);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let sp = groups[0];
+        assert_eq!(
+            (sp.base, sp.first, sp.last, sp.lo, sp.hi),
+            (31, 0, 7, 0, 31)
+        );
+        assert!(sp.store);
+        // Groups do not overlap: the accesses off x1 inside the stretch take
+        // their own checks.
+        assert_eq!(
+            member,
+            [Some(0), None, Some(0), None, None, None, None, Some(0)]
+        );
+        // The host base avoids what the stretch names.
+        assert_eq!(sp.hb, 17);
+        // Off x1 alone, the first three are a group (the third loads into
+        // its base, and ends it).
+        let (groups, member) = plan_groups(&ops[3..7]);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let x1 = groups[0];
+        assert_eq!((x1.base, x1.first, x1.last, x1.lo, x1.hi), (1, 0, 2, 0, 19));
+        assert!(!x1.store);
+        assert_eq!(member, [Some(0), Some(0), Some(0), None]);
     }
 
     #[test]
