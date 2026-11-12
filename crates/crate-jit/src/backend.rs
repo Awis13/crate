@@ -686,8 +686,17 @@ impl Cpu {
 
     /// The host entry of the block for the current PC, translating it if
     /// needed, and whether it is a normal (cached) block. A pending chain from
-    /// the previous block's exit is patched to it.
+    /// the previous block's exit is patched to it. Everything the code cache
+    /// wrote meanwhile is then made visible to instruction fetch, at once,
+    /// for the translated code to run next.
     fn next_block(&mut self, cache: &mut CodeCache, chain: Option<(u64, u64)>) -> (u64, bool) {
+        let next = self.find_block(cache, chain);
+        self.forget_chains(cache);
+        cache.sync();
+        next
+    }
+
+    fn find_block(&mut self, cache: &mut CodeCache, chain: Option<(u64, u64)>) -> (u64, bool) {
         let pc = self.state.pc;
         let el = self.el();
         let debug = self.debug_active();
@@ -800,7 +809,6 @@ impl Cpu {
                 self.jc.el0_shared = true;
             }
         }
-        self.forget_chains(cache);
         (entry, true)
     }
 

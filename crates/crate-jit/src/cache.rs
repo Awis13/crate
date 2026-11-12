@@ -113,6 +113,9 @@ pub struct CodeCache {
     /// a page's code makes exactly the guards of chains into it fail.
     entry_pages: FastMap<usize, u64>,
     into: FastMap<u64, Vec<usize>>,
+    /// The ranges of code written since the instruction cache was last made
+    /// to see them (`sync`), as (offset, length).
+    dirty: Vec<(usize, usize)>,
 }
 
 /// A fault while translating: the region filled up.
@@ -141,6 +144,7 @@ impl CodeCache {
             guarded: Vec::new(),
             entry_pages: FastMap::default(),
             into: FastMap::default(),
+            dirty: Vec::new(),
         };
         cache.cold = cache.segment;
         cache.emit_stubs();
@@ -196,7 +200,7 @@ impl CodeCache {
         let mut w = self.region.writer();
         w.write_words(self.cursor, words);
         drop(w);
-        self.region.flush(self.cursor, bytes);
+        self.dirty.push((self.cursor, bytes));
         self.cursor += bytes;
         // Keep blocks 16-byte aligned.
         self.cursor = self.cursor.next_multiple_of(16);
@@ -286,7 +290,7 @@ impl CodeCache {
             let mut w = self.region.writer();
             w.write_words(cold, cold_words);
             drop(w);
-            self.region.flush(cold, cold_words.len() * 4);
+            self.dirty.push((cold, cold_words.len() * 4));
             self.cold = cold;
         }
         let off = self.cursor;
@@ -332,7 +336,7 @@ impl CodeCache {
         let mut w = self.region.writer();
         w.patch_word(off, b(delta));
         drop(w);
-        self.region.flush(off, 4);
+        self.dirty.push((off, 4));
     }
 
     /// Patches the guarded chain to another page whose literal is at
@@ -372,7 +376,7 @@ impl CodeCache {
         w.write_words(off, &[key as u32, (key >> 32) as u32]);
         drop(w);
         if !same {
-            self.region.flush(at, 4);
+            self.dirty.push((at, 4));
         }
         if old == translate::NEVER_KEY {
             self.guarded.push(off);
@@ -395,6 +399,15 @@ impl CodeCache {
         let mut w = self.region.writer();
         for &off in literals {
             w.write_words(off, &[never as u32, (never >> 32) as u32]);
+        }
+    }
+
+    /// Makes the code written since the last call visible to this thread's
+    /// instruction fetch: before translated code runs again.
+    pub fn sync(&mut self) {
+        if !self.dirty.is_empty() {
+            self.region.flush_ranges(&self.dirty);
+            self.dirty.clear();
         }
     }
 
@@ -431,6 +444,8 @@ impl CodeCache {
         self.guarded.clear();
         self.entry_pages.clear();
         self.into.clear();
+        // What was written before is gone; the stubs written next are dirty.
+        self.dirty.clear();
         self.epoch += 1;
         self.emit_stubs();
     }

@@ -229,6 +229,16 @@ impl JitRegion {
         // SAFETY: the range lies inside the region.
         unsafe { flush_icache(self.exec.add(offset), len) }
     }
+
+    /// Makes every `(offset, len)` range written visible to instruction
+    /// fetch, with one set of barriers for all of them.
+    pub fn flush_ranges(&self, ranges: &[(usize, usize)]) {
+        for &(offset, len) in ranges {
+            assert!(offset.checked_add(len).is_some_and(|end| end <= self.len));
+        }
+        // SAFETY: every range lies inside the region.
+        unsafe { flush_icache_ranges(self.exec, ranges) }
+    }
 }
 
 impl Drop for JitRegion {
@@ -597,6 +607,82 @@ unsafe fn dual_map(len: usize) -> Result<(*mut u8, *mut u8)> {
 unsafe fn flush_icache(start: *mut u8, len: usize) {
     // SAFETY: the caller's range is mapped.
     unsafe { mach::sys_icache_invalidate(start.cast(), len) }
+}
+
+/// The sequence `sys_icache_invalidate` runs for one range (which on these
+/// cores cleans no data cache: their data side is coherent with instruction
+/// fetch), for every range with one set of barriers: invalidate each 64-byte
+/// line of instruction cache to the point of unification, with a DSB every
+/// 20 lines as the system's own does on the cores that need one, then wait
+/// for all of it and resynchronize this thread's fetch.
+///
+/// # Safety
+///
+/// Every range, from `base`, must be mapped.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+unsafe fn flush_icache_ranges(base: *mut u8, ranges: &[(usize, usize)]) {
+    use std::arch::asm;
+    if ranges.is_empty() {
+        return;
+    }
+    let mut lines = 0u32;
+    // SAFETY: cache maintenance by address over mapped memory, and barriers.
+    unsafe {
+        asm!("dsb ish");
+        for &(offset, len) in ranges {
+            let start = base as usize + offset;
+            let mut a = start & !63;
+            while a < start + len {
+                asm!("ic ivau, {}", in(reg) a);
+                a += 64;
+                lines += 1;
+                if lines % 20 == 0 {
+                    asm!("dsb ish");
+                }
+            }
+        }
+        asm!("dsb ish", "isb");
+    }
+}
+
+/// Cleans the data cache to the point of unification and invalidates the
+/// instruction cache over every range, with one set of barriers.
+///
+/// # Safety
+///
+/// Every range, from `base`, must be mapped and readable.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+unsafe fn flush_icache_ranges(base: *mut u8, ranges: &[(usize, usize)]) {
+    use std::arch::asm;
+    if ranges.is_empty() {
+        return;
+    }
+    let ctr: u64;
+    // SAFETY: reads an ID register Linux exposes to user space.
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr) };
+    let dline = 4usize << ((ctr >> 16) & 15);
+    let iline = 4usize << (ctr & 15);
+    // SAFETY: cache maintenance by address over mapped memory, then barriers.
+    unsafe {
+        for &(offset, len) in ranges {
+            let start = base as usize + offset;
+            let mut a = start & !(dline - 1);
+            while a < start + len {
+                asm!("dc cvau, {}", in(reg) a);
+                a += dline;
+            }
+        }
+        asm!("dsb ish");
+        for &(offset, len) in ranges {
+            let start = base as usize + offset;
+            let mut a = start & !(iline - 1);
+            while a < start + len {
+                asm!("ic ivau, {}", in(reg) a);
+                a += iline;
+            }
+        }
+        asm!("dsb ish", "isb");
+    }
 }
 
 /// Cleans the data cache to the point of unification and invalidates the
