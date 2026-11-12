@@ -1153,6 +1153,9 @@ struct Run {
     /// Run with the MMU on, at this virtual address of the program's first
     /// word (page tables from `page_tables`); `None` runs with the MMU off.
     at: Option<u64>,
+    /// Run the program once first, on the same CPU, so the run that counts
+    /// starts with the software TLBs and jump caches the first left.
+    warm: bool,
 }
 
 fn guest_memory(shared: &Shared) -> Arc<GuestMemory> {
@@ -1175,19 +1178,28 @@ fn run_translated(
     tables: Option<u64>,
 ) -> Captured {
     let mut cpu = Cpu::new(guest_memory(shared));
-    cpu.state.x[..31].copy_from_slice(&init.x);
-    cpu.state.sp = init.sp;
-    cpu.state.nzcv = init.nzcv;
-    cpu.state.v = init.v;
-    cpu.state.pc = prog.guest_pc;
-    if let (Some(at), Some(l0)) = (run.at, tables) {
-        cpu.state.mmu = crate_jit::state::MmuRegs {
-            sctlr_el1: 1,
-            ttbr0_el1: l0,
-            tcr_el1: 16, // T0SZ 16 (48-bit), TG0 4 KiB
-            ..Default::default()
-        };
-        cpu.state.pc = at + (prog.body_start * 4) as u64;
+    let start = |cpu: &mut Cpu| {
+        cpu.state.x[..31].copy_from_slice(&init.x);
+        cpu.state.sp = init.sp;
+        cpu.state.nzcv = init.nzcv;
+        cpu.state.v = init.v;
+        cpu.state.pc = prog.guest_pc;
+        if let (Some(at), Some(l0)) = (run.at, tables) {
+            cpu.state.mmu = crate_jit::state::MmuRegs {
+                sctlr_el1: 1,
+                ttbr0_el1: l0,
+                tcr_el1: 16, // T0SZ 16 (48-bit), TG0 4 KiB
+                ..Default::default()
+            };
+            cpu.state.pc = at + (prog.body_start * 4) as u64;
+        }
+    };
+    start(&mut cpu);
+    if run.warm {
+        let stop = cpu.run(cache);
+        assert_eq!(stop, Stop::Brk(0), "the warming run");
+        shared.write(DATA_OFF, &vec![0u8; DATA_LEN]);
+        start(&mut cpu);
     }
     let stop = cpu.run(cache);
     if stop != Stop::Brk(0) {
@@ -1313,8 +1325,10 @@ fn random_init(rng: &mut Rng, shared: &Shared) -> Captured {
 
 /// One generated stream of `units.0` and up to `units.1` more units, run
 /// natively and translated, with everything compared. Translated, it runs
-/// fast twice with one code cache, so the second run takes the branches the
-/// first chained, and slow; or with `mmu_alias` through the MMU, at its own
+/// fast twice with one code cache, the second time after a warming run on the
+/// same CPU, so it takes the branches the first chained with its TLBs full
+/// (a group's check passes, and its accesses run unchecked), and slow; or
+/// with `mmu_alias` through the MMU, at its own
 /// address and at a second one in turn, all with one code cache, so chains
 /// to another page made at one address meet the other.
 fn check_stream(
@@ -1381,12 +1395,15 @@ fn check_stream(
     let fast = Run {
         fast: true,
         at: None,
+        warm: false,
     };
     let slow = Run {
         fast: false,
         at: None,
+        warm: false,
     };
-    let mut runs = vec![fast, fast, slow];
+    let warm = Run { warm: true, ..fast };
+    let mut runs = vec![fast, warm, slow];
     let tables = mmu_alias.map(|alias| {
         let first = (code_off as u64) >> 12;
         let last = (code_off as u64 + len) >> 12;
@@ -1397,6 +1414,7 @@ fn check_stream(
         let at = |va: u64| Run {
             fast: true,
             at: Some(va + code_off as u64),
+            warm: false,
         };
         let own = shared.addr();
         runs = vec![at(own), at(alias), at(own), at(own), at(alias)];

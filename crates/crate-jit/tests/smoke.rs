@@ -219,3 +219,62 @@ fn pc_relative_values_follow_the_address_the_code_runs_at() {
         assert_eq!(cpu.state.x[4], base + 12, "bl's link at {base:#x}");
     }
 }
+
+#[test]
+fn a_group_keeps_its_host_base_across_a_slow_path_in_its_stretch() {
+    // ldr x6, [x7] (page A, which fills its TLB entry); then a group off x1
+    // (page A): ldr x2, [x1]; ldr x3, [x4] (page B, a miss: the slow path,
+    // in the middle of the group); ldr x5, [x1, #8]; brk #0.
+    let (a, b) = (RAM + 0x2000, RAM + 0x3000);
+    let (mut cpu, mut cache) = setup(&[0xf94000e6, 0xf9400022, 0xf9400083, 0xf9400425, 0xd4200000]);
+    cpu.mem.write_u64(a, 0x1111).unwrap();
+    cpu.mem.write_u64(a + 8, 0x2222).unwrap();
+    cpu.mem.write_u64(b, 0x3333).unwrap();
+    cpu.state.x[7] = a;
+    cpu.state.x[1] = a;
+    cpu.state.x[4] = b;
+    cpu.state.pc = RAM;
+    assert_eq!(cpu.run(&mut cache), Stop::Brk(0));
+    assert_eq!(
+        [cpu.state.x[2], cpu.state.x[3], cpu.state.x[5]],
+        [0x1111, 0x3333, 0x2222]
+    );
+}
+
+#[test]
+fn a_group_whose_check_fails_rejoins_with_every_register_right() {
+    use crate_jit::asm::{LSL, movz, orr_reg};
+    // Loads that put three pages in the TLB; then every register the fast
+    // path may borrow gets a new value (so its slot is stale); then a group
+    // off x1 across a page, so its check fails though each access hits,
+    // around a store off x4 that, in the group's own code, needs a third
+    // scratch register; then every one of them is read back.
+    let regs: Vec<u32> = (0..15)
+        .chain(19..30)
+        .filter(|r| !(1..=5).contains(r))
+        .collect();
+    // ldr x6, [x7]; ldr x6, [x8]; ldr x6, [x9]
+    let mut code = vec![0xf94000e6, 0xf9400106, 0xf9400126];
+    code.extend(regs.iter().map(|&r| movz(true, r, 0x100 + r, 0)));
+    // ldr x2, [x1]; str x3, [x4, #8]; ldr x5, [x1, #8]
+    code.extend([0xf9400022, 0xf9000483, 0xf9400425]);
+    code.extend(regs.iter().map(|&r| orr_reg(true, r, r, r, LSL, 0)));
+    code.push(0xd4200000); // brk #0
+    let (a, b) = (RAM + 0x2ff8, RAM + 0x5000);
+    let (mut cpu, mut cache) = setup(&code);
+    cpu.mem.write_u64(a, 0x1111).unwrap();
+    cpu.mem.write_u64(a + 8, 0x2222).unwrap();
+    cpu.state.x[7] = a;
+    cpu.state.x[8] = a + 8;
+    cpu.state.x[9] = b;
+    cpu.state.x[1] = a;
+    cpu.state.x[3] = 0x3333;
+    cpu.state.x[4] = b;
+    cpu.state.pc = RAM;
+    assert_eq!(cpu.run(&mut cache), Stop::Brk(0));
+    assert_eq!([cpu.state.x[2], cpu.state.x[5]], [0x1111, 0x2222]);
+    assert_eq!(cpu.mem.read_u64(b + 8).unwrap(), 0x3333);
+    for &r in &regs {
+        assert_eq!(cpu.state.x[r as usize], 0x100 + r as u64, "x{r}");
+    }
+}

@@ -111,8 +111,7 @@ struct SlowSite {
     /// The instruction's operands among X19..X29.
     regs: Regs,
     /// Registers pinned by a group of accesses (see `Group`), which the call
-    /// destroys: they are zeroed after it, which sends the group's later
-    /// accesses to their own checks.
+    /// destroys: the site keeps them in the state across it.
     pinned: u32,
 }
 
@@ -202,13 +201,20 @@ fn emit_sync(asm: &mut Asm, c: RegCache) {
     });
 }
 
-/// Zeroes the registers of `mask`.
-fn zero(asm: &mut Asm, mut mask: u32) {
-    while mask != 0 {
-        let r = mask.trailing_zeros();
-        asm.emit(movz(true, r, 0, 0));
-        mask &= !(1 << r);
+/// Puts the register of `pinned` (a group's host base, if any) in the state
+/// before a call that destroys it (`save`), or takes it back after.
+fn keep(asm: &mut Asm, pinned: u32, save: bool) {
+    if pinned == 0 {
+        return;
     }
+    debug_assert_eq!(pinned.count_ones(), 1, "groups do not overlap");
+    let r = pinned.trailing_zeros();
+    let off = offsets::scratch(3);
+    asm.emit(if save {
+        str_imm(3, r, SP, off)
+    } else {
+        ldr_imm(3, r, SP, off)
+    });
 }
 
 /// Calls `f(r, true)` for each pair of neighbours r, r+1 in `mask` and
@@ -346,9 +352,10 @@ fn ends_block_always(op: &Op) -> bool {
 /// first access (which may be pre-indexed; its last may be post-indexed), and
 /// every byte any of them touches lies `lo..=hi` from it, so when the check
 /// finds that range in one page each access is a single host instruction at
-/// `hb`, the base's host address, kept in one of X15..X17 for the stretch. A
-/// failed check, or any slow path in the stretch, leaves `hb` zero, and each
-/// access then takes its own check, in the cold section.
+/// `hb`, the base's host address, kept in one of X15..X17 for the stretch
+/// (and in the state across any slow path in it). A failed check runs a copy
+/// of the whole stretch instead, in the cold section, translated with each
+/// access through its own check, and rejoins after it.
 #[derive(Clone, Copy, Debug)]
 struct Group {
     first: usize,
@@ -511,19 +518,6 @@ fn plan_groups(ops: &[(Op, u32, u64)], groups: &mut Vec<Group>, member: &mut Vec
 /// boundary, and so fails its check, more often.
 const MAX_GROUP_SPAN: i64 = 4096;
 
-/// An access with its writeback taken out: a pre-indexed one at its base plus
-/// its offset, a post-indexed one at its base.
-fn without_writeback(m: &Mem) -> u32 {
-    let w = m.word;
-    let pair = matches!(m.kind, MemKind::Pair | MemKind::VecPair);
-    match (pair, m.pre) {
-        (false, true) => w & !(3 << 10),
-        (false, false) => w & !(3 << 10) & !(0x1ff << 12),
-        (true, true) => (w & !(7 << 23)) | 0b010 << 23,
-        (true, false) => (w & !(7 << 23) & !(0x7f << 15)) | 0b010 << 23,
-    }
-}
-
 /// One block being built.
 pub struct Block {
     pub asm: Asm,
@@ -560,11 +554,17 @@ pub struct Block {
     returns_to: Option<u64>,
     /// Host registers no scratch choice may take: a group's host base.
     pinned: u32,
+    /// Where a group's failed check goes (its stretch's cold copy), and the
+    /// registers as they were there.
+    group_fail: Option<(Label, RegCache)>,
+    /// Translating a group's stretch again, every access on its own.
+    copying: bool,
     /// The groups of accesses one TLB check covers, and for each instruction
     /// of the block the group it belongs to.
     groups: Vec<Group>,
     member: Vec<Option<usize>>,
-    /// The block's decoded instructions (kept for their memory).
+    /// The block's decoded instructions, which a group's stretch is
+    /// translated from a second time (see `Group`).
     ops: Vec<(Op, u32, u64)>,
 }
 
@@ -612,8 +612,10 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize, spare: Spare) -
         named |= reads | writes;
         dead = (dead & !(reads | writes)) | (writes & !reads);
     }
+    t.ops = ops;
     let mut next = pc;
-    for (i, &(op, word, at)) in ops.iter().enumerate() {
+    for i in 0..t.ops.len() {
+        let (op, word, at) = t.ops[i];
         t.at = i;
         if t.returns_to.take() == Some(at) {
             // A call's return point, translated right after it: from now on
@@ -632,7 +634,6 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize, spare: Spare) -
     }
     t.emit_call_tails();
     t.emit_slow_sites();
-    t.ops = ops;
     t
 }
 
@@ -671,6 +672,8 @@ impl Block {
             calls: spare.calls,
             returns_to: None,
             pinned: 0,
+            group_fail: None,
+            copying: false,
             groups: spare.groups,
             member: spare.member,
             ops: spare.ops,
@@ -759,8 +762,8 @@ impl Block {
             }
             Op::Memory(m) => {
                 match self.member.get(self.at).copied().flatten() {
-                    Some(g) => self.emit_member(self.groups[g], m, pc),
-                    None => self.emit_memory(m, None, pc),
+                    Some(g) if !self.copying => self.emit_member(self.groups[g], m),
+                    _ => self.emit_memory(m, None, pc),
                 }
                 false
             }
@@ -1409,9 +1412,9 @@ impl Block {
     }
 
     /// An access of a group (see `Group`): the group's check before its
-    /// first, then the access at the host base, or through its own check
-    /// once the host base is zero.
-    fn emit_member(&mut self, g: Group, m: Mem, pc: u64) {
+    /// first, then the access at the host base; after its last, the copy of
+    /// the stretch a failed check runs.
+    fn emit_member(&mut self, g: Group, m: Mem) {
         let ops = Self::gpr_operands(&m);
         for &r in ops.as_slice() {
             self.need(r, true, true);
@@ -1424,9 +1427,6 @@ impl Block {
             self.pinned |= 1 << g.hb;
             self.emit_group_check(&g, &m, ops.mask());
         }
-        let alt = self.asm.label();
-        let back = self.asm.label();
-        self.asm.cbz(true, g.hb, alt);
         let hb = g.hb;
         self.asm.emit(match (m.writeback, m.kind) {
             // A pre-indexed first or post-indexed last access is at the
@@ -1437,24 +1437,6 @@ impl Block {
             (true, _) => (m.word & 0xc4c0_0000) | 0x3800_0000 | hb << 5 | m.rt,
             (false, _) => (m.word & !(0x1f << 5)) | hb << 5,
         });
-        self.asm.bind(back);
-        // Its own check, as any access outside a group, in the cold section;
-        // then every register back where the code at `back` has it.
-        let cache = self.cache;
-        let word = if m.writeback {
-            without_writeback(&m)
-        } else {
-            m.word
-        };
-        let Op::Memory(plain) = decode::decode(word, pc) else {
-            unreachable!("an access decodes as one")
-        };
-        self.asm.set_cold(true);
-        self.asm.bind(alt);
-        self.emit_memory_with(plain, None, word, pc);
-        self.reconcile(cache);
-        self.asm.b(back);
-        self.asm.set_cold(false);
         if m.writeback {
             match m.rn {
                 31 => {
@@ -1471,13 +1453,39 @@ impl Block {
         }
         if self.at == g.last {
             self.pinned &= !(1 << g.hb);
+            self.emit_group_copy(g);
         }
+    }
+
+    /// The copy of a group's stretch its failed check goes to, in the cold
+    /// section: the same instructions, from the registers as the check left
+    /// them, each access through its own check; then back after the stretch
+    /// with every register where the code there has it.
+    fn emit_group_copy(&mut self, g: Group) {
+        let (fail, at_check) = self.group_fail.take().expect("the group's check");
+        let after = self.cache;
+        let back = self.asm.label();
+        self.asm.bind(back);
+        self.asm.set_cold(true);
+        self.asm.bind(fail);
+        self.cache = at_check;
+        self.copying = true;
+        for k in g.first..=g.last {
+            self.at = k;
+            let (op, word, at) = self.ops[k];
+            let left = self.emit(op, word, at);
+            debug_assert!(!left && self.asm.is_cold(), "a stretch only runs on");
+        }
+        self.copying = false;
+        self.reconcile(after);
+        self.asm.b(back);
+        self.asm.set_cold(false);
     }
 
     /// The group's TLB check, with its first access's operands (`avoid`) in
     /// place: the entry for the page of the highest byte any access touches,
     /// its tag compared with the page of the lowest; `hb` gets the host
-    /// address of the group's base, or zero.
+    /// address of the group's base, and a failure goes to the stretch's copy.
     fn emit_group_check(&mut self, g: &Group, m0: &Mem, avoid: u32) {
         let hb = g.hb;
         let [b, c] = self.scratch2(avoid);
@@ -1515,24 +1523,30 @@ impl Block {
         self.asm
             .emit(emit::sub_reg_shifted(hb, hb, anchor, LSR, TLB_SHIFT));
         let fail = self.asm.label();
-        let ok = self.asm.label();
         self.asm.cbnz(true, hb, fail);
+        self.group_fail = Some((fail, self.cache));
         self.asm.emit(add_reg(true, hb, b, anchor, LSL, 0));
         if g.lo != 0 {
             self.asm.emit_all(add_const(hb, hb, -g.lo, b));
         }
-        self.asm.bind(ok);
-        self.asm.set_cold(true);
-        self.asm.bind(fail);
-        self.asm.emit(movz(true, hb, 0, 0));
-        self.asm.b(ok);
-        self.asm.set_cold(false);
     }
 
-    /// Emits what brings the registers from where they are now to `target`,
-    /// a state this one took scratch registers from (an access's own check,
-    /// in the cold section, rejoining a group's code).
+    /// Emits what brings the registers from where they are now to `target`:
+    /// what is dirty here only, or borrowed there only, stored; what is
+    /// loaded there only, or borrowed here only, loaded (a group's copy
+    /// rejoining the code after its stretch, which may have chosen other
+    /// scratch registers).
     fn reconcile(&mut self, target: RegCache) {
+        // Stored: what is dirty here only, and what holds the guest's value
+        // here but is borrowed there, where its slot is what counts.
+        let store = (self.cache.dirty & !target.dirty) | (target.borrowed & !self.cache.borrowed);
+        pairs(store, |r, both| {
+            self.asm.emit(if both {
+                stp(r, r + 1, SP, offsets::x(r) as i32)
+            } else {
+                str_imm(3, r, SP, offsets::x(r))
+            })
+        });
         let reload =
             (target.loaded & !self.cache.loaded) | (self.cache.borrowed & !target.borrowed);
         pairs(reload, |r, both| {
@@ -1821,9 +1835,10 @@ impl Block {
 
     fn emit_slow_inline(&mut self, word: u32, pc: u64, regs: &[Reg]) {
         self.sync();
+        keep(&mut self.asm, self.pinned, true);
         self.emit_slow_call(word, pc, regs);
         self.cache.loaded = 0;
-        zero(&mut self.asm, self.pinned);
+        keep(&mut self.asm, self.pinned, false);
     }
 
     /// The out-of-line slow paths of the block's fast loads and stores, in
@@ -1836,6 +1851,7 @@ impl Block {
         for site in sites {
             self.asm.bind(site.label);
             emit_sync(&mut self.asm, site.cache);
+            keep(&mut self.asm, site.pinned, true);
             self.emit_slow_call(site.word, site.pc, site.regs.as_slice());
             // The access's operands among X15..X17 are loaded where it
             // resumes (the slow path may have written one).
@@ -1846,7 +1862,7 @@ impl Block {
                     ldr_imm(3, r, SP, offsets::x(r))
                 })
             });
-            zero(&mut self.asm, site.pinned);
+            keep(&mut self.asm, site.pinned, false);
             self.asm.b(site.resume);
         }
         for cold in [true, false] {
