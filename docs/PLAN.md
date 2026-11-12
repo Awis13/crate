@@ -174,6 +174,28 @@ output matching the Mac's, sha256 of 100 MB took 84 ms, the perl loop 312 ms
 Chrome ran a V8 loop of 10 million to the expected result in 2.4 s, Chrome's
 start included.
 
+A second round of speed work followed (2026-11-11), each change measured and
+kept only if it won. Direct branches and calls to another page, half of a
+compile's jump-cache lookups, are chained behind a guard: a key of the target
+address with the jump cache's own context number or generation in its top
+bits, which changes exactly when a lookup would stop finding the block, so the
+guard is right on any OS's TLB discipline, not Linux's. Instruction-cache
+maintenance after writing code is done once per dispatcher visit, with one
+set of barriers. A group of accesses off one base runs each access as a single
+host instruction, and a failed check runs a cold copy of the whole stretch.
+On the way, a TLBI for another address space was found to skip global and
+upper-half EL0 translations, which the architecture says it reaches. Medians
+of 3 against milestone 6 in the same session (M3 Air, jit, 4 CPUs, 4 GB, a
+minute's rest before each pass, load 2-6): gcc -O2 6.93 s (8.07), gcc again
+6.67 (7.86), node -e 0 0.41 (0.43), python 1.36 (1.40), xz 1.39 (1.42), the
+whole pass 24.5 s (26.9); four compiles at once 9.20 s (10.47), xz -T4 11.40
+(11.47); boot 2.97 s (2.89); every output hash unchanged and the
+kvm-unit-tests as before. Measured and dropped: loading a TLB entry's tag and
+delta apart (the CPU predicts a plain load's value, but the extra instruction
+cost more), indexing the other TLBs down from SP like the near one (neutral),
+and a virtio-blk thread (the host serves the reads from its cache in
+microseconds; small reads got slower).
+
 ## How aTerm adopts it
 
 aTerm already chooses an engine at launch. crate becomes another choice beside
