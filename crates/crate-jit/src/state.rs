@@ -41,7 +41,7 @@ pub const TLB_SHIFT: u32 = 12;
 
 /// Entries in each direct-mapped software TLB (a power of two): 32 MiB of
 /// 4 KiB pages each.
-pub const TLB_BITS: u32 = 13;
+pub const TLB_BITS: u32 = 15;
 pub const TLB_ENTRIES: usize = 1 << TLB_BITS;
 
 /// Entries in each jump cache (a power of two).

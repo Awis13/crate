@@ -23,8 +23,8 @@ use crate::cache::{BlockKey, FastHasher};
 use crate::mmu::{self, Access};
 use crate::smp::{Remote, Smp};
 use crate::state::{
-    CpuState, Exit, JC_ENTRIES, JcEntry, MONITOR_CLEAR, MmuRegs, TLB_ENTRIES, TLB_INVALID,
-    TlbEntry, offsets,
+    CpuState, Exit, JC_ENTRIES, JcEntry, MONITOR_CLEAR, MmuRegs, TLB_BITS, TLB_ENTRIES,
+    TLB_INVALID, TlbEntry, TlbKind, offsets, tlb_index,
 };
 use crate::translate::{Ctx, ERET_MARKER, FETCH_ABORT, SYSTEM_WORD_MARKER};
 
@@ -210,13 +210,17 @@ struct Filled {
 }
 
 impl Filled {
-    const MAX: usize = 2048;
+    const MAX: usize = 8192;
 
     fn new() -> Self {
         Filled {
             idx: Vec::with_capacity(Self::MAX),
             overflow: false,
         }
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflow
     }
 
     fn push(&mut self, i: usize) {
@@ -260,6 +264,11 @@ pub(crate) struct TlbBook {
     large: [[Filled; 2]; 4],
     /// Some upper-half entry is non-global (only with a split kernel map).
     ng_high: [bool; 4],
+    /// The largest mapping any entry came from, as log2 of its size (0 for
+    /// none larger than an entry), so an invalidation of one address looks
+    /// for the pieces of a block only among the entries the largest block
+    /// around it could have.
+    max_shift: [u8; 4],
 }
 
 const META_NG: u8 = 1 << 7;
@@ -278,6 +287,7 @@ impl TlbBook {
                 [Filled::new(), Filled::new()],
             ],
             ng_high: [false; 4],
+            max_shift: [0; 4],
         }
     }
 
@@ -293,6 +303,7 @@ impl TlbBook {
         }
         if shift > crate::state::TLB_SHIFT as u8 {
             self.large[tlb][high as usize].push(i);
+            self.max_shift[tlb] = self.max_shift[tlb].max(shift);
         }
     }
 
@@ -302,6 +313,7 @@ impl TlbBook {
         self.large[tlb][0].clear();
         self.large[tlb][1].clear();
         self.ng_high[tlb] = false;
+        self.max_shift[tlb] = 0;
     }
 }
 
@@ -441,7 +453,12 @@ pub struct Cpu {
     cpu: usize,
     /// Its MPIDR_EL1.
     mpidr: u64,
+    /// The ASID of the address space it runs, with the MMU on: the only one
+    /// whose translations the EL0 TLBs hold.
+    asid: Option<u16>,
     pub(crate) tlbs: TlbBook,
+    /// The page-table walks' cache, emptied with the software TLBs.
+    pub(crate) walk: mmu::WalkCache,
     pub(crate) counters: Counters,
     fetch: FetchTlb,
     jc: JcBook,
@@ -471,7 +488,9 @@ impl Cpu {
             smp: std::ptr::null(),
             cpu: 0,
             mpidr: 0x8000_0000,
+            asid: None,
             tlbs: TlbBook::new(),
+            walk: mmu::WalkCache::default(),
             counters: Counters::default(),
             fetch: FetchTlb {
                 entries: Box::new([[(0, 0, 0, 0); 256]; 2]),
@@ -639,7 +658,14 @@ impl Cpu {
         };
         let (pa, size_shift) = match self.fetch.lookup(el, pc) {
             Some(hit) => hit,
-            None => match mmu::translate(&self.mem, &self.state.mmu, el, pc, Access::Execute) {
+            None => match mmu::translate_cached(
+                &self.mem,
+                &self.state.mmu,
+                el,
+                pc,
+                Access::Execute,
+                &mut self.walk,
+            ) {
                 Ok(t) => {
                     self.fetch.insert(el, pc, t.pa, t.size_shift);
                     (t.pa, t.size_shift)
@@ -775,6 +801,7 @@ impl Cpu {
             self.tlb_empty(t);
         }
         self.fetch.clear();
+        self.walk.clear();
         self.jc_flush(0);
         self.jc_flush(1);
         self.jc.contexts.clear();
@@ -794,6 +821,7 @@ impl Cpu {
             self.tlbs.large[t][0].clear();
         }
         self.fetch.clear();
+        self.walk.clear();
         if self.jc.el1_low {
             self.jc_flush(1);
         }
@@ -817,8 +845,9 @@ impl Cpu {
         let on = m.sctlr_el1 & 1 != 0;
         let asid = (ttbr >> 48) as u16 & width;
         let key = (asid, m.ttbr0_el1 & 0x0000_ffff_ffff_fffe | !on as u64);
+        self.asid = on.then_some(asid);
         if let Some(smp) = self.smp() {
-            smp.set_asid(self.cpu, on.then_some(asid));
+            smp.set_asid(self.cpu, self.asid);
         }
         let ctx = match self.jc.contexts.get(&key) {
             Some(&c) => c,
@@ -856,8 +885,10 @@ impl Cpu {
     /// code in the jump cache goes by retiring its context numbers.
     fn flush_user(&mut self, asid: u16) {
         self.counters.jc_flush_reason[2] += 1;
-        self.tlb_empty(2);
-        self.tlb_empty(3);
+        if self.asid.is_none_or(|running| running == asid) {
+            self.tlb_empty(2);
+            self.tlb_empty(3);
+        }
         for t in 0..2 {
             let list = if self.tlbs.ng_high[t] {
                 TlbList::All
@@ -867,6 +898,7 @@ impl Cpu {
             self.tlb_drop(t, list, |_, meta| meta & META_NG != 0);
         }
         self.fetch.clear();
+        self.walk.clear();
         self.retire_contexts(Some(asid));
         if self.jc.el1_low {
             self.jc_flush(1);
@@ -878,17 +910,40 @@ impl Cpu {
     fn flush_va(&mut self, va: u64, asid: Option<u16>) {
         let page = va >> 12;
         let half = ((va >> 55) & 1) as usize;
+        // The EL0 TLBs hold lower-half translations of the running address
+        // space only.
+        let other = half == 1 || asid.is_some_and(|a| self.asid.is_some_and(|r| r != a));
         for t in 0..4 {
+            if other && (t == tlb_index(0, TlbKind::Load) || t == tlb_index(0, TlbKind::Store)) {
+                continue;
+            }
             let i = TlbEntry::index(t, va);
             if self.state.tlb[t].entries[i].tag == page {
                 self.state.tlb[t].entries[i].tag = TLB_INVALID;
             }
-            self.tlb_drop(t, TlbList::Large(half), |tag, meta| {
+            let covers = |tag: u64, meta: u8| {
                 let shift = (meta & !META_NG) as u32;
                 shift >= 64 || (shift > 12 && (tag << 12) >> shift == va >> shift)
-            });
+            };
+            let max = self.tlbs.max_shift[t] as u32;
+            if self.tlbs.large[t][half].overflowed() && max > 12 && max - 12 < TLB_BITS {
+                // Too many pieces of blocks to list: look at the entries of
+                // the pages of the largest block that could hold `va`.
+                let base = va >> max << max;
+                let entries = &mut self.state.tlb[t].entries;
+                for p in 0..1u64 << (max - 12) {
+                    let i = TlbEntry::index(t, base + (p << 12));
+                    let e = &mut entries[i];
+                    if e.tag != TLB_INVALID && covers(e.tag, self.tlbs.meta[t][i]) {
+                        e.tag = TLB_INVALID;
+                    }
+                }
+            } else {
+                self.tlb_drop(t, TlbList::Large(half), covers);
+            }
         }
         self.fetch.clear();
+        self.walk.clear();
         for el in 0..2 {
             let in_large = match &self.jc.large[el] {
                 Some(list) => list.iter().any(|&(shift, base)| va >> shift == base),
@@ -2469,6 +2524,64 @@ mod tests {
             ..Default::default()
         };
         (cpu, va, pa_a, pa_b)
+    }
+
+    /// Puts a translation of `va` from a mapping of `2^shift` bytes in TLB
+    /// `t`, as a fill would.
+    fn put(cpu: &mut Cpu, t: usize, va: u64, shift: u32, global: bool) {
+        let i = TlbEntry::index(t, va);
+        cpu.state.tlb[t].entries[i] = TlbEntry {
+            tag: va >> 12,
+            delta: 0,
+        };
+        cpu.tlbs.filled(t, i, va, shift, global);
+    }
+
+    fn holds(cpu: &Cpu, t: usize, va: u64) -> bool {
+        cpu.state.tlb[t].entries[TlbEntry::index(t, va)].tag == va >> 12
+    }
+
+    #[test]
+    fn a_tlbi_of_an_address_drops_its_whole_block_past_the_list() {
+        let (mut cpu, _, _, _) = two_page_cpu();
+        let t = tlb_index(1, TlbKind::Load);
+        // More pieces of blocks than the list keeps.
+        for n in 0..Filled::MAX as u64 + 1 {
+            put(&mut cpu, t, 0xffff_0000_4000_0000 + (n << 21), 21, true);
+        }
+        assert!(cpu.tlbs.large[t][1].overflowed());
+        // Every page of one 2 MiB block, and a page elsewhere whose entry is
+        // among theirs.
+        let block = 0xffff_0000_0020_0000u64;
+        for p in 0..512 {
+            put(&mut cpu, t, block + (p << 12), 21, true);
+        }
+        let other = block + (TLB_ENTRIES as u64) * 0x1000 * 4 + 0x3000;
+        put(&mut cpu, t, other, 12, true);
+        cpu.flush_va(block + 0x5123, None);
+        assert!((0..512).all(|p| !holds(&cpu, t, block + (p << 12))));
+        assert!(holds(&cpu, t, other));
+    }
+
+    #[test]
+    fn an_asid_flush_of_another_address_space_keeps_the_el0_tlbs() {
+        let (mut cpu, _, _, _) = two_page_cpu();
+        cpu.state.mmu.ttbr0_el1 |= 5 << 48;
+        cpu.context_changed();
+        let t = tlb_index(0, TlbKind::Load);
+        let va = 0x7_0000_1000u64;
+        put(&mut cpu, t, va, 12, false);
+        cpu.flush_user(7);
+        cpu.flush_va(va, Some(7));
+        assert!(holds(&cpu, t, va), "another address space's");
+        cpu.flush_va(va, Some(5));
+        assert!(!holds(&cpu, t, va));
+        put(&mut cpu, t, va, 12, false);
+        cpu.flush_user(5);
+        assert!(!holds(&cpu, t, va));
+        put(&mut cpu, t, va, 12, false);
+        cpu.flush_va(va, None);
+        assert!(!holds(&cpu, t, va), "every address space's");
     }
 
     #[test]
