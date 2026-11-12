@@ -401,6 +401,9 @@ struct JcBook {
     large: [Option<Vec<(u32, u64)>>; 2],
     /// The miss target empty entries point at, for the cache in use.
     miss: [u64; 2],
+    /// The code cache's epoch the entries are from. Once it has moved on, the
+    /// code they point at is gone and its space holds other code.
+    epoch: u64,
     /// EL0 entries are tagged with a context number for the address space
     /// (ASID and TTBR0) they were filled in, so a context switch keeps them;
     /// retiring a context's number drops them all at once.
@@ -538,6 +541,7 @@ impl Cpu {
                 el0_shared: false,
                 large: [Some(Vec::new()), Some(Vec::new())],
                 miss: [0; 2],
+                epoch: 0,
                 contexts: HashMap::default(),
                 next_context: 1,
                 generation: 0,
@@ -578,6 +582,7 @@ impl Cpu {
         let miss = cache.stubs().jc_miss;
         if self.jc.miss != miss {
             self.jc.miss = miss;
+            self.jc.epoch = cache.epoch();
             for (el, jc) in self.state.jc.iter_mut().enumerate() {
                 jc.entries.fill(JcEntry {
                     tag: 0,
@@ -722,7 +727,7 @@ impl Cpu {
                     self.fetch.insert(el, pc, &t);
                     (t.pa, t.size_shift, t.global)
                 }
-                Err(f) => return (cache.fetch_fault(pc, f.fsc, ctx), false),
+                Err(f) => return self.fetch_fault(cache, pc, f.fsc, ctx),
             },
         };
         let key = BlockKey {
@@ -736,7 +741,7 @@ impl Cpu {
                 let off = (pc & 0xfff) as usize;
                 let Ok(host) = self.mem.host_range(page, 0x1000) else {
                     // The fetch translated but missed RAM: an external abort.
-                    return (cache.fetch_fault(pc, 0x10, ctx), false);
+                    return self.fetch_fault(cache, pc, 0x10, ctx);
                 };
                 // Tell the other CPUs before reading the code, so one that
                 // rewrites it and does not see this sends the invalidation.
@@ -755,18 +760,13 @@ impl Cpu {
                         n,
                     );
                 }
-                let epoch = cache.epoch();
                 self.counters.translated += 1;
                 let started = self.trace.stats.then(std::time::Instant::now);
                 let e = cache.translate(key, pc, &words[..n], ctx);
                 if let Some(t) = started {
                     self.counters.translate_us += t.elapsed().as_micros() as u64;
                 }
-                if cache.epoch() != epoch {
-                    // The region filled and was emptied: every jump-cache
-                    // entry points at code that is gone.
-                    self.code_dropped();
-                }
+                self.forget_emptied_cache(cache);
                 e
             }
         };
@@ -879,6 +879,26 @@ impl Cpu {
     fn code_dropped(&mut self) {
         self.jc_clear(0);
         self.jc_clear(1);
+    }
+
+    /// Empties the jump caches if the code cache was emptied since they were
+    /// filled (its region filled up, or every translation was invalidated):
+    /// their entries lead into space that new code is written over, mid-block
+    /// or into data. Every way of emptying it goes through here before
+    /// translated code runs again.
+    fn forget_emptied_cache(&mut self, cache: &CodeCache) {
+        if self.jc.epoch != cache.epoch() {
+            self.jc.epoch = cache.epoch();
+            self.code_dropped();
+        }
+    }
+
+    /// The block that raises the instruction abort for a fetch at `pc` with
+    /// status `fsc`. Making it may empty a full cache, as translating does.
+    fn fetch_fault(&mut self, cache: &mut CodeCache, pc: u64, fsc: u8, ctx: Ctx) -> (u64, bool) {
+        let entry = cache.fetch_fault(pc, fsc, ctx);
+        self.forget_emptied_cache(cache);
+        (entry, false)
     }
 
     /// Empties the entries of the jump cache for `el`.
@@ -1112,7 +1132,7 @@ impl Cpu {
             }
             Remote::CodeAll => {
                 cache.reset();
-                self.code_dropped();
+                self.forget_emptied_cache(cache);
             }
         }
     }
@@ -1364,7 +1384,7 @@ impl Cpu {
                     if self.state.flush_cache != 0 {
                         self.state.flush_cache = 0;
                         cache.reset();
-                        self.code_dropped();
+                        self.forget_emptied_cache(cache);
                     }
                 }
                 Some(Exit::Call) => {
@@ -2875,6 +2895,57 @@ mod tests {
             (300, Stop::Brk(3)),
             "global, remapped"
         );
+    }
+
+    /// The block of a fetch abort that finds the code cache full empties it,
+    /// as a translation does, and the jump caches must forget their entries
+    /// then too: the next blocks are written where the old ones were, so a
+    /// stale entry sends an indirect branch into another block. (New
+    /// processes paging their code in after Claude Code was killed in a guest
+    /// made many such blocks, and the CPUs ran into the middle of others.)
+    #[test]
+    fn a_fetch_abort_that_empties_the_cache_empties_the_jump_caches() {
+        use crate::asm;
+        use crate_core::memory::{HeapRam, RamBlock};
+        const RAM: u64 = 0x4000_0000;
+        let block: Arc<dyn RamBlock> = Arc::new(HeapRam::new(0x10_0000).unwrap());
+        let mem = Arc::new(GuestMemory::new(vec![(RAM, block)]).unwrap());
+        // A: x0 += 1; brk #1.  B: br x2, to A through the jump cache.
+        let (a, b) = (RAM + 0x1000, RAM + 0x2000);
+        mem.write_u32(a, asm::add_imm(true, 0, 0, 1, false))
+            .unwrap();
+        mem.write_u32(a + 4, asm::brk(1)).unwrap();
+        mem.write_u32(b, asm::br(2)).unwrap();
+        let mut cpu = Cpu::new(mem);
+        // The fast paths, whatever the environment says: only they use the
+        // jump caches.
+        let mut cache = CodeCache::with_mode(1 << 16, true).unwrap();
+        cpu.state.pstate = 0b0101; // EL1h, the MMU off
+        let run = |cpu: &mut Cpu, cache: &mut CodeCache, pc: u64| {
+            cpu.state.x[0] = 0;
+            cpu.state.x[2] = a;
+            cpu.state.pc = pc;
+            let stop = cpu.run(cache);
+            (cpu.state.x[0], stop)
+        };
+        // A first, the first block after the stubs; then B reaches it.
+        assert_eq!(run(&mut cpu, &mut cache, a), (1, Stop::Brk(1)));
+        assert_eq!(run(&mut cpu, &mut cache, b), (1, Stop::Brk(1)));
+        // Fetches from outside RAM until one's block finds the cache full: the
+        // block made once it is emptied is the first after the stubs, at A's
+        // old address.
+        for _ in 0..1 << 16 {
+            if cache.epoch() != 0 {
+                break;
+            }
+            assert_eq!(run(&mut cpu, &mut cache, 0x1000_0000).1, Stop::Exception);
+        }
+        assert_eq!(
+            cache.epoch(),
+            1,
+            "the fetch aborts' blocks filled the cache"
+        );
+        assert_eq!(run(&mut cpu, &mut cache, b), (1, Stop::Brk(1)));
     }
 
     /// With a 16 KiB granule, one miss fills every 4 KiB piece of the page,
