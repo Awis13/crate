@@ -264,6 +264,10 @@ pub(crate) struct TlbBook {
     large: [[Filled; 2]; 4],
     /// Some upper-half entry is non-global (only with a split kernel map).
     ng_high: [bool; 4],
+    /// Some entry is global or in the upper half: one a TLBI for another
+    /// address space can still reach (in the EL0 TLBs, which otherwise hold
+    /// only the running address space's lower-half translations).
+    shared: [bool; 4],
     /// The largest mapping any entry came from, as log2 of its size (0 for
     /// none larger than an entry), so an invalidation of one address looks
     /// for the pieces of a block only among the entries the largest block
@@ -287,6 +291,7 @@ impl TlbBook {
                 [Filled::new(), Filled::new()],
             ],
             ng_high: [false; 4],
+            shared: [false; 4],
             max_shift: [0; 4],
         }
     }
@@ -301,6 +306,9 @@ impl TlbBook {
         } else if !global {
             self.ng_high[tlb] = true;
         }
+        if high || global {
+            self.shared[tlb] = true;
+        }
         if shift > crate::state::TLB_SHIFT as u8 {
             self.large[tlb][high as usize].push(i);
             self.max_shift[tlb] = self.max_shift[tlb].max(shift);
@@ -313,6 +321,7 @@ impl TlbBook {
         self.large[tlb][0].clear();
         self.large[tlb][1].clear();
         self.ng_high[tlb] = false;
+        self.shared[tlb] = false;
         self.max_shift[tlb] = 0;
     }
 }
@@ -329,23 +338,38 @@ enum TlbList {
 /// lookups, emptied (by moving to a new generation) by every TLB
 /// invalidation.
 struct FetchTlb {
-    /// Per EL and entry: (page | 1 for valid, physical page, mapping size,
-    /// generation).
+    /// Per EL and entry: (page | 1 for valid, physical page, mapping size
+    /// with `FETCH_GLOBAL` for a global mapping, generation).
     entries: Box<[[FetchEntry; 256]; 2]>,
     generation: u32,
 }
 
 type FetchEntry = (u64, u64, u32, u32);
 
+const FETCH_GLOBAL: u32 = 1 << 8;
+
+/// How many context numbers there are. The number goes in an EL0 jump-cache
+/// tag's top 16 bits, which a PC's own are all zeros or all ones; two numbers
+/// below 0x8000 never differ by all ones, so no two (PC, context) pairs make
+/// the same tag.
+const CONTEXTS: u16 = 0x8000;
+
 impl FetchTlb {
-    fn lookup(&self, el: u32, va: u64) -> Option<(u64, u32)> {
+    /// The physical address `va` fetches from, the log2 size of its mapping,
+    /// and whether the mapping is global.
+    fn lookup(&self, el: u32, va: u64) -> Option<(u64, u32, bool)> {
         let e = &self.entries[el.min(1) as usize][((va >> 12) & 255) as usize];
-        (e.0 == (va >> 12 << 1 | 1) && e.3 == self.generation).then_some((e.1 | (va & 0xfff), e.2))
+        (e.0 == (va >> 12 << 1 | 1) && e.3 == self.generation).then_some((
+            e.1 | (va & 0xfff),
+            e.2 & !FETCH_GLOBAL,
+            e.2 & FETCH_GLOBAL != 0,
+        ))
     }
 
-    fn insert(&mut self, el: u32, va: u64, pa: u64, size_shift: u32) {
+    fn insert(&mut self, el: u32, va: u64, t: &mmu::Translation) {
+        let size = t.size_shift | if t.global { FETCH_GLOBAL } else { 0 };
         self.entries[el.min(1) as usize][((va >> 12) & 255) as usize] =
-            (va >> 12 << 1 | 1, pa & !0xfff, size_shift, self.generation);
+            (va >> 12 << 1 | 1, t.pa & !0xfff, size, self.generation);
     }
 
     fn clear(&mut self) {
@@ -367,6 +391,9 @@ struct JcBook {
     /// The EL1 cache holds code from the lower half of the address space
     /// (TTBR0), which a change of TTBR0 makes stale.
     el1_low: bool,
+    /// The EL0 cache holds code from a global mapping or from the upper half
+    /// of the address space, which a TLBI for any address space reaches.
+    el0_shared: bool,
     /// The blocks (mapping size, VA >> size) larger than a page that cached
     /// code came from, so a TLBI inside one drops the cache; `None` once too
     /// many to track, when any TLBI does.
@@ -500,6 +527,7 @@ impl Cpu {
                 filled: [Filled::new(), Filled::new()],
                 pages: [HashSet::default(), HashSet::default()],
                 el1_low: false,
+                el0_shared: false,
                 large: [Some(Vec::new()), Some(Vec::new())],
                 miss: [0; 2],
                 contexts: HashMap::default(),
@@ -656,7 +684,7 @@ impl Cpu {
             stubs: *cache.stubs(),
             mpidr: self.mpidr,
         };
-        let (pa, size_shift) = match self.fetch.lookup(el, pc) {
+        let (pa, size_shift, global) = match self.fetch.lookup(el, pc) {
             Some(hit) => hit,
             None => match mmu::translate_cached(
                 &self.mem,
@@ -667,8 +695,8 @@ impl Cpu {
                 &mut self.walk,
             ) {
                 Ok(t) => {
-                    self.fetch.insert(el, pc, t.pa, t.size_shift);
-                    (t.pa, t.size_shift)
+                    self.fetch.insert(el, pc, &t);
+                    (t.pa, t.size_shift, t.global)
                 }
                 Err(f) => return (cache.fetch_fault(pc, f.fsc, ctx), false),
             },
@@ -748,6 +776,9 @@ impl Cpu {
             if el_i == 1 && pc >> 55 == 0 {
                 self.jc.el1_low = true;
             }
+            if el_i == 0 && (global || pc >> 55 != 0) {
+                self.jc.el0_shared = true;
+            }
         }
         (entry, true)
     }
@@ -767,6 +798,8 @@ impl Cpu {
         self.jc.large[el] = Some(Vec::new());
         if el == 1 {
             self.jc.el1_low = false;
+        } else {
+            self.jc.el0_shared = false;
         }
     }
 
@@ -852,7 +885,7 @@ impl Cpu {
         let ctx = match self.jc.contexts.get(&key) {
             Some(&c) => c,
             None => {
-                if self.jc.next_context == u16::MAX {
+                if self.jc.next_context == CONTEXTS {
                     // Out of numbers: forget every context.
                     self.jc.contexts.clear();
                     self.jc.next_context = 1;
@@ -910,11 +943,13 @@ impl Cpu {
     fn flush_va(&mut self, va: u64, asid: Option<u16>) {
         let page = va >> 12;
         let half = ((va >> 55) & 1) as usize;
-        // The EL0 TLBs hold lower-half translations of the running address
-        // space only.
+        // The EL0 TLBs hold the running address space's lower-half
+        // translations, and only those unless they hold a global or an
+        // upper-half one, which a TLBI for any address space reaches.
         let other = half == 1 || asid.is_some_and(|a| self.asid.is_some_and(|r| r != a));
         for t in 0..4 {
-            if other && (t == tlb_index(0, TlbKind::Load) || t == tlb_index(0, TlbKind::Store)) {
+            let el0 = t == tlb_index(0, TlbKind::Load) || t == tlb_index(0, TlbKind::Store);
+            if other && el0 && !self.tlbs.shared[t] {
                 continue;
             }
             let i = TlbEntry::index(t, va);
@@ -952,7 +987,9 @@ impl Cpu {
             if in_large || self.jc.pages[el].contains(&page) {
                 self.counters.jc_flush_reason[3] += 1;
                 if el == 0 && half == 0 {
-                    self.retire_contexts(asid);
+                    // A TLBI for one address space also drops global
+                    // translations, which every address space shares.
+                    self.retire_contexts(if self.jc.el0_shared { None } else { asid });
                 } else {
                     self.jc_flush(el);
                 }
@@ -2595,6 +2632,35 @@ mod tests {
         put(&mut cpu, t, va, 12, false);
         cpu.flush_va(va, None);
         assert!(!holds(&cpu, t, va), "every address space's");
+    }
+
+    #[test]
+    fn a_tlbi_for_another_address_space_still_drops_shared_el0_entries() {
+        let (mut cpu, _, _, _) = two_page_cpu();
+        cpu.state.mmu.ttbr0_el1 |= 5 << 48;
+        cpu.context_changed();
+        let t = tlb_index(0, TlbKind::Load);
+        // A global lower-half mapping, and an upper-half one EL0 may use:
+        // TLBI VAE1 for ASID 7 reaches both.
+        let (low, high) = (0x7_0000_1000u64, 0xffff_0000_0000_3000u64);
+        put(&mut cpu, t, low, 12, true);
+        put(&mut cpu, t, low + 0x1000, 12, false);
+        cpu.flush_va(low, Some(7));
+        assert!(!holds(&cpu, t, low), "a global translation");
+        put(&mut cpu, t, high, 12, false);
+        cpu.flush_va(high, Some(7));
+        assert!(!holds(&cpu, t, high), "an upper-half translation");
+        assert!(holds(&cpu, t, low + 0x1000), "another page");
+        // The jump cache: EL0 code of the page, from a private mapping, then
+        // from a global one.
+        cpu.jc.pages[0].insert(low >> 12);
+        let context = cpu.state.jc_context;
+        cpu.flush_va(low, Some(7));
+        assert_eq!(cpu.state.jc_context, context, "another address space's");
+        cpu.jc.pages[0].insert(low >> 12);
+        cpu.jc.el0_shared = true;
+        cpu.flush_va(low, Some(7));
+        assert_ne!(cpu.state.jc_context, context, "a global mapping's code");
     }
 
     #[test]
