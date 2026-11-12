@@ -124,6 +124,50 @@ pub fn ttbr0_page_shift(regs: &MmuRegs) -> u32 {
     tg0_page_shift(regs.tcr_el1).unwrap_or(12)
 }
 
+/// The level of a walk whose descriptors `WalkCache` keeps: the one above
+/// the pages, whose entries cover 2 MiB each with the 4 KiB granule.
+const CACHED_LEVEL: i32 = 2;
+
+/// Descriptors of recent walks at `CACHED_LEVEL`, by the region of address
+/// space each covers, so a walk to another page of the same region reads one
+/// descriptor instead of four. Only valid descriptors are kept; the guest
+/// changes a valid one only by breaking it first and invalidating its TLB
+/// entries, so emptying this along with the software TLBs keeps it right.
+/// It holds no permissions of its own: the walk checks them at the leaf.
+pub struct WalkCache {
+    tags: [u64; WALK_ENTRIES],
+    descs: [u64; WALK_ENTRIES],
+}
+
+const WALK_ENTRIES: usize = 64;
+
+impl Default for WalkCache {
+    fn default() -> Self {
+        WalkCache {
+            tags: [u64::MAX; WALK_ENTRIES],
+            descs: [0; WALK_ENTRIES],
+        }
+    }
+}
+
+impl WalkCache {
+    /// Forgets every descriptor.
+    pub fn clear(&mut self) {
+        self.tags.fill(u64::MAX);
+    }
+
+    fn get(&self, region: u64) -> Option<u64> {
+        let i = region as usize % WALK_ENTRIES;
+        (self.tags[i] == region).then(|| self.descs[i])
+    }
+
+    fn insert(&mut self, region: u64, desc: u64) {
+        let i = region as usize % WALK_ENTRIES;
+        self.tags[i] = region;
+        self.descs[i] = desc;
+    }
+}
+
 /// Translates guest virtual `va` for an access at `el` (0 or 1).
 pub fn translate(
     mem: &GuestMemory,
@@ -131,6 +175,29 @@ pub fn translate(
     el: u32,
     va: u64,
     access: Access,
+) -> Result<Translation, Fault> {
+    walk(mem, regs, el, va, access, None)
+}
+
+/// `translate`, starting from `cache` where it can and filling it.
+pub fn translate_cached(
+    mem: &GuestMemory,
+    regs: &MmuRegs,
+    el: u32,
+    va: u64,
+    access: Access,
+    cache: &mut WalkCache,
+) -> Result<Translation, Fault> {
+    walk(mem, regs, el, va, access, Some(cache))
+}
+
+fn walk(
+    mem: &GuestMemory,
+    regs: &MmuRegs,
+    el: u32,
+    va: u64,
+    access: Access,
+    mut cache: Option<&mut WalkCache>,
 ) -> Result<Translation, Fault> {
     let write = access == Access::Write;
     if regs.sctlr_el1 & SCTLR_M == 0 {
@@ -176,6 +243,16 @@ pub fn translate(
     let mut table = ttbr & 0xffff_ffff_fffe & !((1u64 << page_shift) - 1);
     // The output-address mask: bits [47:0] (PA size capped at 48 here).
     let oa_mask = ((1u64 << 48) - 1) & !((1u64 << page_shift) - 1);
+    // The region one descriptor at the cached level covers (the address's
+    // sign bits keep TTBR0's apart from TTBR1's).
+    let region = va >> (page_shift + g.bits);
+    let mut known = None;
+    if level <= CACHED_LEVEL {
+        if let Some(desc) = cache.as_ref().and_then(|c| c.get(region)) {
+            level = CACHED_LEVEL;
+            known = Some(desc);
+        }
+    }
 
     loop {
         let bottom = page_shift + ((3 - level) as u32) * g.bits;
@@ -183,9 +260,20 @@ pub fn translate(
         let index_bits = (ia - bottom).min(g.bits);
         let index = (va >> bottom) & ((1 << index_bits) - 1);
         let entry_addr = table + index * 8;
-        let desc = mem
-            .read_u64(entry_addr)
-            .map_err(|_| Fault::at(Fault::ADDRESS_SIZE, level, write))?;
+        let desc = match known.take() {
+            Some(desc) => desc,
+            None => {
+                let desc = mem
+                    .read_u64(entry_addr)
+                    .map_err(|_| Fault::at(Fault::ADDRESS_SIZE, level, write))?;
+                if level == CACHED_LEVEL && desc & 1 != 0 {
+                    if let Some(c) = cache.as_mut() {
+                        c.insert(region, desc);
+                    }
+                }
+                desc
+            }
+        };
 
         if desc & 1 == 0 {
             // Bit 0 clear: an invalid descriptor.
@@ -388,6 +476,53 @@ mod tests {
             translate(&mem, &r, 0, va, Access::Read).unwrap_err().fsc & 0x3c,
             Fault::PERMISSION
         );
+    }
+
+    #[test]
+    fn a_cached_walk_reads_only_the_leaf() {
+        for &ps in &[12u32, 14, 16] {
+            let (mem, base) = memory();
+            let va = 0x4008_1240 & !((1u64 << ps) - 1);
+            let tables = base + 0x10_0000;
+            let (tcr, ttbr0) = identity_map(&mem, tables, ps, va, 0b01);
+            let r = regs(tcr, ttbr0);
+            let mut cache = WalkCache::default();
+            for _ in 0..2 {
+                let t = translate_cached(&mem, &r, 1, va + 0x30, Access::Read, &mut cache);
+                assert_eq!(t.unwrap().pa, va + 0x30, "granule {ps}");
+            }
+            // Take away every level above the leaf table: the cached walk
+            // still finds the page; an uncached one, or one after the cache
+            // is emptied, does not.
+            let levels = 3 - Granule::new(ps).start_level(48) as u64;
+            let leaf_table = tables + levels * (1 << ps);
+            for t in (tables..leaf_table).step_by(8) {
+                mem.write_u64(t, 0).unwrap();
+            }
+            let t = translate_cached(&mem, &r, 1, va + 0x30, Access::Read, &mut cache);
+            assert_eq!(t.unwrap().pa, va + 0x30);
+            assert!(translate(&mem, &r, 1, va, Access::Read).is_err());
+            cache.clear();
+            assert!(translate_cached(&mem, &r, 1, va, Access::Read, &mut cache).is_err());
+        }
+    }
+
+    #[test]
+    fn a_cached_walk_still_checks_the_leaf() {
+        let (mem, base) = memory();
+        let va = 0x4008_0000;
+        let (tcr, ttbr0) = identity_map(&mem, base + 0x10_0000, 12, va, 0b01);
+        let r = regs(tcr, ttbr0);
+        let mut cache = WalkCache::default();
+        assert!(translate_cached(&mem, &r, 1, va, Access::Read, &mut cache).is_ok());
+        // Another page of the same 2 MiB, never mapped, and the page itself
+        // once unmapped: the leaf is read on every walk.
+        let other = translate_cached(&mem, &r, 1, va + 0x1000, Access::Read, &mut cache);
+        assert_eq!(other.unwrap_err().fsc, Fault::TRANSLATION | 3);
+        let leaf = base + 0x10_0000 + 3 * 0x1000;
+        mem.write_u64(leaf + ((va >> 12) & 0x1ff) * 8, 0).unwrap();
+        let gone = translate_cached(&mem, &r, 1, va, Access::Read, &mut cache);
+        assert_eq!(gone.unwrap_err().fsc, Fault::TRANSLATION | 3);
     }
 
     #[test]

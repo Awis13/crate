@@ -3,7 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Translated code: one region of executable memory per CPU, the shared stubs
-//! at its start, and the blocks after them.
+//! at its start, and the blocks after them. The region is used in segments of
+//! a MiB: the code that runs fills a segment upwards from its start, and each
+//! block's cold code (its slow paths and the exits it takes until a chain is
+//! patched) fills it downwards from its end, so the code that runs is packed
+//! together for the CPU's instruction cache, yet a block's conditional
+//! branches (which reach a MiB) go straight to its cold code.
 //!
 //! A block is found by the physical address its guest PC translated to and
 //! the mode it was translated for (its exception level, and whether debug
@@ -25,7 +30,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate_host::jit::JitRegion;
 
 use crate::asm::*;
-use crate::emit::{self, CHAIN_ENTRY, Stubs};
+use crate::emit::{self, Stubs};
 use crate::translate::{self, Ctx};
 
 /// Identifies a translation.
@@ -67,13 +72,23 @@ const MAX_BLOCK: usize = 512;
 /// region's start with B and BL, which reach 128 MiB back.
 pub const MAX_REGION: usize = 128 << 20;
 
+/// The size of a segment: as far as CBNZ and B.cond reach.
+const SEGMENT: usize = 1 << 20;
+
 /// Translated host code for one CPU.
 pub struct CodeCache {
     region: JitRegion,
     /// How much of the region is used: all of it up to `MAX_REGION`.
     capacity: usize,
-    /// Next free byte in the region.
+    /// The size of a segment: `SEGMENT`, or the whole capacity if smaller.
+    segment: usize,
+    /// Next free byte in the region for the code that runs, which grows up
+    /// from the stubs, then from the start of each segment.
     cursor: usize,
+    /// Where the current segment's cold code (slow paths, exits taken once)
+    /// starts: it grows down from the segment's end, so it stays out of the
+    /// way of the code that runs and within reach of its branches.
+    cold: usize,
     /// Every live block, by key, to the offset of its entry.
     blocks: FastMap<BlockKey, usize>,
     /// The keys of the live blocks translated from each physical page.
@@ -86,6 +101,9 @@ pub struct CodeCache {
     /// Bumped whenever the cache is emptied, so a chain site recorded before
     /// it is known to be gone.
     epoch: u64,
+    /// The memory the last translation used, emptied, so the next one reuses
+    /// it instead of allocating its own.
+    spare: translate::Spare,
 }
 
 /// A fault while translating: the region filled up.
@@ -97,17 +115,22 @@ pub enum TranslateError {
 impl CodeCache {
     /// A cache in `region`, whose slow path calls `helper`.
     pub fn with_region(region: JitRegion, helper: u64, fast: bool) -> Self {
+        let capacity = region.len().min(MAX_REGION);
         let mut cache = CodeCache {
-            capacity: region.len().min(MAX_REGION),
+            capacity,
+            segment: SEGMENT.min(capacity),
             region,
             cursor: 0,
+            cold: 0,
             blocks: FastMap::default(),
             pages: FastMap::default(),
             stubs: Stubs::default(),
             helper,
             fast,
             epoch: 0,
+            spare: translate::Spare::default(),
         };
+        cache.cold = cache.segment;
         cache.emit_stubs();
         cache
     }
@@ -132,14 +155,17 @@ impl CodeCache {
         let mut asm = Asm::new();
         emit::mem_stub(&mut asm, self.helper);
         self.stubs.mem = self.place(asm);
+        let stats = std::env::var_os("CRATE_JIT_STATS").is_some();
         for el in 0..2 {
             let mut asm = Asm::new();
             let base = self.exec(self.cursor);
-            let stats = std::env::var_os("CRATE_JIT_STATS").is_some();
-            let (at, miss) = emit::jc_stub(&mut asm, el, self.stubs.save, stats);
+            let at = emit::jc_stubs(&mut asm, el, self.stubs.save, stats, emit::JC_COPIES);
             self.place(asm);
-            self.stubs.jc[el as usize] = base + at as u64;
-            self.stubs.jc_miss[el as usize] = base + miss as u64;
+            let el = el as usize;
+            self.stubs.jc[el] = base + at.first as u64;
+            self.stubs.jc_stride[el] = at.stride as u64;
+            self.stubs.jc_ret[el] = base + at.ret as u64;
+            self.stubs.jc_miss[el] = base + at.miss as u64;
         }
     }
 
@@ -153,7 +179,7 @@ impl CodeCache {
 
     fn put(&mut self, words: &[u32]) {
         let bytes = std::mem::size_of_val(words);
-        assert!(self.cursor + bytes <= self.capacity, "code region full");
+        assert!(self.cursor + bytes <= self.cold, "code region full");
         let mut w = self.region.writer();
         w.write_words(self.cursor, words);
         drop(w);
@@ -174,7 +200,8 @@ impl CodeCache {
     /// epoch).
     pub fn translate(&mut self, key: BlockKey, pc: u64, words: &[u32], ctx: Ctx) -> u64 {
         let limit = if ctx.debug { 1 } else { MAX_BLOCK };
-        let block = translate::translate(ctx, pc, words, limit);
+        let spare = std::mem::take(&mut self.spare);
+        let block = translate::translate(ctx, pc, words, limit, spare);
         self.install(key, block, ctx.debug).unwrap_or_else(|_| {
             self.reset();
             let block = translate::translate(
@@ -185,6 +212,7 @@ impl CodeCache {
                 pc,
                 words,
                 limit,
+                translate::Spare::default(),
             );
             self.install(key, block, ctx.debug)
                 .expect("a block in an empty cache")
@@ -193,7 +221,7 @@ impl CodeCache {
 
     /// A block that only raises an instruction abort; run once, never cached.
     pub fn fetch_fault(&mut self, pc: u64, fsc: u8, ctx: Ctx) -> u64 {
-        let block = translate::fetch_fault(ctx, pc, fsc);
+        let block = translate::fetch_fault(ctx, pc, fsc, std::mem::take(&mut self.spare));
         let key = BlockKey {
             pa: u64::MAX,
             mode: 0,
@@ -207,6 +235,7 @@ impl CodeCache {
                 },
                 pc,
                 fsc,
+                translate::Spare::default(),
             );
             self.install(key, block, false)
                 .expect("a block in an empty cache")
@@ -216,23 +245,57 @@ impl CodeCache {
     fn install(
         &mut self,
         key: BlockKey,
-        block: translate::Block,
+        mut block: translate::Block,
         _debug: bool,
     ) -> Result<u64, TranslateError> {
         // Before resolving the block's branches: one to the stubs from past
         // the end of the capacity would not reach them.
-        if self.cursor + block.asm.size_bound() + 16 > self.capacity {
-            return Err(TranslateError::OutOfSpace);
+        let hot = block.asm.size_bound() + 16;
+        let mut cold = self.cold.saturating_sub(block.asm.cold_size()) & !15;
+        if self.cursor + hot > cold {
+            // The next segment, if there is one.
+            let next = (self.cursor / self.segment + 1) * self.segment;
+            if next + self.segment > self.capacity {
+                return Err(TranslateError::OutOfSpace);
+            }
+            self.cursor = next;
+            self.cold = next + self.segment;
+            cold = self.cold.saturating_sub(block.asm.cold_size()) & !15;
+            if self.cursor + hot > cold {
+                return Err(TranslateError::OutOfSpace);
+            }
         }
         let base = self.exec(self.cursor);
         let fetch_faulted = block.fetch_faulted;
-        let words = block.asm.finish(base);
-        let off = self.cursor;
-        self.put(&words);
-        if !fetch_faulted {
-            self.blocks.insert(key, off);
-            self.pages.entry(key.pa >> 12).or_default().push(key);
+        block.asm.finish_split(base, self.exec(cold));
+        let cold_words = block.asm.cold_words();
+        if !cold_words.is_empty() {
+            let mut w = self.region.writer();
+            w.write_words(cold, cold_words);
+            drop(w);
+            self.region.flush(cold, cold_words.len() * 4);
+            self.cold = cold;
         }
+        let off = self.cursor;
+        self.put(&block.asm.words);
+        if !fetch_faulted {
+            // The block's further entries (where its calls return to) are
+            // each the block for their own guest PC from now on.
+            let entries = block.entries.iter().map(|&(pc, label)| {
+                let k = BlockKey {
+                    pa: key.pa.wrapping_add(pc.wrapping_sub(block.start)),
+                    mode: key.mode,
+                };
+                (k, block.asm.offset_of(label) as usize)
+            });
+            let keys = self.pages.entry(key.pa >> 12).or_default();
+            for (k, at) in std::iter::once((key, 0)).chain(entries) {
+                if self.blocks.insert(k, off + at).is_none() {
+                    keys.push(k);
+                }
+            }
+        }
+        self.spare = block.into_spare();
         Ok(self.exec(off))
     }
 
@@ -247,8 +310,7 @@ impl CodeCache {
         if site < base || site >= end {
             return;
         }
-        let target = entry + CHAIN_ENTRY;
-        let delta = target.wrapping_sub(site) as i64;
+        let delta = entry.wrapping_sub(site) as i64;
         if !(-(1 << 27)..(1 << 27)).contains(&delta) {
             return;
         }
@@ -281,6 +343,7 @@ impl CodeCache {
     /// Empties the cache. Safe only between block runs.
     pub fn reset(&mut self) {
         self.cursor = 0;
+        self.cold = self.segment;
         self.blocks.clear();
         self.pages.clear();
         self.epoch += 1;
@@ -291,9 +354,11 @@ impl CodeCache {
         self.blocks.len()
     }
 
-    /// Bytes of code in use.
+    /// Bytes of the region taken: all of it below the cursor, and the
+    /// current segment's cold code.
     pub fn used(&self) -> usize {
-        self.cursor
+        let end = (self.cursor / self.segment + 1) * self.segment;
+        self.cursor + (end - self.cold)
     }
 }
 
@@ -309,6 +374,7 @@ mod tests {
         // Just short of the end, where the block's branches back to the
         // stubs would be out of reach.
         cache.cursor = MAX_REGION - 16;
+        cache.cold = MAX_REGION;
         let ctx = Ctx {
             el: 1,
             fast: true,
@@ -328,5 +394,43 @@ mod tests {
         assert_eq!(cache.epoch(), 1, "the cache was emptied");
         assert_eq!(cache.lookup(&key), Some(entry));
         assert!(cache.used() < 1 << 20);
+    }
+
+    #[test]
+    fn a_call_returns_to_an_entry_of_its_block() {
+        let region = JitRegion::new_dual(1 << 20).unwrap();
+        let mut cache = CodeCache::with_region(region, 0x1000, true);
+        let ctx = Ctx {
+            el: 1,
+            fast: true,
+            debug: false,
+            stubs: *cache.stubs(),
+            mpidr: 0,
+        };
+        // add x0, x0, #1 ; bl +8 ; add x0, x0, #2 ; ret ; add x0, x0, #3
+        let words = [
+            0x9100_0400,
+            0x9400_0002,
+            0x9100_0800,
+            0xd65f_03c0,
+            0x9100_0c00,
+        ];
+        let key = BlockKey {
+            pa: 0x4000_0000,
+            mode: 1,
+        };
+        let entry = cache.translate(key, 0x4000_0000, &words, ctx);
+        // The instruction after the call is an entry, after the call's BL.
+        let after = BlockKey {
+            pa: 0x4000_0008,
+            mode: 1,
+        };
+        let ret = cache.lookup(&after).expect("an entry for the return point");
+        assert!(ret > entry && ret < entry + 0x100);
+        assert_eq!(cache.block_count(), 2);
+        // Dropping the page drops both.
+        assert!(cache.invalidate_page(0x4000_0000));
+        assert_eq!(cache.lookup(&after), None);
+        assert_eq!(cache.block_count(), 0);
     }
 }

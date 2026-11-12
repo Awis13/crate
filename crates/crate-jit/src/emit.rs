@@ -27,33 +27,42 @@ pub struct Stubs {
     pub save: u64,
     /// The memory slow path (see `mem_stub`).
     pub mem: u64,
-    /// The jump-cache lookup for EL0 and EL1 code (see `jc_stub`).
+    /// The jump-cache lookup for EL0 and EL1 code (see `jc_stubs`): the
+    /// first of its `JC_COPIES` copies, `jc_stride` bytes apart.
     pub jc: [u64; 2],
+    pub jc_stride: [u64; 2],
+    /// The same for returns, which jump with RET.
+    pub jc_ret: [u64; 2],
     /// Where a jump-cache miss goes; also the target of an empty entry.
     pub jc_miss: [u64; 2],
 }
 
-/// The registers an indirect jump into a block borrows, which the block's
-/// entry restores from their home slots: X16 holds the jump target and X15 is
-/// the lookup's scratch. The jump cache restores X17 itself.
-pub const JUMP_REG: Reg = 16;
+/// How many copies of the jump-cache lookup each exception level has. A site
+/// branches to the copy its guest address picks, so that the CPU predicts the
+/// indirect branch each copy ends with from the few sites that share it,
+/// rather than one branch from all of them.
+pub const JC_COPIES: usize = 32;
 
-/// Emits a block's entry, the word every jump into the block from the
-/// dispatcher or the jump cache lands on: it reloads the two guest registers
-/// the jump borrowed. A block reached by a chained direct branch starts at the
-/// next word, with every guest register already live.
-pub fn block_entry(asm: &mut Asm) {
-    asm.emit(ldp(15, 16, SP, offsets::x(15) as i32));
+impl Stubs {
+    /// The copy of the jump-cache lookup for code at `el` that the site at
+    /// guest `pc` branches to.
+    pub fn jc_for(&self, el: usize, pc: u64) -> u64 {
+        let copy = ((pc >> 2) ^ (pc >> 9)) as usize % JC_COPIES;
+        self.jc[el] + copy as u64 * self.jc_stride[el]
+    }
 }
 
-/// The byte offset of a block's chained entry from its start.
-pub const CHAIN_ENTRY: u64 = 4;
+/// The host register a jump into a block (from the jump cache, or a
+/// dispatcher's entry) carries the target in. Guest X15..X17 are in their
+/// slots of the state wherever one block hands over to another, so a block's
+/// entry has nothing to reload, and its chained entry is its first word.
+pub const JUMP_REG: Reg = 16;
 
 /// Emits the shared stub that saves the guest registers a block leaves live
-/// (X1..X29 but X18, NZCV and the SIMD registers; FPCR and FPSR stay in the
-/// host's) and returns
-/// through the epilogue. The prefix each exit emits has already saved X0 and
-/// X30 and set the exit code, so this stub is the same for every exit.
+/// (X1..X29 but X15..X18, NZCV and the SIMD registers; FPCR and FPSR stay in
+/// the host's) and returns through the epilogue. The prefix each exit emits
+/// has already saved X0 and X30 and set the exit code, so this stub is the
+/// same for every exit.
 pub fn save_stub(asm: &mut Asm) {
     asm.emit(str_imm(3, 1, SP, offsets::x(1)));
     save_x2_to_x29(asm);
@@ -64,18 +73,22 @@ pub fn save_stub(asm: &mut Asm) {
     asm.emit(br(SCRATCH1));
 }
 
-/// Stores X2..X29 except X18 (guest X18 is virtual: the host's x18 is
-/// reserved by the OS and holds garbage, and the slot holds the real value).
+/// Stores X2..X29 except X15..X18, whose slots already hold them (guest X18
+/// is virtual: the host's x18 is reserved by the OS and holds garbage).
 fn save_x2_to_x29(asm: &mut Asm) {
-    let mut n = 2;
-    while n <= 28 {
-        if n == 18 {
-            asm.emit(str_imm(3, 19, SP, offsets::x(19)));
-        } else {
-            asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
-        }
-        n += 2;
+    for n in [2, 4, 6, 8, 10, 12] {
+        asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
     }
+    asm.emit(str_imm(3, 14, SP, offsets::x(14)));
+    save_x19_to_x29(asm);
+}
+
+/// Stores X19..X29.
+fn save_x19_to_x29(asm: &mut Asm) {
+    for n in [19, 21, 23, 25, 27] {
+        asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
+    }
+    asm.emit(str_imm(3, 29, SP, offsets::x(29)));
 }
 
 fn save_vectors(asm: &mut Asm) {
@@ -92,25 +105,27 @@ fn load_vectors(asm: &mut Asm) {
 
 /// The memory slow path, shared by every load and store of a region. A site
 /// reaches it with `BL` after storing guest X30 (and any operand registers it
-/// names among X19..X29) to the state; the BL's return address is the site's
-/// literal: the instruction word, the offset from the literal to where to
-/// return, and the instruction's offset in its page (the guest PC is the
-/// block's run-time page plus that).
+/// names among X19..X29) to the state and putting the address of its literal
+/// in X17: the instruction word, and the instruction's offset in its page
+/// (the guest PC is the block's run-time page plus that).
 ///
 /// The stub saves what a call into Rust may clobber -- by the procedure call
-/// standard X0..X17, the flags, and the SIMD registers (all of V0..V7 and
-/// V16..V31, and the upper halves of V8..V15) -- but not X19..X29, which the
-/// callee preserves. It calls `helper(cpu, site)`, which performs the access
-/// on the state's copies of the registers; on success it reloads the same set
-/// and returns to the site's return point, which reloads guest X16 (the
-/// return used it) and whichever of X19..X29 the instruction may have
-/// written. On a fault the helper has recorded the exception, so the stub
-/// saves the rest of the registers and leaves through the epilogue.
+/// standard X0..X14 (X15..X17 are in the state already), the flags, and the
+/// SIMD registers (all of V0..V7 and V16..V31, and the upper halves of
+/// V8..V15) -- but not X19..X29, which the callee preserves. It calls
+/// `helper(cpu, site)`, which performs the access on the state's copies of
+/// the registers; on success it reloads the same set and returns to the
+/// site with `RET`, so the CPU's return prediction stays paired with the
+/// site's `BL`. The site then reloads whichever of X15..X17 and X19..X29 the
+/// instruction names. On a fault the helper has recorded the exception, so
+/// the stub saves the rest of the registers and leaves through the epilogue.
 pub fn mem_stub(asm: &mut Asm, helper: u64) {
-    asm.emit(str_imm(3, 30, SP, offsets::SLOW_SITE));
-    for n in (0..18).step_by(2) {
+    asm.emit(str_imm(3, 17, SP, offsets::SLOW_SITE));
+    asm.emit(str_imm(3, 30, SP, offsets::SLOW_RET));
+    for n in (0..14).step_by(2) {
         asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
     }
+    asm.emit(str_imm(3, 14, SP, offsets::x(14)));
     asm.emit(mrs(0, NZCV));
     asm.emit(str_imm(3, 0, SP, offsets::NZCV));
     save_vectors(asm);
@@ -120,25 +135,19 @@ pub fn mem_stub(asm: &mut Asm, helper: u64) {
     load_vectors(asm);
     asm.emit(ldr_imm(3, 0, SP, offsets::NZCV));
     asm.emit(msr(NZCV, 0));
-    asm.emit(ldr_imm(3, 16, SP, offsets::SLOW_SITE));
-    asm.emit(ldrsw_imm(17, 16, 4));
-    asm.emit(add_reg(true, 16, 16, 17, LSL, 0));
-    for n in (0..16).step_by(2) {
+    for n in (0..14).step_by(2) {
         asm.emit(ldp(n, n + 1, SP, offsets::x(n) as i32));
     }
-    asm.emit(ldr_imm(3, 17, SP, offsets::x(17)));
+    asm.emit(ldr_imm(3, 14, SP, offsets::x(14)));
+    asm.emit(ldr_imm(3, 16, SP, offsets::SLOW_RET));
     asm.emit(ldr_imm(3, 30, SP, offsets::x(30)));
-    asm.emit(br(16));
+    asm.emit(ret_reg(16));
 
     asm.bind(fault);
-    // X0..X17, X30, the flags and the vectors are in the state already; X19..
-    // X29 still hold the guest's values (the call preserved them).
-    let mut n = 19;
-    while n <= 27 {
-        asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
-        n += 2;
-    }
-    asm.emit(str_imm(3, 29, SP, offsets::x(29)));
+    // X0..X14, X30, the flags and the vectors are in the state already, and
+    // X15..X17 always were; X19..X29 still hold the guest's values (the call
+    // preserved them).
+    save_x19_to_x29(asm);
     asm.emit(ldr_imm(3, 0, SP, offsets::EPILOGUE));
     asm.emit(br(0));
 }
@@ -163,66 +172,110 @@ fn call_rust(asm: &mut Asm, helper: u64, with_site: bool) {
     asm.emit(mov_sp(SP, 2)); // SP = &state
 }
 
-/// The jump-cache lookup for code at `el`, shared by every indirect branch and
-/// every direct branch to another page. A site reaches it with `B` after
-/// storing guest X15..X17 to their home slots and putting the target guest PC
-/// in X16. The cache is direct-mapped by PC; a hit branches to the target
-/// block's entry (which restores X15 and X16), and a miss -- or a pending exit
+/// The jump-cache lookups for code at `el`, shared by every indirect branch
+/// and every direct branch to another page. A site reaches one with `B` with
+/// guest X15..X17 in their slots and the target guest PC in X16. The cache is
+/// direct-mapped by PC; a hit sets the page of the target (`PAGE_VA`) and
+/// branches to the target block's entry, and a miss -- or a pending exit
 /// request, so a loop through indirect branches cannot keep the CPU from its
 /// dispatcher -- leaves with a Branch exit to the target.
 ///
-/// Returns (lookup, miss) offsets in the region-relative sense of `asm.here`.
-pub fn jc_stub(asm: &mut Asm, el: u32, save: u64, stats: bool) -> (u32, u32) {
-    let at = asm.here();
+/// There are `copies` copies of the lookup, `stride` bytes apart, which jump
+/// with BR, and one more for returns (`ret`), which jumps with RET, so the
+/// CPU predicts it from its own return stack: a guest call is a host BL whose
+/// return address is the translation of the instruction after the call (see
+/// `translate::Block::emit_call`).
+pub fn jc_stubs(asm: &mut Asm, el: u32, save: u64, stats: bool, copies: usize) -> JcStubs {
     let miss = asm.label();
     let kicked = asm.label();
-    asm.emit(str_imm(3, JUMP_REG, SP, offsets::NEXT_PC));
-    if stats {
-        asm.emit(ldr_imm(3, 17, SP, offsets::JC_LOOKUPS));
-        asm.emit(add_imm(true, 17, 17, 1, false));
-        asm.emit(str_imm(3, 17, SP, offsets::JC_LOOKUPS));
-    }
-    asm.emit(ldr_imm(2, 17, SP, offsets::EXIT_REQUEST));
-    asm.cbnz(false, 17, kicked);
-    // The key: the PC, and for EL0 code the address space's context number
-    // in the top bits.
-    if el == 0 {
-        asm.emit(ldr_imm(3, 17, SP, offsets::JC_CONTEXT));
-        asm.emit(eor_reg(true, 17, 17, 16, LSL, 0));
-    } else {
-        asm.emit(mov(17, 16));
-    }
-    asm.emit(eor_reg(true, 15, 17, 17, LSR, crate::state::JC_FOLD));
-    asm.emit(ubfx(15, 15, 2, crate::state::JC_BITS));
-    asm.emit(add_ext(15, SP, 15, EXT_UXTX, 4));
-    let off = offsets::jc(el);
-    debug_assert_eq!(off & 0xfff, 0);
-    asm.emit(add_imm(true, 15, 15, off >> 12, true));
-    asm.emit(ldp(16, 15, 15, 0)); // x16 = tag, x15 = host
-    asm.emit(sub_reg(true, 16, 16, 17));
-    asm.cbnz(true, 16, miss);
-    // The target block computes guest addresses from its page.
-    asm.emit(ldr_imm(3, 16, SP, offsets::NEXT_PC));
-    asm.emit(and_imm(true, 16, 16, !0xfff));
-    asm.emit(str_imm(3, 16, SP, offsets::PAGE_VA));
-    asm.emit(mov(16, 15));
-    asm.emit(ldr_imm(3, 17, SP, offsets::x(17)));
-    asm.emit(br(16));
+    let leave = asm.label();
+    // A miss, from a lookup or from an empty entry: the key is in X17 (for
+    // EL0 code the PC and the address space's context number in the top
+    // bits) and, for EL1 code, the PC still in X16.
     asm.bind(miss);
     let miss_at = asm.here();
+    if el == 0 {
+        asm.emit(ldr_imm(3, JUMP_REG, SP, offsets::JC_CONTEXT));
+        asm.emit(eor_reg(true, JUMP_REG, JUMP_REG, 17, LSL, 0));
+    }
+    asm.emit(str_imm(3, JUMP_REG, SP, offsets::NEXT_PC));
     asm.emit(ldr_imm(3, 15, SP, offsets::JC_MISSES));
     asm.emit(add_imm(true, 15, 15, 1, false));
     asm.emit(str_imm(3, 15, SP, offsets::JC_MISSES));
+    asm.b(leave);
     asm.bind(kicked);
-    asm.emit(ldp(15, 16, SP, offsets::x(15) as i32));
-    asm.emit(ldr_imm(3, 17, SP, offsets::x(17)));
+    asm.emit(str_imm(3, JUMP_REG, SP, offsets::NEXT_PC));
+    asm.bind(leave);
     // The exit prefix, with the next PC already in place.
     asm.emit(str_imm(3, 0, SP, offsets::x(0)));
     asm.emit(str_imm(3, 30, SP, offsets::x(30)));
     asm.emit(movz(true, 0, Exit::Branch as u32, 0));
     asm.emit(str_imm(2, 0, SP, offsets::EXIT));
     asm.b_abs(save);
-    (at, miss_at)
+    let lookup = |asm: &mut Asm, ret: bool| {
+        if stats {
+            asm.emit(ldr_imm(3, 17, SP, offsets::JC_LOOKUPS));
+            asm.emit(add_imm(true, 17, 17, 1, false));
+            asm.emit(str_imm(3, 17, SP, offsets::JC_LOOKUPS));
+        }
+        asm.emit(ldr_imm(2, 17, SP, offsets::EXIT_REQUEST));
+        asm.cbnz(false, 17, kicked);
+        // The target block computes guest addresses from its page; a miss
+        // leaves for the dispatcher, which sets it again.
+        asm.emit(and_imm(true, 15, JUMP_REG, !0xfff));
+        asm.emit(str_imm(3, 15, SP, offsets::PAGE_VA));
+        // The key: the PC, and for EL0 code the address space's context
+        // number in the top bits.
+        let key = if el == 0 {
+            asm.emit(ldr_imm(3, 17, SP, offsets::JC_CONTEXT));
+            asm.emit(eor_reg(true, 17, 17, JUMP_REG, LSL, 0));
+            17
+        } else {
+            JUMP_REG
+        };
+        asm.emit(eor_reg(true, 15, key, key, LSR, crate::state::JC_FOLD));
+        asm.emit(ubfx(15, 15, 2, crate::state::JC_BITS));
+        asm.emit(add_ext(15, SP, 15, EXT_UXTX, 4));
+        let off = offsets::jc(el);
+        debug_assert_eq!(off & 0xfff, 0);
+        asm.emit(add_imm(true, 15, 15, off >> 12, true));
+        // The tag goes where the key is not.
+        let tag = if key == 17 { JUMP_REG } else { 17 };
+        asm.emit(ldp(tag, 15, 15, 0));
+        asm.emit(sub_reg(true, tag, tag, key));
+        asm.cbnz(true, tag, miss);
+        asm.emit(if ret { ret_reg(15) } else { br(15) });
+    };
+    let align = |asm: &mut Asm, to: u32| {
+        while asm.here() < to {
+            asm.emit(brk(0));
+        }
+    };
+    align(asm, asm.here().next_multiple_of(16));
+    let ret = asm.here();
+    lookup(asm, true);
+    align(asm, asm.here().next_multiple_of(16));
+    let first = asm.here();
+    lookup(asm, false);
+    let stride = (asm.here() - first).next_multiple_of(16);
+    for copy in 1..copies as u32 {
+        align(asm, first + copy * stride);
+        lookup(asm, false);
+    }
+    JcStubs {
+        first,
+        stride,
+        ret,
+        miss: miss_at,
+    }
+}
+
+/// Where `jc_stubs` put each part, as offsets from its start.
+pub struct JcStubs {
+    pub first: u32,
+    pub stride: u32,
+    pub ret: u32,
+    pub miss: u32,
 }
 
 /// How a block exit knows the next guest PC.
@@ -272,9 +325,10 @@ pub fn exit(asm: &mut Asm, save: u64, page: u64, code: u32, next: Next, info: Ex
             asm.emit(str_imm(3, SCRATCH0, SP, offsets::NEXT_PC));
         }
         Next::Reg(rn) => {
-            // X0 and X30 are saved; X18 is virtual (it never lives in the
-            // host's reserved x18) and is read from the state block.
-            if rn == 0 || rn == 18 || rn == 30 {
+            // X0 and X30 are saved, X15..X17 are in their slots, and X18 is
+            // virtual (it never lives in the host's reserved x18): those are
+            // read from the state block.
+            if rn == 0 || (15..=18).contains(&rn) || rn == 30 {
                 asm.emit(ldr_imm(3, SCRATCH0, SP, offsets::x(rn)));
             } else if rn == 31 {
                 asm.emit(movz(true, SCRATCH0, 0, 0));
@@ -306,7 +360,9 @@ pub fn exit(asm: &mut Asm, save: u64, page: u64, code: u32, next: Next, info: Ex
         asm.emit(str_imm(3, SCRATCH0, SP, offsets::EXCEPTION_SYNDROME));
     }
     if let Some(site) = info.chain_site {
-        asm.adr(SCRATCH0, site);
+        // An address literal: the site may be in the other section.
+        let literal = asm.address_literal(site);
+        asm.ldr_literal(SCRATCH0, literal);
         asm.emit(str_imm(3, SCRATCH0, SP, offsets::CHAIN_SITE));
     }
     asm.emit(movz(true, SCRATCH0, code, 0));
@@ -345,15 +401,14 @@ pub fn ldr_imm_post(size: u32, rt: Reg, rn: Reg, imm: i32) -> u32 {
     size << 30 | 0x3840_0400 | ((imm as u32 & 0x1ff) << 12) | rn << 5 | rt
 }
 
-/// LDRSW (unsigned offset).
-pub fn ldrsw_imm(rt: Reg, rn: Reg, offset: u32) -> u32 {
-    assert!(offset % 4 == 0 && offset / 4 < 4096);
-    0xb980_0000 | (offset / 4) << 10 | rn << 5 | rt
-}
-
 /// SUB (shifted register), no shift.
 pub fn sub_reg(sf: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     (sf as u32) << 31 | 0x4b00_0000 | rm << 16 | rn << 5 | rd
+}
+
+/// SUB (shifted register), 64-bit: Rd = Rn - (Rm shifted by `amount`).
+pub fn sub_reg_shifted(rd: Reg, rn: Reg, rm: Reg, shift: u32, amount: u32) -> u32 {
+    0xcb00_0000 | shift << 22 | rm << 16 | amount << 10 | rn << 5 | rd
 }
 
 #[cfg(test)]
@@ -365,8 +420,9 @@ mod tests {
         // str x2, [sp, #-16]!  and  ldr x2, [sp], #16
         assert_eq!(str_imm_pre(3, 2, SP, -16), 0xf81f0fe2);
         assert_eq!(ldr_imm_post(3, 2, SP, 16), 0xf84107e2);
-        // ldrsw x17, [x16, #4] ; sub x15, x15, x16
-        assert_eq!(ldrsw_imm(17, 16, 4), 0xb9800611);
+        // sub x15, x15, x16
         assert_eq!(sub_reg(true, 15, 15, 16), 0xcb1001ef);
+        // sub x17, x17, x16, lsr #12
+        assert_eq!(sub_reg_shifted(17, 17, 16, LSR, 12), 0xcb503231);
     }
 }

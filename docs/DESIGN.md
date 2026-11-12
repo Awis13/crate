@@ -1,7 +1,7 @@
 # Design
 
 How the pieces in [PLAN.md](PLAN.md)'s diagram meet in code, as of
-milestones 3 and 4 and the first part of milestone 5 (the C API and iOS).
+milestones 3 to 5 and the translator work of milestone 6.
 
 ## The board and the CPU backend
 
@@ -178,32 +178,61 @@ touch the machine are rewritten.
 live in the host's registers of the same number — guest X0..X30 in host
 X0..X30, the guest's NZCV, FPCR and FPSR in the host's, the guest V0..V31 in the
 host's — so a guest instruction that only moves data between registers *is*
-the same host instruction. The exception is X18, the platform register: the
+the same host instruction. The exceptions are X18, the platform register: the
 host OS reserves it and clobbers it (macOS zeroes it on preemption), so guest
 X18 lives in the state and every instruction that names it, data processing,
-SIMD transfers and memory alike, runs against a borrowed register. The host
-stack pointer does not hold the guest's; it points at the `CpuState` block, so
-translated code spills a register with a plain `STP Xn, Xm, [SP, #off]` and
-reaches every field with an immediate offset. The guest's own SP lives in the
+SIMD transfers and memory alike, runs against a borrowed register; and X15..X17,
+whose guest values live in the state wherever one block hands over to another
+(the dispatcher, a chained branch, the jump cache, the memory stub), so their
+host registers are free scratch there. A block loads one into its host register
+when an instruction names it and stores it back before it leaves, if it
+changed it. The host
+stack pointer does not hold the guest's; it points into the `CpuState` block,
+at its register slots, so translated code spills a register with a plain
+`STP Xn, Xm, [SP, #off]` and reaches every field with an immediate offset. The guest's own SP lives in the
 state too. FPCR and FPSR stay in the host's registers between runs as well as
 during them: the dispatcher does no floating point, and reading or writing
 them stalls the host.
 
-**Loads and stores** take an inline fast path. The guest address is computed
-into a borrowed host register (four are parked in scratch slots of the state),
-the page of its last byte is compared with the software-TLB entry for its
-first (direct-mapped, 8K entries of 4 KiB pages per exception level and kind of
-access), and on a hit the host does the same access — same size, sign,
-ordering, exclusivity — at the host address. A miss, a device, an access that
-crosses a page or a misaligned exclusive goes out of line to a stub shared by
-the code region, which saves what a call into Rust may clobber (X0..X17, the
-flags and the vectors, plus the instruction's own operands among X19..X29) and
-calls the slow path. The slow path performs the access on the state's copies of
-the registers and fills the TLB entry. Exclusives are a monitor (address and
-value) set by the load and a compare-and-swap at the store, CAS and the LSE
-atomics are the host's own instructions on the host address, and the slow
-path uses host atomics for all of them, so both paths are correct across
-CPUs. An access to a physical address no device claims reads as zero and
+**Loads and stores** take an inline fast path on three scratch registers. The
+guest address is computed into one, the software-TLB entry (direct-mapped, 32K
+entries of 4 KiB pages per exception level and kind of access) for the page of
+its last byte is loaded, and its tag compared with the page of its first, so an
+access that crosses a page never matches; on a hit the host runs the guest's
+own instruction — same size, sign, ordering, exclusivity — at the host
+address: a single register's load or store adds the entry's delta to the
+guest address as its register offset (`LDR Wt, [Xva, Xdelta]`), the others
+run at the host address with no offset (LDP at offset zero, the no-offset
+forms), and the host does any writeback itself. The TLBs lie below the
+address SP holds, the one for EL0 loads right below it, so code reaches that
+table's entry for an index in one instruction (`SUB Xd, SP, Xi, LSL #4`) and
+the others' in two. A run of accesses off one base register with nothing
+between them that changes it, branches or leaves (a prologue's stores, a
+structure's fields) shares one check of the page that holds them all: the
+first finds the host address of the base and keeps it in one of X15..X17, the
+others use it with their own offsets, and if the check fails each goes its own
+way, out of line. The scratch registers are X15..X17 when the access does
+not name them; otherwise the block borrows others, preferring one the rest of
+the block overwrites before reading, then one it does not name again, and puts
+a borrowed register back only when an instruction names it or the block
+leaves, so a block of several accesses borrows once. Everything is back in
+place before anything leaves the block, so the guest's registers at a fault are
+exact. A miss, a device, an access that crosses a page or a misaligned
+exclusive goes out of line to a stub shared by the code region, which saves
+what a call into Rust may clobber (X0..X14, the flags and the vectors, plus the
+instruction's own operands among X19..X29) and calls the slow path, then
+returns with RET to keep the CPU's return prediction paired with the call. The
+slow path performs the access on the state's copies of the registers and fills
+the TLB entry (a load of a page it may also write fills the store TLB too).
+Refills were 15% of a compile's time, mostly page walks: a walk cache keeps
+the descriptor one level above the pages for the 64 most recent 2 MiB
+regions, so most walks read one descriptor instead of four. It holds only
+valid descriptors, which the guest changes only by breaking them and
+invalidating their TLB entries, so it is emptied with the software TLBs.
+Exclusives are a monitor (address and value) set by the load and a
+compare-and-swap at the store, CAS and the LSE atomics are the host's own
+instructions on the host address, and the slow path uses host atomics for all
+of them, so both paths are correct across CPUs. An access to a physical address no device claims reads as zero and
 ignores writes, as on hvf.
 
 **One translation per physical page.** A block never crosses a 4 KiB page and
@@ -221,7 +250,18 @@ patches to the target block (chaining); since chains never leave a page, the
 blocks of an invalidated page take every chain into them along. Other
 branches — indirect ones, returns, and direct ones to another page — look the
 target up in a jump cache (64K entries per EL, the PC's high bits folded into
-the index), a shared stub per EL; a hit branches straight into the block. EL0
+the index), in a stub per EL; a hit branches straight into the block. Each EL
+has 32 copies of the stub, and a site branches to the one its guest address
+picks, so the CPU predicts each copy's indirect branch from the few sites
+that share it instead of one branch from all of them (a cold start of node
+took 8% fewer cycles).
+Calls (BL, BLR) do not end a block: a call is a host BL to a tail that sets the
+link and goes to the target, and the code the call returns to is translated
+right after the BL, as an entry of the block of its own (the block for that
+PC from then on). A return's lookup, in a second stub per EL, jumps to the
+entry it finds with RET, and the CPU's return stack, filled by the host BL,
+predicts it; a return was 38% of a compile's lookups, and through one shared
+indirect branch it was mostly mispredicted. EL0
 entries carry a per-CPU context number for the address space (ASID and TTBR0)
 they were filled in, so a context switch keeps them, and a TLBI of an address
 space retires its numbers instead of emptying the cache. Backward chained
@@ -256,7 +296,12 @@ while inside; the issuer posts, then reads each generation, and kicks and
 waits for any CPU that is inside (a sequentially consistent fence on each
 side makes one of them see the other). It waits only for CPUs running the
 address space a TLBI by ASID names, but tells them all, since any may hold its
-code. An instruction-cache invalidation neither kicks nor waits: another CPU is
+code. A CPU's EL0 TLBs hold only the address space it runs, so a TLBI of
+another's leaves them alone (a process exiting used to empty every CPU's), and
+a TLBI of one address looks for the pieces of a block among the entries the
+largest block it could be in may have, not every entry, once there are too many
+to list: a boot's 140 thousand of them had been most of its work. An
+instruction-cache invalidation neither kicks nor waits: another CPU is
 only promised the new code after its own context synchronization, so it is
 asked to look at its queue at its next ISB; and a page no CPU ever translated
 code from (a shared bitmap) needs no message at all, which is the usual case
@@ -275,7 +320,16 @@ macOS-only. A machine can run all its CPUs in one region, an equal slice each
 (`JitRegion::split`, `Jit::in_region`), which is how the C API runs them. A CPU
 uses at most 128 MiB of its region, the reach of the B and BL that take its
 blocks to the stubs at the start, and empties its cache when that is full; a
-block's room is checked before its branches are resolved.
+block's room is checked before its branches are resolved. Code that runs once
+or never — the memory slow paths and their literals, and the exits a chained
+branch takes until it is patched — goes in a second, cold section of the
+block. The region is used a MiB at a time: blocks fill a segment upwards from
+its start and their cold sections fill it downwards from its end, so the code
+that runs is packed together for the instruction cache while every
+conditional branch (which reaches a MiB) goes straight to its block's cold
+code. Footprint is most of what translated code costs: a profile of a compile
+had 40% of its samples on the first instruction of a block, and 32 bytes of
+padding after each block, never run, made it 17-23% slower.
 
 **On iOS** an app cannot make memory executable on its own; a debugger
 attached to it can, and StikDebug's scripts handle one `brk #0x69` stop a
@@ -303,8 +357,9 @@ product, LRCPC, JSCVT and FCMA (all of which the host runs as copies), 4, 16 and
 SVE.
 
 **Testing.** Random EL0 instruction streams — with forward branches, loops,
-calls and indirect jumps, across a page boundary, and every load/store form
-the fast path rewrites — run natively (in a child process, caught at a
+direct and indirect calls and indirect jumps, across a page boundary, every
+load/store form the fast path rewrites, and pushes, pops and arithmetic on SP
+— run natively (in a child process, caught at a
 trailing BRK through the signal machine context) and translated with the fast
 paths on and off, and the full register file and memory are compared
 (`crates/crate-jit/tests/el0_random.rs`). Two variants name X18 (natively it is
@@ -351,9 +406,11 @@ an app does, optionally on executable memory it maps itself.
 - No blob resources, so no zero-copy scanout: every frame shown is a GL
   readback and a copy to the app.
 - The translator keeps no translations across launches and shares none
-  between CPUs; each CPU has a code region of at most 128 MiB (a slice of one
-  region through the C API). The guest's 16 KiB pages still take four 4 KiB
-  TLB entries.
+  between CPUs (a second compile translates almost nothing, so sharing would
+  not speed it up); each CPU has a code region of at most 128 MiB (a slice of
+  one region through the C API). The guest's 16 KiB pages still take four
+  4 KiB TLB entries. Direct branches to another page still go through the jump
+  cache, and every access's TLB lookup is a load on the path to its data.
 - PL031 alarms never fire.
 - No block I/O thread, no virtio event-index or offloads, no PCIe.
 - Loads and stores to MMIO that the CPU cannot describe (ISV clear) stop the

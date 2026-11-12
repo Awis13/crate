@@ -347,9 +347,9 @@ impl Cpu {
                 let second = addr.wrapping_add(n);
                 let acc = if m.load { Access::Read } else { Access::Write };
                 self.state.exception_far = addr;
-                mmu::translate(&self.mem, &regs, acc_el, addr, acc)?;
+                mmu::translate_cached(&self.mem, &regs, acc_el, addr, acc, &mut self.walk)?;
                 self.state.exception_far = second;
-                mmu::translate(&self.mem, &regs, acc_el, second, acc)?;
+                mmu::translate_cached(&self.mem, &regs, acc_el, second, acc, &mut self.walk)?;
                 if m.load {
                     let a = self.load(addr, n, acc_el, &regs)?;
                     let b = self.load(second, n, acc_el, &regs)?;
@@ -412,7 +412,7 @@ impl Cpu {
     /// A plain load of `n` bytes (1 to 8) at guest `addr`.
     fn load(&mut self, addr: u64, n: u64, el: u32, regs: &MmuRegs) -> Result<u64, mmu::Fault> {
         self.state.exception_far = addr;
-        let t = mmu::translate(&self.mem, regs, el, addr, Access::Read)?;
+        let t = mmu::translate_cached(&self.mem, regs, el, addr, Access::Read, &mut self.walk)?;
         if crosses_page(addr, n, TLB_SHIFT) {
             self.counters.slow_cross += 1;
             let mut buf = [0u8; 8];
@@ -420,7 +420,13 @@ impl Cpu {
             return Ok(u64::from_le_bytes(buf));
         }
         if let Ok(ptr) = self.mem.host_range(t.pa, n) {
-            self.tlb_fill(el, TlbKind::Load, addr, &t);
+            // A page it may also write serves its stores from now on too.
+            let kind = if t.writable {
+                TlbKind::Store
+            } else {
+                TlbKind::Load
+            };
+            self.tlb_fill(el, kind, addr, &t);
             // SAFETY: host_range checked the span; an aligned access of its
             // size is one host access.
             return Ok(unsafe { read_host(ptr, n) });
@@ -438,7 +444,7 @@ impl Cpu {
         regs: &MmuRegs,
     ) -> Result<(), mmu::Fault> {
         self.state.exception_far = addr;
-        let t = mmu::translate(&self.mem, regs, el, addr, Access::Write)?;
+        let t = mmu::translate_cached(&self.mem, regs, el, addr, Access::Write, &mut self.walk)?;
         if crosses_page(addr, n, TLB_SHIFT) {
             self.counters.slow_cross += 1;
             return self.scatter(addr, &value.to_le_bytes()[..n as usize], el, regs);
@@ -495,7 +501,7 @@ impl Cpu {
         while done < buf.len() {
             let va = addr.wrapping_add(done as u64);
             self.state.exception_far = va;
-            let t = mmu::translate(&self.mem, regs, el, va, Access::Read)?;
+            let t = mmu::translate_cached(&self.mem, regs, el, va, Access::Read, &mut self.walk)?;
             let page = 1u64 << TLB_SHIFT;
             let chunk = ((page - (va & (page - 1))) as usize).min(buf.len() - done);
             if self.mem.read(t.pa, &mut buf[done..done + chunk]).is_err() {
@@ -524,13 +530,13 @@ impl Cpu {
         while done < bytes.len() {
             let va = addr.wrapping_add(done as u64);
             self.state.exception_far = va;
-            mmu::translate(&self.mem, regs, el, va, Access::Write)?;
+            mmu::translate_cached(&self.mem, regs, el, va, Access::Write, &mut self.walk)?;
             done += ((page - (va & (page - 1))) as usize).min(bytes.len() - done);
         }
         let mut done = 0usize;
         while done < bytes.len() {
             let va = addr.wrapping_add(done as u64);
-            let t = mmu::translate(&self.mem, regs, el, va, Access::Write)?;
+            let t = mmu::translate_cached(&self.mem, regs, el, va, Access::Write, &mut self.walk)?;
             let chunk = ((page - (va & (page - 1))) as usize).min(bytes.len() - done);
             if self.mem.write(t.pa, &bytes[done..done + chunk]).is_err() {
                 for k in 0..chunk {
@@ -666,7 +672,7 @@ impl Cpu {
         write: bool,
     ) -> Result<(), mmu::Fault> {
         let acc = if write { Access::Write } else { Access::Read };
-        let t = mmu::translate(&self.mem, regs, el, addr, acc)?;
+        let t = mmu::translate_cached(&self.mem, regs, el, addr, acc, &mut self.walk)?;
         let n = m.total as u64;
         let ram = self.mem.host_range(t.pa, n).ok();
         if ram.is_some() {
@@ -847,7 +853,7 @@ impl Cpu {
             self.watchpoint(va, 64, true)?;
         }
         self.state.exception_far = va;
-        let t = mmu::translate(&self.mem, &regs, el, va, Access::Write)?;
+        let t = mmu::translate_cached(&self.mem, &regs, el, va, Access::Write, &mut self.walk)?;
         if self.mem.fill(t.pa, 64, 0).is_ok() {
             self.tlb_fill(el, TlbKind::Store, va, &t);
             return Ok(());
@@ -865,7 +871,7 @@ impl Cpu {
             return;
         }
         let acc = if write { Access::Write } else { Access::Read };
-        if let Ok(t) = mmu::translate(&self.mem, regs, el, addr, acc) {
+        if let Ok(t) = mmu::translate_cached(&self.mem, regs, el, addr, acc, &mut self.walk) {
             let kind = if write { TlbKind::Store } else { TlbKind::Load };
             self.tlb_fill(el, kind, addr, &t);
         }
@@ -891,7 +897,7 @@ impl Cpu {
         };
         for &k in kinds {
             let ti = tlb_index(el, k);
-            let i = TlbEntry::index(va);
+            let i = TlbEntry::index(ti, va);
             self.state.tlb[ti].entries[i] = TlbEntry {
                 tag: TlbEntry::tag_for(va),
                 delta,

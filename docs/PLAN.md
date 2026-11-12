@@ -56,7 +56,7 @@ Each ends in something that runs.
 | 3 | Full system on `jit`: several CPUs, TLB maintenance across CPUs, exclusives, self-modifying code | Debian boots on 4 CPUs; benchmark outputs byte-identical to native; faster than QEMU's TCG |
 | 4 | GPU, display, input: virtio-gpu 2D and virgl (virglrenderer over ANGLE), keyboard and tablet | aTerm's desktops, Chrome and Claude Code run under `crate-run` on a Mac |
 | 5 | iOS: XCFramework, iOS executable-memory provider, aTerm adopts crate beside its current engines | Debian and Omarchy on a device pass aTerm's checklist: console, SSH tabs, forwards, desktop, resolution change, Claude Code |
-| 6 | Speed: 16 KB-page guest kernels, Linux paravirtual hooks (TLB flushes, idle), guest memory mapped by the host MMU, translations kept across launches | targets set from the milestone 3 measurements |
+| 6 | Speed: the translator's own costs first (scratch registers for loads and stores, cold code apart, predicted returns), then 16 KB-page guest kernels, Linux paravirtual hooks (TLB flushes, idle), guest memory mapped by the host MMU, translations kept across launches | on an M3, jit, 4 CPUs: every line of crate-bench ties (medians of 3, within about 5%) or beats the other translator its README compares, every output hash unchanged, kvm-unit-tests as before; on the iPhone, Debian still at its prompt in about 7 s and its desktop in about 8.4 s |
 | 7 | Ready to publish: device and machine interfaces frozen as v1, documentation, a minimal sample app | the owner decides to open the repository |
 | later | Other guests (macOS) as machines of their own | |
 
@@ -115,6 +115,64 @@ stopped responding after two desktop restarts in quick succession, with the
 guest short of memory; it did not happen again on the phone or on a Mac at
 the same memory. Forwarded sockets no longer raise SIGPIPE when a connection's
 other end has gone.
+
+Milestone 6's targets were met on the Mac on 2026-11-11. The speed came from
+the translator's own costs, which a profile of a compile showed were most of
+its time: loads and stores spilled and reloaded four registers each, every
+block entered through the jump cache stalled on its first instruction, and
+half of the code was cold. Guest X15..X17 now live in the state between
+blocks, so the memory fast path has three scratch registers whenever an access
+does not name them, borrows others only otherwise and puts them back lazily,
+and runs every access at its host address with no offset; code that runs once
+or never goes to the far end of a CPU's code region, so the code that runs is
+packed for the instruction cache; and a call is a host BL whose return address
+is the translation of the instruction after it, so a return jumps there with
+RET and the CPU predicts it. On jit with 4 CPUs and 4 GB, crate-bench's single
+pass takes 34.8-36.4 s (milestone 3: 73-81 s; QEMU's TCG 130.5; native 9),
+gcc -O2 10.0-10.6 s (22-26), four compiles at once 15.0-16.8 s (48-49), xz -T4
+16.6 s (34-38) and 1000 spawns 0.7-0.8 s (1.6-2.1), with every output hash
+unchanged and the kvm-unit-tests passing or skipping as before. Debian reaches
+a root prompt in 7.0 s on the Mac (4 CPUs), Chrome's V8 gives the same results
+faster, and Omarchy boots. On the iPhone (aTerm crate with this code, Debian,
+jit, 3 CPUs, 1950 MiB, two launches) the root prompt came 5.4-5.7 s after
+launch (milestone 5: 6.6-7.0) and the desktop 6.5 s (8.2-8.4); in the guest,
+every output matching the Mac's, sha256 of 100 MB took 85-90 ms, a perl loop
+of 3 million 410-421 ms, sorting 300 thousand lines 87-101 ms, gzip and gunzip
+of 50 MB 416-426 ms, three sha256 of 50 MB at once 95-108 ms and `claude
+--version` 111-164 ms. PLAN's own items for this milestone remain: 16
+KB-page guest kernels, paravirtual TLB flushes and idle, guest memory mapped
+by the host MMU, translations kept across launches; so do a code cache shared
+by the CPUs and chained branches to another page. The largest cost left in a
+compile is the TLB lookup, a load on the path to every access's data.
+
+The milestone's goal then became to tie or beat the other translator
+crate-bench compares on every line, which it does on the Mac since
+2026-11-11 (medians of 3, M3 MacBook Air under the user's other work): boot
+2.9 s (5.27), gcc -O2 8.0 s (9.34), gcc again 7.6-8.3 (8.16), node -e 0 0.42-0.43
+(0.42), node's integer loop 0.52-0.55 (0.59), its FP loop 0.92-0.95 (1.03),
+python 1.45-1.56 (1.96), awk 0.65-0.73 (0.72), xz 1.41-1.43 (1.79), sha256
+0.05 (0.07), find 0.49-0.53 (0.59), 1000 spawns 0.54 (3.39), the whole pass
+27-31 s (36.1); four compiles at once 12.4-15.8 s (21.4), xz -T4 12.7-16.0
+(18.2), 4 x 250 spawns 0.20 (1.88); an idle shell 0.65% of a core (2.1%).
+Wall time on that machine is too noisy for a few percent, so changes were
+judged by the process's retired cycles over repeated compiles. What did it:
+footprint first (32 bytes of never-run padding per block made gcc 17-23%
+slower), so slow paths moved into the same MiB segment as their block and the
+trampolines left the code that runs, single loads and stores take the TLB
+delta as a register offset, and the EL0 load TLB sits right below SP; 32
+copies of the jump-cache stub per EL, so each indirect branch is predicted
+from few sites; and the TLB refills, 15% of a compile, which a page-walk cache
+and a larger TLB cut, while TLB invalidations stopped scanning whole tables
+(a boot's work fell by two thirds). A code cache shared by the CPUs was
+measured not to matter: a second compile translates almost nothing. On the
+iPhone (aTerm crate with this code, Debian, jit, 3 CPUs, 1950 MiB, launched
+through StikDebug) the root prompt came 5.3 s after launch and the desktop
+6.3 s, with labwc and xfce4-panel running and no faults; in the guest, every
+output matching the Mac's, sha256 of 100 MB took 84 ms, the perl loop 312 ms
+(410-421 after the first three steps), sorting 72 ms, gzip and gunzip of 50 MB
+363 ms, three sha256 at once 81 ms, `claude --version` 165 ms, and headless
+Chrome ran a V8 loop of 10 million to the expected result in 2.4 s, Chrome's
+start included.
 
 ## How aTerm adopts it
 
