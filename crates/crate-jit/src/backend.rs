@@ -264,6 +264,10 @@ pub(crate) struct TlbBook {
     large: [[Filled; 2]; 4],
     /// Some upper-half entry is non-global (only with a split kernel map).
     ng_high: [bool; 4],
+    /// Some entry is global or in the upper half: one a TLBI for another
+    /// address space can still reach (in the EL0 TLBs, which otherwise hold
+    /// only the running address space's lower-half translations).
+    shared: [bool; 4],
     /// The largest mapping any entry came from, as log2 of its size (0 for
     /// none larger than an entry), so an invalidation of one address looks
     /// for the pieces of a block only among the entries the largest block
@@ -287,6 +291,7 @@ impl TlbBook {
                 [Filled::new(), Filled::new()],
             ],
             ng_high: [false; 4],
+            shared: [false; 4],
             max_shift: [0; 4],
         }
     }
@@ -301,6 +306,9 @@ impl TlbBook {
         } else if !global {
             self.ng_high[tlb] = true;
         }
+        if high || global {
+            self.shared[tlb] = true;
+        }
         if shift > crate::state::TLB_SHIFT as u8 {
             self.large[tlb][high as usize].push(i);
             self.max_shift[tlb] = self.max_shift[tlb].max(shift);
@@ -313,6 +321,7 @@ impl TlbBook {
         self.large[tlb][0].clear();
         self.large[tlb][1].clear();
         self.ng_high[tlb] = false;
+        self.shared[tlb] = false;
         self.max_shift[tlb] = 0;
     }
 }
@@ -329,23 +338,38 @@ enum TlbList {
 /// lookups, emptied (by moving to a new generation) by every TLB
 /// invalidation.
 struct FetchTlb {
-    /// Per EL and entry: (page | 1 for valid, physical page, mapping size,
-    /// generation).
+    /// Per EL and entry: (page | 1 for valid, physical page, mapping size
+    /// with `FETCH_GLOBAL` for a global mapping, generation).
     entries: Box<[[FetchEntry; 256]; 2]>,
     generation: u32,
 }
 
 type FetchEntry = (u64, u64, u32, u32);
 
+const FETCH_GLOBAL: u32 = 1 << 8;
+
+/// How many context numbers there are. The number goes in an EL0 jump-cache
+/// tag's top 16 bits, which a PC's own are all zeros or all ones; two numbers
+/// below 0x8000 never differ by all ones, so no two (PC, context) pairs make
+/// the same tag.
+const CONTEXTS: u16 = 0x8000;
+
 impl FetchTlb {
-    fn lookup(&self, el: u32, va: u64) -> Option<(u64, u32)> {
+    /// The physical address `va` fetches from, the log2 size of its mapping,
+    /// and whether the mapping is global.
+    fn lookup(&self, el: u32, va: u64) -> Option<(u64, u32, bool)> {
         let e = &self.entries[el.min(1) as usize][((va >> 12) & 255) as usize];
-        (e.0 == (va >> 12 << 1 | 1) && e.3 == self.generation).then_some((e.1 | (va & 0xfff), e.2))
+        (e.0 == (va >> 12 << 1 | 1) && e.3 == self.generation).then_some((
+            e.1 | (va & 0xfff),
+            e.2 & !FETCH_GLOBAL,
+            e.2 & FETCH_GLOBAL != 0,
+        ))
     }
 
-    fn insert(&mut self, el: u32, va: u64, pa: u64, size_shift: u32) {
+    fn insert(&mut self, el: u32, va: u64, t: &mmu::Translation) {
+        let size = t.size_shift | if t.global { FETCH_GLOBAL } else { 0 };
         self.entries[el.min(1) as usize][((va >> 12) & 255) as usize] =
-            (va >> 12 << 1 | 1, pa & !0xfff, size_shift, self.generation);
+            (va >> 12 << 1 | 1, t.pa & !0xfff, size, self.generation);
     }
 
     fn clear(&mut self) {
@@ -367,6 +391,9 @@ struct JcBook {
     /// The EL1 cache holds code from the lower half of the address space
     /// (TTBR0), which a change of TTBR0 makes stale.
     el1_low: bool,
+    /// The EL0 cache holds code from a global mapping or from the upper half
+    /// of the address space, which a TLBI for any address space reaches.
+    el0_shared: bool,
     /// The blocks (mapping size, VA >> size) larger than a page that cached
     /// code came from, so a TLBI inside one drops the cache; `None` once too
     /// many to track, when any TLBI does.
@@ -378,6 +405,11 @@ struct JcBook {
     /// retiring a context's number drops them all at once.
     contexts: HashMap<(u16, u64), u16, BuildHasherDefault<FastHasher>>,
     next_context: u16,
+    /// The EL1 cache's generation (see `CpuState::jc_key`).
+    generation: u16,
+    /// Context numbers or generations are about to be reused: every guarded
+    /// chain's key must be forgotten before translated code runs again.
+    forget_chains: bool,
 }
 
 /// Debug switches read once from the environment.
@@ -418,6 +450,8 @@ pub(crate) struct Counters {
     pub jc_lookups: u64,
     pub jc_flush_reason: [u64; 6],
     pub chain_exits: u64,
+    /// Guarded chains to another page patched (or given a new key).
+    pub guarded_chains: u64,
     pub slow_device: u64,
     pub slow_cross: u64,
     pub slow_fault: u64,
@@ -500,10 +534,13 @@ impl Cpu {
                 filled: [Filled::new(), Filled::new()],
                 pages: [HashSet::default(), HashSet::default()],
                 el1_low: false,
+                el0_shared: false,
                 large: [Some(Vec::new()), Some(Vec::new())],
                 miss: [0; 2],
                 contexts: HashMap::default(),
                 next_context: 1,
+                generation: 0,
+                forget_chains: false,
             },
             vtimer_line: false,
             ptimer_line: false,
@@ -569,11 +606,16 @@ impl Cpu {
             // SAFETY: the state is a stable heap box; the enter trampoline runs
             // the block at `target` and returns the exit code.
             let code = unsafe { crate_jit_enter(&mut *self.state) } as u32;
+            let missed = self.take_pending_chain(cache, epoch);
             match Exit::from_u32(code) {
                 Some(Exit::Branch) | Some(Exit::WaitForInterrupt) | Some(Exit::WaitForEvent) => {
                     self.state.pc = self.state.next_pc;
-                    if self.state.chain_site != 0 && cacheable {
-                        chain = Some((self.state.chain_site, epoch));
+                    let site = match self.state.chain_site {
+                        0 => missed,
+                        site => Some(site),
+                    };
+                    if let (Some(site), true) = (site, cacheable) {
+                        chain = Some((site, epoch));
                     }
                 }
                 Some(Exit::Call) => {
@@ -644,8 +686,17 @@ impl Cpu {
 
     /// The host entry of the block for the current PC, translating it if
     /// needed, and whether it is a normal (cached) block. A pending chain from
-    /// the previous block's exit is patched to it.
+    /// the previous block's exit is patched to it. Everything the code cache
+    /// wrote meanwhile is then made visible to instruction fetch, at once,
+    /// for the translated code to run next.
     fn next_block(&mut self, cache: &mut CodeCache, chain: Option<(u64, u64)>) -> (u64, bool) {
+        let next = self.find_block(cache, chain);
+        self.forget_chains(cache);
+        cache.sync();
+        next
+    }
+
+    fn find_block(&mut self, cache: &mut CodeCache, chain: Option<(u64, u64)>) -> (u64, bool) {
         let pc = self.state.pc;
         let el = self.el();
         let debug = self.debug_active();
@@ -656,7 +707,7 @@ impl Cpu {
             stubs: *cache.stubs(),
             mpidr: self.mpidr,
         };
-        let (pa, size_shift) = match self.fetch.lookup(el, pc) {
+        let (pa, size_shift, global) = match self.fetch.lookup(el, pc) {
             Some(hit) => hit,
             None => match mmu::translate_cached(
                 &self.mem,
@@ -667,8 +718,8 @@ impl Cpu {
                 &mut self.walk,
             ) {
                 Ok(t) => {
-                    self.fetch.insert(el, pc, t.pa, t.size_shift);
-                    (t.pa, t.size_shift)
+                    self.fetch.insert(el, pc, &t);
+                    (t.pa, t.size_shift, t.global)
                 }
                 Err(f) => return (cache.fetch_fault(pc, f.fsc, ctx), false),
             },
@@ -713,19 +764,25 @@ impl Cpu {
                 if cache.epoch() != epoch {
                     // The region filled and was emptied: every jump-cache
                     // entry points at code that is gone.
-                    self.jc_flush(0);
-                    self.jc_flush(1);
+                    self.code_dropped();
                 }
                 e
             }
         };
-        if let Some((site, epoch)) = chain {
-            cache.chain(site, epoch, entry);
+        let el_i = el.min(1) as usize;
+        let cached = cache.fast && !debug && pc & 3 == 0;
+        match chain {
+            Some((site, epoch)) if site & 1 == 0 => cache.chain(site, epoch, entry),
+            // A guarded chain, for the key of the jump-cache entry made next.
+            Some((site, epoch)) if cached => {
+                self.counters.guarded_chains += 1;
+                cache.chain_guarded(site & !1, epoch, entry, pc ^ self.state.jc_key[el_i]);
+            }
+            _ => {}
         }
-        if cache.fast && !debug && pc & 3 == 0 {
-            let el_i = el.min(1) as usize;
+        if cached {
             let tag = if el_i == 0 {
-                pc ^ self.state.jc_context
+                pc ^ self.state.jc_key[0]
             } else {
                 pc
             };
@@ -748,14 +805,76 @@ impl Cpu {
             if el_i == 1 && pc >> 55 == 0 {
                 self.jc.el1_low = true;
             }
+            if el_i == 0 && (global || pc >> 55 != 0) {
+                self.jc.el0_shared = true;
+            }
         }
         (entry, true)
+    }
+
+    /// Forgets every guarded chain's key if the numbers in them are about to
+    /// be reused: before any translated code runs again.
+    fn forget_chains(&mut self, cache: &mut CodeCache) {
+        if self.jc.forget_chains {
+            self.jc.forget_chains = false;
+            cache.forget_chains();
+        }
+    }
+
+    /// After a run of translated code: a guarded chain whose guard failed but
+    /// whose jump-cache lookup hit is patched to what it found (nothing can
+    /// have changed its key since: only the dispatcher does); one whose lookup
+    /// missed is returned, marked, to patch once the block it left for is
+    /// found.
+    fn take_pending_chain(&mut self, cache: &mut CodeCache, epoch: u64) -> Option<u64> {
+        let site = std::mem::take(&mut self.state.pending_site);
+        if site == 0 {
+            return None;
+        }
+        let host = std::mem::take(&mut self.state.pending_host);
+        if host == 0 {
+            return Some(site | 1);
+        }
+        // The lookup's own key: for EL0 code the guard's, for EL1 the PC.
+        let key = match self.el() {
+            0 => self.state.pending_key,
+            _ => self.state.pending_key ^ self.state.jc_key[1],
+        };
+        self.counters.guarded_chains += 1;
+        cache.chain_guarded(site, epoch, host, key);
+        None
     }
 
     // ---------------------------------------------------------------- TLB and jump cache
 
     /// Empties the jump cache for `el`.
     fn jc_flush(&mut self, el: usize) {
+        self.jc_clear(el);
+        // Guarded chains compare keys with these numbers in them, so the
+        // ones in use go: every EL0 context's, and the EL1 generation.
+        if el == 0 {
+            self.jc.contexts.clear();
+            self.context_changed();
+        } else {
+            self.jc.generation += 1;
+            if self.jc.generation == CONTEXTS {
+                self.jc.generation = 0;
+                self.jc.forget_chains = true;
+            }
+            self.state.jc_key[1] = (self.jc.generation as u64) << 48;
+        }
+    }
+
+    /// Translated code was dropped: so are the jump caches' entries, some of
+    /// which may lead to it. The guards of chains into it fail by themselves
+    /// (the code cache resets their keys), so the keys' numbers stay.
+    fn code_dropped(&mut self) {
+        self.jc_clear(0);
+        self.jc_clear(1);
+    }
+
+    /// Empties the entries of the jump cache for `el`.
+    fn jc_clear(&mut self, el: usize) {
         self.counters.jc_flushes += 1;
         let miss = self.jc.miss[el];
         let entries = &mut self.state.jc[el].entries;
@@ -767,6 +886,8 @@ impl Cpu {
         self.jc.large[el] = Some(Vec::new());
         if el == 1 {
             self.jc.el1_low = false;
+        } else {
+            self.jc.el0_shared = false;
         }
     }
 
@@ -804,8 +925,6 @@ impl Cpu {
         self.walk.clear();
         self.jc_flush(0);
         self.jc_flush(1);
-        self.jc.contexts.clear();
-        self.context_changed();
     }
 
     /// Drops the data translations of the lower half of the address space (a
@@ -852,11 +971,13 @@ impl Cpu {
         let ctx = match self.jc.contexts.get(&key) {
             Some(&c) => c,
             None => {
-                if self.jc.next_context == u16::MAX {
-                    // Out of numbers: forget every context.
+                if self.jc.next_context == CONTEXTS {
+                    // Out of numbers: forget every context, and every
+                    // chain's key with one in it.
                     self.jc.contexts.clear();
                     self.jc.next_context = 1;
-                    self.jc_flush(0);
+                    self.jc_clear(0);
+                    self.jc.forget_chains = true;
                 }
                 let c = self.jc.next_context;
                 self.jc.next_context += 1;
@@ -864,20 +985,19 @@ impl Cpu {
                 c
             }
         };
-        self.state.jc_context = (ctx as u64) << 48;
+        self.state.jc_key[0] = (ctx as u64) << 48;
     }
 
     /// Retires the context numbers of address space `asid` (every one with
     /// `None`), so their EL0 jump-cache entries never match again.
     fn retire_contexts(&mut self, asid: Option<u16>) {
         match asid {
-            Some(a) => self.jc.contexts.retain(|&(ctx_asid, _), _| ctx_asid != a),
-            None => {
-                self.jc.contexts.clear();
-                self.jc_flush(0);
+            Some(a) => {
+                self.jc.contexts.retain(|&(ctx_asid, _), _| ctx_asid != a);
+                self.context_changed();
             }
+            None => self.jc_flush(0),
         }
-        self.context_changed();
     }
 
     /// Drops every non-global translation of address space `asid` (TLBI
@@ -910,11 +1030,13 @@ impl Cpu {
     fn flush_va(&mut self, va: u64, asid: Option<u16>) {
         let page = va >> 12;
         let half = ((va >> 55) & 1) as usize;
-        // The EL0 TLBs hold lower-half translations of the running address
-        // space only.
+        // The EL0 TLBs hold the running address space's lower-half
+        // translations, and only those unless they hold a global or an
+        // upper-half one, which a TLBI for any address space reaches.
         let other = half == 1 || asid.is_some_and(|a| self.asid.is_some_and(|r| r != a));
         for t in 0..4 {
-            if other && (t == tlb_index(0, TlbKind::Load) || t == tlb_index(0, TlbKind::Store)) {
+            let el0 = t == tlb_index(0, TlbKind::Load) || t == tlb_index(0, TlbKind::Store);
+            if other && el0 && !self.tlbs.shared[t] {
                 continue;
             }
             let i = TlbEntry::index(t, va);
@@ -952,7 +1074,9 @@ impl Cpu {
             if in_large || self.jc.pages[el].contains(&page) {
                 self.counters.jc_flush_reason[3] += 1;
                 if el == 0 && half == 0 {
-                    self.retire_contexts(asid);
+                    // A TLBI for one address space also drops global
+                    // translations, which every address space shares.
+                    self.retire_contexts(if self.jc.el0_shared { None } else { asid });
                 } else {
                     self.jc_flush(el);
                 }
@@ -969,14 +1093,12 @@ impl Cpu {
             Remote::CodePage(pa) => {
                 if cache.invalidate_page(pa) {
                     self.counters.jc_flush_reason[4] += 1;
-                    self.jc_flush(0);
-                    self.jc_flush(1);
+                    self.code_dropped();
                 }
             }
             Remote::CodeAll => {
                 cache.reset();
-                self.jc_flush(0);
-                self.jc_flush(1);
+                self.code_dropped();
             }
         }
     }
@@ -1168,6 +1290,7 @@ impl Cpu {
             // SAFETY: the state is a stable heap box for the whole dispatch run.
             let code = unsafe { crate_jit_enter(&mut *self.state) } as u32;
             smp.leave(self.cpu);
+            let missed = self.take_pending_chain(cache, epoch);
             // One instruction ran: leave active-pending unless it faulted.
             if stepping_now
                 && !matches!(
@@ -1206,8 +1329,12 @@ impl Cpu {
             match Exit::from_u32(code) {
                 Some(Exit::Branch) => {
                     self.state.pc = self.state.next_pc;
-                    if self.state.chain_site != 0 && cacheable {
-                        chain = Some((self.state.chain_site, epoch));
+                    let site = match self.state.chain_site {
+                        0 => missed,
+                        site => Some(site),
+                    };
+                    if let (Some(site), true) = (site, cacheable) {
+                        chain = Some((site, epoch));
                     }
                 }
                 Some(Exit::WaitForInterrupt) => {
@@ -1223,8 +1350,7 @@ impl Cpu {
                     if self.state.flush_cache != 0 {
                         self.state.flush_cache = 0;
                         cache.reset();
-                        self.jc_flush(0);
-                        self.jc_flush(1);
+                        self.code_dropped();
                     }
                 }
                 Some(Exit::Call) => {
@@ -2595,6 +2721,146 @@ mod tests {
         put(&mut cpu, t, va, 12, false);
         cpu.flush_va(va, None);
         assert!(!holds(&cpu, t, va), "every address space's");
+    }
+
+    #[test]
+    fn a_tlbi_for_another_address_space_still_drops_shared_el0_entries() {
+        let (mut cpu, _, _, _) = two_page_cpu();
+        cpu.state.mmu.ttbr0_el1 |= 5 << 48;
+        cpu.context_changed();
+        let t = tlb_index(0, TlbKind::Load);
+        // A global lower-half mapping, and an upper-half one EL0 may use:
+        // TLBI VAE1 for ASID 7 reaches both.
+        let (low, high) = (0x7_0000_1000u64, 0xffff_0000_0000_3000u64);
+        put(&mut cpu, t, low, 12, true);
+        put(&mut cpu, t, low + 0x1000, 12, false);
+        cpu.flush_va(low, Some(7));
+        assert!(!holds(&cpu, t, low), "a global translation");
+        put(&mut cpu, t, high, 12, false);
+        cpu.flush_va(high, Some(7));
+        assert!(!holds(&cpu, t, high), "an upper-half translation");
+        assert!(holds(&cpu, t, low + 0x1000), "another page");
+        // The jump cache: EL0 code of the page, from a private mapping, then
+        // from a global one.
+        cpu.jc.pages[0].insert(low >> 12);
+        let context = cpu.state.jc_key[0];
+        cpu.flush_va(low, Some(7));
+        assert_eq!(cpu.state.jc_key[0], context, "another address space's");
+        cpu.jc.pages[0].insert(low >> 12);
+        cpu.jc.el0_shared = true;
+        cpu.flush_va(low, Some(7));
+        assert_ne!(cpu.state.jc_key[0], context, "a global mapping's code");
+    }
+
+    /// EL0 code in two pages, A and B, that loops A -> B -> A three times, so
+    /// both branches between the pages are chained and then taken chained.
+    /// Page B is a different frame in each of two address spaces, and is
+    /// remapped, rewritten and invalidated between runs: every run must see
+    /// the B the architecture says it fetches.
+    #[test]
+    fn chains_to_another_page_follow_the_mapping_of_their_target() {
+        use crate::asm;
+        use crate_core::memory::{HeapRam, RamBlock};
+        const RAM: u64 = 0x4000_0000;
+        let block: Arc<dyn RamBlock> = Arc::new(HeapRam::new(0x10_0000).unwrap());
+        let mem = Arc::new(GuestMemory::new(vec![(RAM, block)]).unwrap());
+        let (va_a, va_b) = (0x10_0000u64, 0x10_3000u64);
+        let (pa_a, pa_b1, pa_b2) = (RAM + 0x1000, RAM + 0x2000, RAM + 0x3000);
+        let words = |at: u64, words: &[u32]| {
+            for (i, &w) in words.iter().enumerate() {
+                mem.write_u32(at + 4 * i as u64, w).unwrap();
+            }
+        };
+        // A: x1 += 1; b B.  B: x0 += k; cmp x1, #3; b.ne A; brk #id.
+        words(
+            pa_a,
+            &[
+                asm::add_imm(true, 1, 1, 1, false),
+                asm::b((va_b - va_a - 4) as i64),
+            ],
+        );
+        let b_code = |k: u32, id: u32| {
+            [
+                asm::add_imm(true, 0, 0, k, false),
+                0xf100_0c3f, // subs xzr, x1, #3
+                asm::b_cond(asm::NE, va_a as i64 - (va_b + 8) as i64),
+                asm::brk(id),
+            ]
+        };
+        words(pa_b1, &b_code(1, 1));
+        words(pa_b2, &b_code(10, 2));
+        // Two address spaces' tables, each a frame per level.
+        let tables = |root: u64| [root, root + 0x1000, root + 0x2000, root + 0x3000];
+        let (t1, t2) = (tables(RAM + 0x8_0000), tables(RAM + 0x9_0000));
+        let leaf_slot = |t: [u64; 4], va: u64| t[3] + ((va >> 12) & 0x1ff) * 8;
+        // A page: valid, AF, AP = EL0 and EL1 read/write, executable at EL0,
+        // non-global unless `global`.
+        let leaf = |pa: u64, global: bool| pa | 3 | 1 << 10 | 1 << 6 | (!global as u64) << 11;
+        for (t, b) in [(t1, pa_b1), (t2, pa_b2)] {
+            for level in 0..3 {
+                let shift = 39 - 9 * level;
+                mem.write_u64(t[level] + ((va_a >> shift) & 0x1ff) * 8, t[level + 1] | 3)
+                    .unwrap();
+            }
+            mem.write_u64(leaf_slot(t, va_a), leaf(pa_a, false))
+                .unwrap();
+            mem.write_u64(leaf_slot(t, va_b), leaf(b, false)).unwrap();
+        }
+        let mut cpu = Cpu::new(mem.clone());
+        let mut cache = CodeCache::new(1 << 20).unwrap();
+        cpu.state.mmu = MmuRegs {
+            sctlr_el1: 1,
+            tcr_el1: 16, // T0SZ 16, TG0 4 KiB, ASIDs in TTBR0
+            ..Default::default()
+        };
+        // What an MSR to TTBR0_EL1 does.
+        let ttbr0 = |cpu: &mut Cpu, t: [u64; 4], asid: u64| {
+            cpu.state.mmu.ttbr0_el1 = t[0] | asid << 48;
+            cpu.context_changed();
+            cpu.flush_low();
+        };
+        let run = |cpu: &mut Cpu, cache: &mut CodeCache| {
+            cpu.state.pstate = 0; // EL0t
+            cpu.state.x[0] = 0;
+            cpu.state.x[1] = 0;
+            cpu.state.pc = va_a;
+            let stop = cpu.run(cache);
+            (cpu.state.x[0], stop)
+        };
+        ttbr0(&mut cpu, t1, 1);
+        assert_eq!(run(&mut cpu, &mut cache), (3, Stop::Brk(1)));
+        assert_eq!(run(&mut cpu, &mut cache), (3, Stop::Brk(1)), "chained");
+        ttbr0(&mut cpu, t2, 2);
+        assert_eq!(
+            run(&mut cpu, &mut cache),
+            (30, Stop::Brk(2)),
+            "another address space"
+        );
+        ttbr0(&mut cpu, t1, 1);
+        assert_eq!(run(&mut cpu, &mut cache), (3, Stop::Brk(1)), "back");
+        // Remapped, with TLBI VAE1 for the address space.
+        mem.write_u64(leaf_slot(t1, va_b), leaf(pa_b2, false))
+            .unwrap();
+        cpu.flush_va(va_b, Some(1));
+        assert_eq!(run(&mut cpu, &mut cache), (30, Stop::Brk(2)), "remapped");
+        // Rewritten, with IC IVAU.
+        words(pa_b2, &b_code(100, 3));
+        cpu.apply(Remote::CodePage(pa_b2), &mut cache);
+        assert_eq!(run(&mut cpu, &mut cache), (300, Stop::Brk(3)), "rewritten");
+        // A global mapping, remapped with a TLBI VAE1 for another address
+        // space, which reaches it all the same.
+        mem.write_u64(leaf_slot(t1, va_b), leaf(pa_b1, true))
+            .unwrap();
+        cpu.flush_va(va_b, Some(1));
+        assert_eq!(run(&mut cpu, &mut cache), (3, Stop::Brk(1)), "global");
+        mem.write_u64(leaf_slot(t1, va_b), leaf(pa_b2, true))
+            .unwrap();
+        cpu.flush_va(va_b, Some(2));
+        assert_eq!(
+            run(&mut cpu, &mut cache),
+            (300, Stop::Brk(3)),
+            "global, remapped"
+        );
     }
 
     #[test]

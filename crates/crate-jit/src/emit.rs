@@ -35,6 +35,9 @@ pub struct Stubs {
     pub jc_ret: [u64; 2],
     /// Where a jump-cache miss goes; also the target of an empty entry.
     pub jc_miss: [u64; 2],
+    /// The lookup a chained branch to another page goes to when its guard
+    /// fails, with the address of its literal in X15 (see `jc_stubs`).
+    pub jc_chain: [u64; 2],
 }
 
 /// How many copies of the jump-cache lookup each exception level has. A site
@@ -184,7 +187,11 @@ fn call_rust(asm: &mut Asm, helper: u64, with_site: bool) {
 /// with BR, and one more for returns (`ret`), which jumps with RET, so the
 /// CPU predicts it from its own return stack: a guest call is a host BL whose
 /// return address is the translation of the instruction after the call (see
-/// `translate::Block::emit_call`).
+/// `translate::Block::emit_call`). And one for chained branches to another
+/// page whose guard failed (`chain`): it leaves the address of the branch's
+/// literal (in X15) in `pending_site`, so the dispatcher chains the branch to
+/// what the lookup finds -- recorded in `pending_host` and `pending_key` on a
+/// hit, or the block it translates after a miss.
 pub fn jc_stubs(asm: &mut Asm, el: u32, save: u64, stats: bool, copies: usize) -> JcStubs {
     let miss = asm.label();
     let kicked = asm.label();
@@ -195,7 +202,7 @@ pub fn jc_stubs(asm: &mut Asm, el: u32, save: u64, stats: bool, copies: usize) -
     asm.bind(miss);
     let miss_at = asm.here();
     if el == 0 {
-        asm.emit(ldr_imm(3, JUMP_REG, SP, offsets::JC_CONTEXT));
+        asm.emit(ldr_imm(3, JUMP_REG, SP, offsets::jc_key(0)));
         asm.emit(eor_reg(true, JUMP_REG, JUMP_REG, 17, LSL, 0));
     }
     asm.emit(str_imm(3, JUMP_REG, SP, offsets::NEXT_PC));
@@ -212,7 +219,12 @@ pub fn jc_stubs(asm: &mut Asm, el: u32, save: u64, stats: bool, copies: usize) -
     asm.emit(movz(true, 0, Exit::Branch as u32, 0));
     asm.emit(str_imm(2, 0, SP, offsets::EXIT));
     asm.b_abs(save);
-    let lookup = |asm: &mut Asm, ret: bool| {
+    // A chain's lookup first records its site for the dispatcher, and on a
+    // hit the entry and key it found.
+    let lookup = |asm: &mut Asm, ret: bool, chain: bool| {
+        if chain {
+            asm.emit(stp(15, XZR, SP, offsets::PENDING_SITE as i32));
+        }
         if stats {
             asm.emit(ldr_imm(3, 17, SP, offsets::JC_LOOKUPS));
             asm.emit(add_imm(true, 17, 17, 1, false));
@@ -227,7 +239,7 @@ pub fn jc_stubs(asm: &mut Asm, el: u32, save: u64, stats: bool, copies: usize) -
         // The key: the PC, and for EL0 code the address space's context
         // number in the top bits.
         let key = if el == 0 {
-            asm.emit(ldr_imm(3, 17, SP, offsets::JC_CONTEXT));
+            asm.emit(ldr_imm(3, 17, SP, offsets::jc_key(0)));
             asm.emit(eor_reg(true, 17, 17, JUMP_REG, LSL, 0));
             17
         } else {
@@ -244,6 +256,9 @@ pub fn jc_stubs(asm: &mut Asm, el: u32, save: u64, stats: bool, copies: usize) -
         asm.emit(ldp(tag, 15, 15, 0));
         asm.emit(sub_reg(true, tag, tag, key));
         asm.cbnz(true, tag, miss);
+        if chain {
+            asm.emit(stp(15, key, SP, offsets::PENDING_HOST as i32));
+        }
         asm.emit(if ret { ret_reg(15) } else { br(15) });
     };
     let align = |asm: &mut Asm, to: u32| {
@@ -252,21 +267,25 @@ pub fn jc_stubs(asm: &mut Asm, el: u32, save: u64, stats: bool, copies: usize) -
         }
     };
     align(asm, asm.here().next_multiple_of(16));
+    let chain = asm.here();
+    lookup(asm, false, true);
+    align(asm, asm.here().next_multiple_of(16));
     let ret = asm.here();
-    lookup(asm, true);
+    lookup(asm, true, false);
     align(asm, asm.here().next_multiple_of(16));
     let first = asm.here();
-    lookup(asm, false);
+    lookup(asm, false, false);
     let stride = (asm.here() - first).next_multiple_of(16);
     for copy in 1..copies as u32 {
         align(asm, first + copy * stride);
-        lookup(asm, false);
+        lookup(asm, false, false);
     }
     JcStubs {
         first,
         stride,
         ret,
         miss: miss_at,
+        chain,
     }
 }
 
@@ -276,6 +295,7 @@ pub struct JcStubs {
     pub stride: u32,
     pub ret: u32,
     pub miss: u32,
+    pub chain: u32,
 }
 
 /// How a block exit knows the next guest PC.

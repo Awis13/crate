@@ -533,6 +533,8 @@ enum Literal {
     Values(Vec<u64>),
     /// The absolute address of a label.
     Address(Label),
+    /// A value, then the absolute address of a label.
+    ValueAndAddress(u64, Label),
 }
 
 impl Literal {
@@ -540,6 +542,7 @@ impl Literal {
         match self {
             Literal::Values(v) => v.len(),
             Literal::Address(_) => 1,
+            Literal::ValueAndAddress(..) => 2,
         }
     }
 }
@@ -722,6 +725,15 @@ impl Asm {
         label
     }
 
+    /// Two 64-bit words after the code of the current section: `value`, then
+    /// the address where `of` will run.
+    pub fn value_and_address_literal(&mut self, value: u64, of: Label) -> Label {
+        let label = self.label();
+        self.literals
+            .push((self.in_cold, label, Literal::ValueAndAddress(value, of)));
+        label
+    }
+
     pub fn mov_imm(&mut self, rd: Reg, value: u64) {
         let seq = mov_imm(rd, value);
         if seq.len() <= 2 {
@@ -792,6 +804,11 @@ impl Asm {
                     }
                     Literal::Address(of) => {
                         addresses.push((cold, self.here(), *of));
+                        self.emit_all([0, 0]);
+                    }
+                    &Literal::ValueAndAddress(v, of) => {
+                        self.emit_all([v as u32, (v >> 32) as u32]);
+                        addresses.push((cold, self.here(), of));
                         self.emit_all([0, 0]);
                     }
                 }
@@ -921,6 +938,16 @@ mod tests {
         assert_eq!(cold[0], ldr_literal(0, 8));
         assert_eq!(cold[1], b(0x1004 - 0x8004));
         assert_eq!(cold[2] as u64 | (cold[3] as u64) << 32, 0x1004);
+
+        let mut a = Asm::new();
+        let at = a.label();
+        a.bind(at);
+        a.emit(nop());
+        let lit = a.value_and_address_literal(0x1122_3344_5566_7788, at);
+        a.ldr_literal(0, lit);
+        let words = a.finish(0x4000);
+        assert_eq!(words[1], ldr_literal(0, 4));
+        assert_eq!(&words[2..6], &[0x5566_7788, 0x1122_3344, 0x4000, 0]);
     }
 
     #[test]

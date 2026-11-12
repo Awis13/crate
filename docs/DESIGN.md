@@ -209,9 +209,12 @@ table's entry for an index in one instruction (`SUB Xd, SP, Xi, LSL #4`) and
 the others' in two. A run of accesses off one base register with nothing
 between them that changes it, branches or leaves (a prologue's stores, a
 structure's fields) shares one check of the page that holds them all: the
-first finds the host address of the base and keeps it in one of X15..X17, the
-others use it with their own offsets, and if the check fails each goes its own
-way, out of line. The scratch registers are X15..X17 when the access does
+first finds the host address of the base and keeps it in one of X15..X17 (and
+in the state across a slow path in the stretch), the others are each a single
+host instruction at it with their own offsets, and if the check fails the
+whole stretch runs from a cold copy translated with every access through its
+own check, which rejoins the code after the stretch with every register where
+that code has it. The scratch registers are X15..X17 when the access does
 not name them; otherwise the block borrows others, preferring one the rest of
 the block overwrites before reading, then one it does not name again, and puts
 a borrowed register back only when an instruction names it or the block
@@ -246,11 +249,26 @@ library. The code cache keeps, per physical page, the blocks made from it, so
 IC IVAU drops exactly those.
 
 **Branches.** A direct branch to the same page ends in a branch the dispatcher
-patches to the target block (chaining); since chains never leave a page, the
-blocks of an invalidated page take every chain into them along. Other
-branches — indirect ones, returns, and direct ones to another page — look the
-target up in a jump cache (64K entries per EL, the PC's high bits folded into
-the index), in a stub per EL; a hit branches straight into the block. Each EL
+patches to the target block (chaining); since such chains never leave a page,
+the blocks of an invalidated page take every chain into them along. A direct
+branch or call to another page is chained too, behind a guard: one
+translation serves every address its page is mapped at, so the target may be
+another page of code each time. The guard compares a key, the target address
+with a number XORed into its top 16 bits (where a PC's own bits are all equal),
+with the key the branch was patched for, kept in a cold literal beside the
+address of the branch. The number is the EL0 jump cache's context number for
+the address space, or for EL1 a generation; either changes exactly when the
+jump cache would drop an entry for the target (a TLBI that reaches it, a
+change of TTBR0 or ASID, a flush of the cache), so the branch is taken only
+when a lookup would have found the block it goes to. Dropping a page's code
+resets the keys of the chains into it. A failed guard looks the target up
+through a variant of the jump-cache stub that records the site, and the
+dispatcher patches the branch, or only its key, when it next has the CPU back:
+nothing else can change a key meanwhile. These were half of a compile's
+lookups (gcc -O2: 8% fewer cycles; again: 12%). Other branches — indirect
+ones and returns — look the target up in a jump cache (64K entries per EL,
+the PC's high bits folded into the index), in a stub per EL; a hit branches
+straight into the block. Each EL
 has 32 copies of the stub, and a site branches to the one its guest address
 picks, so the CPU predicts each copy's indirect branch from the few sites
 that share it instead of one branch from all of them (a cold start of node
@@ -264,9 +282,11 @@ predicts it; a return was 38% of a compile's lookups, and through one shared
 indirect branch it was mostly mispredicted. EL0
 entries carry a per-CPU context number for the address space (ASID and TTBR0)
 they were filled in, so a context switch keeps them, and a TLBI of an address
-space retires its numbers instead of emptying the cache. Backward chained
-branches, jump-cache lookups and ISB test the CPU's exit request, so no loop of
-translated code keeps a CPU from its dispatcher.
+space retires its numbers instead of emptying the cache; a TLBI for one
+address space still reaches EL0 code from a global or an upper-half mapping,
+which every address space may share. Backward chained branches, jump-cache
+lookups and ISB test the CPU's exit request, so no loop of translated code
+keeps a CPU from its dispatcher.
 
 **System registers** that are plain state (TPIDR, SP_EL0, ELR, SPSR, ESR, FAR,
 VBAR, PAR, CPACR, CONTEXTIDR), the host's own (NZCV, FPCR, FPSR, and the
@@ -329,7 +349,11 @@ that runs is packed together for the instruction cache while every
 conditional branch (which reaches a MiB) goes straight to its block's cold
 code. Footprint is most of what translated code costs: a profile of a compile
 had 40% of its samples on the first instruction of a block, and 32 bytes of
-padding after each block, never run, made it 17-23% slower.
+padding after each block, never run, made it 17-23% slower. The code cache
+records the ranges it writes, and the dispatcher makes them visible to
+instruction fetch at once, with one set of barriers, right before translated
+code runs again: a block's install and the chain patched to it used to be
+three calls to `sys_icache_invalidate`, each with two DSBs and an ISB.
 
 **On iOS** an app cannot make memory executable on its own; a debugger
 attached to it can, and StikDebug's scripts handle one `brk #0x69` stop a
@@ -409,9 +433,11 @@ an app does, optionally on executable memory it maps itself.
   between CPUs (a second compile translates almost nothing, so sharing would
   not speed it up); each CPU has a code region of at most 128 MiB (a slice of
   one region through the C API). The guest's 16 KiB pages still take four
-  4 KiB TLB entries. Direct branches to another page still go through the jump
-  cache, and every access's TLB lookup is a load on the path to its data.
+  4 KiB TLB entries. Every access's TLB lookup is a load on the path to its
+  data (loading the delta apart, which the CPU can predict, cost more than it
+  gave).
 - PL031 alarms never fire.
-- No block I/O thread, no virtio event-index or offloads, no PCIe.
+- No block I/O thread (one measured no faster: the host serves the reads
+  from its cache), no virtio event-index or offloads, no PCIe.
 - Loads and stores to MMIO that the CPU cannot describe (ISV clear) stop the
   machine; Linux's accessors never make them.
