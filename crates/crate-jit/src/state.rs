@@ -299,6 +299,15 @@ pub struct CpuState {
     pub monitor: u64,
     pub monitor_value: u64,
     pub monitor_value2: u64,
+    /// A chained branch to another page whose guard failed (see
+    /// `translate::Block::goto_const`) leaves here the address of its literal
+    /// before it looks its target up in the jump cache, and on a hit the
+    /// target's block entry and jump-cache key, so the dispatcher can chain
+    /// it when the CPU next comes back, or once the target is translated.
+    pub pending_site: u64,
+    pub pending_host: u64,
+    pub pending_key: u64,
+    pub _pad1: u64,
 
     /// Guest V0..V31, 16 bytes each.
     pub v: [[u8; 16]; 32],
@@ -325,9 +334,13 @@ pub struct CpuState {
     /// CRATE_JIT_STATS=1) (statistics).
     pub jc_misses: u64,
     pub jc_lookups: u64,
-    /// XORed into an EL0 jump-cache entry's tag: the context number of the
-    /// address space in its top 16 bits (user addresses have none there).
-    pub jc_context: u64,
+    /// Per exception level, a number in the top 16 bits (where a PC's own
+    /// bits are all zeros or all ones) that a chained branch to another page
+    /// XORs into its target to make the key it compares: for EL0, the
+    /// context number of the address space, which also tags EL0 jump-cache
+    /// entries; for EL1, a generation. Either changes whenever the jump
+    /// cache would drop an entry for the target.
+    pub jc_key: [u64; 2],
     /// The real host stack top, restored into SP before calling back to Rust.
     pub host_sp: u64,
     /// This block's own address, so a helper can be handed it.
@@ -414,6 +427,8 @@ impl CpuState {
 
 // Pair loads and stores of Q registers need `v` 16-byte aligned.
 const _: () = assert!(offsets::V % 16 == 0);
+// The pending chain's site and entry are stored with STP from SP.
+const _: () = assert!(offsets::PENDING_HOST <= 504 && offsets::PENDING_HOST % 8 == 0);
 
 /// Byte offsets into `CpuState`, the contract with emitted code.
 pub mod offsets {
@@ -457,7 +472,13 @@ pub mod offsets {
     pub const HOST_SP: u32 = at(offset_of!(CpuState, host_sp));
     pub const JC_MISSES: u32 = at(offset_of!(CpuState, jc_misses));
     pub const JC_LOOKUPS: u32 = at(offset_of!(CpuState, jc_lookups));
-    pub const JC_CONTEXT: u32 = at(offset_of!(CpuState, jc_context));
+    pub const PENDING_SITE: u32 = at(offset_of!(CpuState, pending_site));
+    pub const PENDING_HOST: u32 = at(offset_of!(CpuState, pending_host));
+
+    /// The offset of `jc_key` for code at `el`.
+    pub const fn jc_key(el: u32) -> u32 {
+        at(offset_of!(CpuState, jc_key)) + 8 * if el == 0 { 0 } else { 1 }
+    }
     pub const SELF_PTR: u32 = at(offset_of!(CpuState, self_ptr));
     pub const CPU_PTR: u32 = at(offset_of!(CpuState, cpu_ptr));
     pub const DISPATCH_TARGET: u32 = at(offset_of!(CpuState, dispatch_target));
@@ -521,6 +542,8 @@ mod tests {
             offsets::SLOW_RET,
             offsets::MONITOR,
             offsets::MONITOR_VALUE,
+            offsets::jc_key(0),
+            offsets::jc_key(1),
             offsets::FPCR,
             offsets::FPSR,
             offsets::HOST_SP,
@@ -542,8 +565,14 @@ mod tests {
             offsets::EXIT_REQUEST + 4
         );
         assert_eq!(offsets::IRQ_HINT % 4, 0);
-        // Pairs of X registers and the scratch slots: STP reaches 504.
+        // Pairs of X registers, the scratch slots and the pending chain:
+        // STP reaches 504.
         assert!(offsets::x(29) <= 504 && offsets::scratch(2) <= 504);
+        assert_eq!(offsets::PENDING_HOST, offsets::PENDING_SITE + 8);
+        assert_eq!(
+            (std::mem::offset_of!(CpuState, pending_key) - offsets::ANCHOR) as u32,
+            offsets::PENDING_HOST + 8
+        );
         // Pairs of Q registers reach 1008.
         assert_eq!(offsets::V % 16, 0);
         assert!(offsets::v(30) <= 1008);

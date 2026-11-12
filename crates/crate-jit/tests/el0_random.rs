@@ -1311,17 +1311,27 @@ fn random_init(rng: &mut Rng, shared: &Shared) -> Captured {
     init
 }
 
-/// One generated stream, run natively and translated (fast and slow, and with
-/// `mmu_alias` also at a second virtual address through the MMU, sharing the
-/// first run's translations), with everything compared.
-fn check_stream(shared: &Shared, rng: &mut Rng, iter: usize, x18: bool, mmu_alias: Option<u64>) {
+/// One generated stream of `units.0` and up to `units.1` more units, run
+/// natively and translated, with everything compared. Translated, it runs
+/// fast twice with one code cache, so the second run takes the branches the
+/// first chained, and slow; or with `mmu_alias` through the MMU, at its own
+/// address and at a second one in turn, all with one code cache, so chains
+/// to another page made at one address meet the other.
+fn check_stream(
+    shared: &Shared,
+    rng: &mut Rng,
+    iter: usize,
+    x18: bool,
+    mmu_alias: Option<u64>,
+    units: (usize, usize),
+) {
     let code_off = if rng.bool() {
         0x1000 - 4 * (rng.next() % 200) as usize
     } else {
         4 * (rng.next() % 64) as usize
     };
     let shape = Shape {
-        count: 16 + (rng.next() % 16) as usize,
+        count: units.0 + (rng.next() % units.1 as u64) as usize,
         code_off,
         x18: 18,
         use_x18: x18,
@@ -1368,16 +1378,15 @@ fn check_stream(shared: &Shared, rng: &mut Rng, iter: usize, x18: bool, mmu_alia
     }
     native.x[18] = if x18 { native.x[18] } else { 0 };
 
-    let mut runs = vec![
-        Run {
-            fast: true,
-            at: None,
-        },
-        Run {
-            fast: false,
-            at: None,
-        },
-    ];
+    let fast = Run {
+        fast: true,
+        at: None,
+    };
+    let slow = Run {
+        fast: false,
+        at: None,
+    };
+    let mut runs = vec![fast, fast, slow];
     let tables = mmu_alias.map(|alias| {
         let first = (code_off as u64) >> 12;
         let last = (code_off as u64 + len) >> 12;
@@ -1385,21 +1394,17 @@ fn check_stream(shared: &Shared, rng: &mut Rng, iter: usize, x18: bool, mmu_alia
     });
     let mut shared_cache = CodeCache::with_mode(4 << 20, true).unwrap();
     if let Some(alias) = mmu_alias {
-        runs = vec![
-            Run {
-                fast: true,
-                at: Some(shared.addr() + code_off as u64),
-            },
-            Run {
-                fast: true,
-                at: Some(alias + code_off as u64),
-            },
-        ];
+        let at = |va: u64| Run {
+            fast: true,
+            at: Some(va + code_off as u64),
+        };
+        let own = shared.addr();
+        runs = vec![at(own), at(alias), at(own), at(own), at(alias)];
     }
     for run in runs {
         shared.write(DATA_OFF, &vec![0u8; DATA_LEN]);
         let mut fresh = CodeCache::with_mode(4 << 20, run.fast).unwrap();
-        let cache = if mmu_alias.is_some() {
+        let cache = if run.fast {
             &mut shared_cache
         } else {
             &mut fresh
@@ -1441,7 +1446,21 @@ fn random_streams_match_the_cpu() {
     let shared = Shared::new(RAM_SIZE);
     let mut rng = Rng(0x1234_5678_9abc_def1);
     for iter in 0..iterations() {
-        check_stream(&shared, &mut rng, iter, false, None);
+        check_stream(&shared, &mut rng, iter, false, None, (16, 16));
+    }
+}
+
+/// Streams over two to four pages: most of their branches, calls and
+/// returns that cross a page are chained behind a guard, at one address and
+/// at another.
+#[test]
+fn long_streams_across_pages_match_the_cpu() {
+    let shared = Shared::new(RAM_SIZE);
+    let mut rng = Rng(0x0c4a_17ed_0bad_9a9e);
+    let alias = 0x7e00_0000_0000u64;
+    for iter in 0..iterations() / 4 {
+        let mmu = (iter % 2 == 1).then_some(alias);
+        check_stream(&shared, &mut rng, iter, false, mmu, (64, 64));
     }
 }
 
@@ -1452,7 +1471,7 @@ fn x18_streams_match_the_cpu() {
     let shared = Shared::new(RAM_SIZE);
     let mut rng = Rng(0x0bad_cafe_dead_beef);
     for iter in 0..iterations() / 2 {
-        check_stream(&shared, &mut rng, iter, true, None);
+        check_stream(&shared, &mut rng, iter, true, None, (16, 16));
     }
 }
 
@@ -1465,7 +1484,7 @@ fn translations_are_shared_across_addresses() {
     let mut rng = Rng(0x005e_ed0f_5a3e_d0d0);
     let alias = 0x7f00_0000_0000u64;
     for iter in 0..iterations() / 2 {
-        check_stream(&shared, &mut rng, iter, false, Some(alias));
+        check_stream(&shared, &mut rng, iter, false, Some(alias), (16, 16));
     }
 }
 

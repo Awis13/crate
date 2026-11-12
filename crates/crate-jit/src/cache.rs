@@ -20,9 +20,10 @@
 //!
 //! The cache also keeps, per 4 KiB physical page, the blocks translated from
 //! it, so an instruction-cache invalidation of that page drops exactly those.
-//! Blocks never cross a page, so a chain (a patched branch from one block to
-//! another) never leaves its page, and dropping a page's blocks drops every
-//! chain into them.
+//! Blocks never cross a page, so an unguarded chain (a patched branch from one
+//! block to another) never leaves its page, and dropping a page's blocks
+//! drops every such chain into them. A chain to another page has a guard
+//! whose key the invalidation changes (see `translate`).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -104,6 +105,14 @@ pub struct CodeCache {
     /// The memory the last translation used, emptied, so the next one reuses
     /// it instead of allocating its own.
     spare: translate::Spare,
+    /// The offsets of the literals of guarded chains patched since their keys
+    /// were last forgotten.
+    guarded: Vec<usize>,
+    /// The physical page (`pa >> 12`) of the block at each entry offset, and
+    /// the literals of the guarded chains patched into each page, so dropping
+    /// a page's code makes exactly the guards of chains into it fail.
+    entry_pages: FastMap<usize, u64>,
+    into: FastMap<u64, Vec<usize>>,
 }
 
 /// A fault while translating: the region filled up.
@@ -129,6 +138,9 @@ impl CodeCache {
             fast,
             epoch: 0,
             spare: translate::Spare::default(),
+            guarded: Vec::new(),
+            entry_pages: FastMap::default(),
+            into: FastMap::default(),
         };
         cache.cold = cache.segment;
         cache.emit_stubs();
@@ -166,6 +178,7 @@ impl CodeCache {
             self.stubs.jc_stride[el] = at.stride as u64;
             self.stubs.jc_ret[el] = base + at.ret as u64;
             self.stubs.jc_miss[el] = base + at.miss as u64;
+            self.stubs.jc_chain[el] = base + at.chain as u64;
         }
     }
 
@@ -293,6 +306,7 @@ impl CodeCache {
                 if self.blocks.insert(k, off + at).is_none() {
                     keys.push(k);
                 }
+                self.entry_pages.insert(off + at, key.pa >> 12);
             }
         }
         self.spare = block.into_spare();
@@ -321,13 +335,81 @@ impl CodeCache {
         self.region.flush(off, 4);
     }
 
+    /// Patches the guarded chain to another page whose literal is at
+    /// `literal` (recorded by its jump-cache lookup in `epoch`) to jump to the
+    /// block entered at `entry`, and its guard to let the branch through for
+    /// `key`.
+    pub fn chain_guarded(&mut self, literal: u64, epoch: u64, entry: u64, key: u64) {
+        if epoch != self.epoch {
+            return;
+        }
+        let base = self.region.exec_base() as u64;
+        if literal < base || literal + 16 > base + self.capacity as u64 || literal & 7 != 0 {
+            return;
+        }
+        let off = (literal - base) as usize;
+        // SAFETY: inside the region, and a literal of this epoch's code: the
+        // key, then the address of the branch.
+        let [old, site] = unsafe { self.region.exec_base().add(off).cast::<[u64; 2]>().read() };
+        let delta = entry.wrapping_sub(site) as i64;
+        if site < base
+            || site >= base + self.cursor as u64
+            || !(-(1 << 27)..(1 << 27)).contains(&delta)
+        {
+            return;
+        }
+        let Some(&page) = self.entry_pages.get(&((entry - base) as usize)) else {
+            return;
+        };
+        let at = (site - base) as usize;
+        let word = b(delta);
+        // SAFETY: the branch, inside the region.
+        let same = unsafe { self.region.exec_base().add(at).cast::<u32>().read() } == word;
+        let mut w = self.region.writer();
+        if !same {
+            w.patch_word(at, word);
+        }
+        w.write_words(off, &[key as u32, (key >> 32) as u32]);
+        drop(w);
+        if !same {
+            self.region.flush(at, 4);
+        }
+        if old == translate::NEVER_KEY {
+            self.guarded.push(off);
+        }
+        if old == translate::NEVER_KEY || !same {
+            self.into.entry(page).or_default().push(off);
+        }
+    }
+
+    /// Makes every guarded chain's guard fail until it is patched again: the
+    /// numbers in the keys are about to be reused.
+    pub fn forget_chains(&mut self) {
+        let guarded = std::mem::take(&mut self.guarded);
+        self.forget(&guarded);
+    }
+
+    /// Makes the guards of the chains with these literals fail.
+    fn forget(&mut self, literals: &[usize]) {
+        let never = translate::NEVER_KEY;
+        let mut w = self.region.writer();
+        for &off in literals {
+            w.write_words(off, &[never as u32, (never >> 32) as u32]);
+        }
+    }
+
     /// Drops every block translated from the 4 KiB physical page at `pa`.
     /// Returns whether there were any.
     pub fn invalidate_page(&mut self, pa: u64) -> bool {
+        if let Some(literals) = self.into.remove(&(pa >> 12)) {
+            self.forget(&literals);
+        }
         match self.pages.remove(&(pa >> 12)) {
             Some(keys) => {
                 for k in keys {
-                    self.blocks.remove(&k);
+                    if let Some(off) = self.blocks.remove(&k) {
+                        self.entry_pages.remove(&off);
+                    }
                 }
                 true
             }
@@ -346,6 +428,9 @@ impl CodeCache {
         self.cold = self.segment;
         self.blocks.clear();
         self.pages.clear();
+        self.guarded.clear();
+        self.entry_pages.clear();
+        self.into.clear();
         self.epoch += 1;
         self.emit_stubs();
     }

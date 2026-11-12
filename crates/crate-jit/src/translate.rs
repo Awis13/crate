@@ -22,11 +22,13 @@
 //! them back only when an instruction names them or the block leaves.
 //!
 //! **Branches** to the same page end in a branch the dispatcher patches to
-//! jump straight to the target block once it exists (chaining). Branches to
-//! another page, and indirect branches, look the target up in the jump cache.
-//! Backward chained branches and every jump-cache lookup test the CPU's exit
-//! request first, so no loop of translated code can keep the CPU from its
-//! dispatcher.
+//! jump straight to the target block once it exists (chaining). Direct
+//! branches to another page are chained too, behind a guard that the target
+//! address still finds the block they were chained to (see
+//! `Block::emit_guarded_chain`); indirect branches look the target up in the
+//! jump cache. Backward chained branches and every jump-cache lookup test the
+//! CPU's exit request first, so no loop of translated code can keep the CPU
+//! from its dispatcher.
 //!
 //! **Calls** (BL, BLR) do not end a block: each is a host BL to a tail that
 //! sets the link and goes to the target, and the code the call returns to
@@ -34,9 +36,10 @@
 //! that entry and jumps there with RET, so the CPU predicts guest returns
 //! from its own return stack.
 //!
-//! A block never crosses a 4 KiB page, so a chained branch never leaves the
-//! page its block came from: invalidating a page's code throws away every
-//! block that could reach another through a chain.
+//! A block never crosses a 4 KiB page, so an unguarded chained branch never
+//! leaves the page its block came from: invalidating a page's code throws
+//! away every block that could reach another through one, and a guarded one
+//! fails its guard from then on.
 //!
 //! With the fast paths off (`Ctx::fast` false), every load and store calls the
 //! slow path and every branch returns to the dispatcher: the slow, simple
@@ -73,6 +76,10 @@ impl Ctx {
         self.fast && !self.debug
     }
 }
+
+/// The key a guarded chain's literal starts with, which no target makes: a
+/// key is a 4-byte aligned PC with a number in its top bits.
+pub const NEVER_KEY: u64 = 1;
 
 /// Markers packed into an exit's syndrome field the dispatcher recognises.
 pub const FETCH_ABORT: u64 = 1 << 40;
@@ -1921,8 +1928,8 @@ impl Block {
             self.asm.set_cold(false);
             return;
         }
-        // Another page: through the jump cache. A link value is a guest
-        // address already in a register.
+        // Another page: chained behind a guard, or through the jump cache. A
+        // link value is a guest address already in a register.
         match link {
             Some(ret) => {
                 self.asm
@@ -1930,9 +1937,59 @@ impl Block {
             }
             None => emit::guest_va(&mut self.asm, JUMP_REG, target, self.page << 12, 17),
         }
-        self.asm
-            .b_abs(self.ctx.stubs.jc_for(self.ctx.el.min(1) as usize, pc));
+        if target & 3 == 0 {
+            self.emit_guarded_chain(target <= pc);
+        } else {
+            self.asm
+                .b_abs(self.ctx.stubs.jc_for(self.ctx.el.min(1) as usize, pc));
+        }
         self.terminated = true;
+    }
+
+    /// A branch to the block for the guest address in X16, in another page,
+    /// which the dispatcher patches to jump straight there, behind a guard.
+    ///
+    /// A block serves every virtual address its physical page is mapped at,
+    /// so the target address, though a constant offset from the branch's,
+    /// may be another page of code each time, or none. The guard compares a
+    /// key -- the target address with the jump-cache key of the exception
+    /// level XORed into its top bits (`CpuState::jc_key`) -- with the one the
+    /// branch was patched for, kept in a literal with the branch's address.
+    /// The key changes whenever the jump cache would drop an entry for the
+    /// target: with the address space (an EL0 context number), and on every
+    /// TLB or code invalidation that reaches the target (a new number or
+    /// generation). So the branch is taken exactly when a jump-cache lookup
+    /// would have found the block it goes to.
+    ///
+    /// A failed guard looks the target up in the jump cache instead, through
+    /// the lookup that records the literal for the dispatcher to patch the
+    /// branch and its key anew. A backward branch also tests the exit
+    /// request, like one in its page.
+    fn emit_guarded_chain(&mut self, backward: bool) {
+        let el = self.ctx.el.min(1);
+        let fail = self.asm.label();
+        let site = self.asm.label();
+        self.asm.set_cold(true);
+        let literal = self.asm.value_and_address_literal(NEVER_KEY, site);
+        self.asm.set_cold(false);
+        self.asm.emit(ldr_imm(3, 17, SP, offsets::jc_key(el)));
+        self.asm.emit(eor_reg(true, 17, 17, JUMP_REG, LSL, 0));
+        self.asm.ldr_literal(15, literal);
+        self.asm.emit(emit::sub_reg(true, 17, 17, 15));
+        self.asm.cbnz(true, 17, fail);
+        self.asm.emit(and_imm(true, 15, JUMP_REG, !0xfff));
+        self.asm.emit(str_imm(3, 15, SP, offsets::PAGE_VA));
+        if backward {
+            self.asm.emit(ldr_imm(2, 17, SP, offsets::EXIT_REQUEST));
+            self.asm.cbnz(false, 17, fail);
+        }
+        self.asm.bind(site);
+        self.asm.b(fail);
+        self.asm.set_cold(true);
+        self.asm.bind(fail);
+        self.asm.adr(15, literal);
+        self.asm.b_abs(self.ctx.stubs.jc_chain[el as usize]);
+        self.asm.set_cold(false);
     }
 
     /// Continues at the address in guest register `rn` (BR, BLR, RET at
