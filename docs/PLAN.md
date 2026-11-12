@@ -56,7 +56,7 @@ Each ends in something that runs.
 | 3 | Full system on `jit`: several CPUs, TLB maintenance across CPUs, exclusives, self-modifying code | Debian boots on 4 CPUs; benchmark outputs byte-identical to native; faster than QEMU's TCG |
 | 4 | GPU, display, input: virtio-gpu 2D and virgl (virglrenderer over ANGLE), keyboard and tablet | aTerm's desktops, Chrome and Claude Code run under `crate-run` on a Mac |
 | 5 | iOS: XCFramework, iOS executable-memory provider, aTerm adopts crate beside its current engines | Debian and Omarchy on a device pass aTerm's checklist: console, SSH tabs, forwards, desktop, resolution change, Claude Code |
-| 6 | Speed: the translator's own costs first (scratch registers for loads and stores, cold code apart, predicted returns), then 16 KB-page guest kernels, Linux paravirtual hooks (TLB flushes, idle), guest memory mapped by the host MMU, translations kept across launches | on an M3, jit, 4 CPUs: crate-bench's single pass under 50 s, gcc -O2 under 15 s, four compiles at once under 30 s, every output hash unchanged; on the iPhone, Debian still at its prompt in about 7 s and its desktop in about 8.4 s |
+| 6 | Speed: the translator's own costs first (scratch registers for loads and stores, cold code apart, predicted returns), then 16 KB-page guest kernels, Linux paravirtual hooks (TLB flushes, idle), guest memory mapped by the host MMU, translations kept across launches | on an M3, jit, 4 CPUs: every line of crate-bench ties (medians of 3, within about 5%) or beats the other translator its README compares, every output hash unchanged, kvm-unit-tests as before; on the iPhone, Debian still at its prompt in about 7 s and its desktop in about 8.4 s |
 | 7 | Ready to publish: device and machine interfaces frozen as v1, documentation, a minimal sample app | the owner decides to open the repository |
 | later | Other guests (macOS) as machines of their own | |
 
@@ -138,6 +138,27 @@ KB-page guest kernels, paravirtual TLB flushes and idle, guest memory mapped
 by the host MMU, translations kept across launches; so do a code cache shared
 by the CPUs and chained branches to another page. The largest cost left in a
 compile is the TLB lookup, a load on the path to every access's data.
+
+The milestone's goal then became to tie or beat the other translator
+crate-bench compares on every line, which it does on the Mac since
+2026-11-11 (medians of 3, M3 MacBook Air under the user's other work): boot
+2.9 s (5.27), gcc -O2 8.0 s (9.34), gcc again 7.6-8.3 (8.16), node -e 0 0.42-0.43
+(0.42), node's integer loop 0.52-0.55 (0.59), its FP loop 0.92-0.95 (1.03),
+python 1.45-1.56 (1.96), awk 0.65-0.73 (0.72), xz 1.41-1.43 (1.79), sha256
+0.05 (0.07), find 0.49-0.53 (0.59), 1000 spawns 0.54 (3.39), the whole pass
+27-31 s (36.1); four compiles at once 12.4-15.8 s (21.4), xz -T4 12.7-16.0
+(18.2), 4 x 250 spawns 0.20 (1.88); an idle shell 0.65% of a core (2.1%).
+Wall time on that machine is too noisy for a few percent, so changes were
+judged by the process's retired cycles over repeated compiles. What did it:
+footprint first (32 bytes of never-run padding per block made gcc 17-23%
+slower), so slow paths moved into the same MiB segment as their block and the
+trampolines left the code that runs, single loads and stores take the TLB
+delta as a register offset, and the EL0 load TLB sits right below SP; 32
+copies of the jump-cache stub per EL, so each indirect branch is predicted
+from few sites; and the TLB refills, 15% of a compile, which a page-walk cache
+and a larger TLB cut, while TLB invalidations stopped scanning whole tables
+(a boot's work fell by two thirds). A code cache shared by the CPUs was
+measured not to matter: a second compile translates almost nothing.
 
 ## How aTerm adopts it
 
