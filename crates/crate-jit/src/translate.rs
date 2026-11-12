@@ -425,9 +425,8 @@ fn stops_group(op: &Op) -> bool {
 /// of each, and the group each instruction belongs to. Groups do not
 /// overlap: a second host base would leave the other accesses of the stretch
 /// one free register (measured: slower).
-fn plan_groups(ops: &[(Op, u32, u64)]) -> (Vec<Group>, Vec<Option<usize>>) {
-    let mut groups: Vec<Group> = Vec::new();
-    let mut member = vec![None; ops.len()];
+fn plan_groups(ops: &[(Op, u32, u64)], groups: &mut Vec<Group>, member: &mut Vec<Option<usize>>) {
+    member.resize(ops.len(), None);
     let mut i = 0;
     while i < ops.len() {
         let Op::Memory(m0) = ops[i].0 else {
@@ -497,7 +496,6 @@ fn plan_groups(ops: &[(Op, u32, u64)]) -> (Vec<Group>, Vec<Option<usize>>) {
             i += 1;
         }
     }
-    (groups, member)
 }
 
 /// The most bytes a group's accesses may span. A wider group crosses a page
@@ -560,15 +558,35 @@ pub struct Block {
     /// of the block the group it belongs to.
     groups: Vec<Group>,
     member: Vec<Option<usize>>,
+    /// The block's decoded instructions (kept for their memory).
+    ops: Vec<(Op, u32, u64)>,
+}
+
+/// The memory a translation works in, kept from one to the next by a code
+/// cache: allocating and freeing it for every block was a fifth of the time
+/// translation took.
+#[derive(Default)]
+pub struct Spare {
+    asm: Asm,
+    ops: Vec<(Op, u32, u64)>,
+    slow: Vec<SlowSite>,
+    literals: Vec<(Label, u32, u64, bool)>,
+    ahead: Vec<(u32, u32)>,
+    entries: Vec<(u64, Label)>,
+    calls: Vec<(Label, u64, u64, Option<u64>)>,
+    tramps: Vec<(Label, Label)>,
+    groups: Vec<Group>,
+    member: Vec<Option<usize>>,
 }
 
 /// Translates guest code at `pc`, whose words up to the end of its 4 KiB page
-/// are `words`, into a block of host code. `limit` caps the instructions.
-pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize) -> Block {
-    let mut t = Block::new(ctx, pc);
+/// are `words`, into a block of host code, in `spare` (a cache passes what the
+/// last translation left). `limit` caps the instructions.
+pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize, spare: Spare) -> Block {
+    let mut t = Block::new(ctx, pc, spare);
     // Decode up to the first instruction that surely ends the block, so the
     // choice of scratch registers can look ahead.
-    let mut ops = Vec::with_capacity(16);
+    let mut ops = std::mem::take(&mut t.ops);
     let mut cur = pc;
     for &word in words.iter().take(limit.max(1)) {
         let op = decode::decode(word, cur);
@@ -579,9 +597,9 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize) -> Block {
         cur = cur.wrapping_add(4);
     }
     if ctx.fast_paths() {
-        (t.groups, t.member) = plan_groups(&ops);
+        plan_groups(&ops, &mut t.groups, &mut t.member);
     }
-    t.ahead = vec![(0, 0); ops.len()];
+    t.ahead.resize(ops.len(), (0, 0));
     let (mut named, mut dead) = (0u32, 0u32);
     for (i, &(op, word, _)) in ops.iter().enumerate().rev() {
         t.ahead[i] = (named, dead);
@@ -609,13 +627,14 @@ pub fn translate(ctx: Ctx, pc: u64, words: &[u32], limit: usize) -> Block {
     }
     t.emit_call_tails();
     t.emit_slow_sites();
+    t.ops = ops;
     t
 }
 
 /// A block that only raises the instruction abort for a fetch at `pc` that
 /// faulted with status `fsc`.
-pub fn fetch_fault(ctx: Ctx, pc: u64, fsc: u8) -> Block {
-    let mut t = Block::new(ctx, pc);
+pub fn fetch_fault(ctx: Ctx, pc: u64, fsc: u8, spare: Spare) -> Block {
+    let mut t = Block::new(ctx, pc, spare);
     t.fetch_faulted = true;
     t.exit(
         Exit::Exception as u32,
@@ -630,27 +649,55 @@ pub fn fetch_fault(ctx: Ctx, pc: u64, fsc: u8) -> Block {
 }
 
 impl Block {
-    fn new(ctx: Ctx, pc: u64) -> Block {
+    fn new(ctx: Ctx, pc: u64, spare: Spare) -> Block {
         Block {
-            asm: Asm::new(),
+            asm: spare.asm,
             ctx,
             page: pc >> 12,
             terminated: false,
             fetch_faulted: false,
-            slow: Vec::new(),
-            literals: Vec::new(),
+            slow: spare.slow,
+            literals: spare.literals,
             cache: RegCache::default(),
-            ahead: Vec::new(),
+            ahead: spare.ahead,
             at: 0,
             start: pc,
-            entries: Vec::new(),
-            calls: Vec::new(),
+            entries: spare.entries,
+            calls: spare.calls,
             returns_to: None,
-            tramps: Vec::new(),
+            tramps: spare.tramps,
             pinned: 0,
-            groups: Vec::new(),
-            member: Vec::new(),
+            groups: spare.groups,
+            member: spare.member,
+            ops: spare.ops,
         }
+    }
+
+    /// The block's memory, emptied, for the next translation.
+    pub fn into_spare(self) -> Spare {
+        let mut spare = Spare {
+            asm: self.asm,
+            ops: self.ops,
+            slow: self.slow,
+            literals: self.literals,
+            ahead: self.ahead,
+            entries: self.entries,
+            calls: self.calls,
+            tramps: self.tramps,
+            groups: self.groups,
+            member: self.member,
+        };
+        spare.asm.clear();
+        spare.ops.clear();
+        spare.slow.clear();
+        spare.literals.clear();
+        spare.ahead.clear();
+        spare.entries.clear();
+        spare.calls.clear();
+        spare.tramps.clear();
+        spare.groups.clear();
+        spare.member.clear();
+        spare
     }
 
     /// Emits an exit to the save stub.
@@ -2422,7 +2469,7 @@ mod tests {
             stubs: Stubs::default(),
             mpidr: 0,
         };
-        Block::new(ctx, 0x4000_0000)
+        Block::new(ctx, 0x4000_0000, Spare::default())
     }
 
     #[test]
@@ -2480,7 +2527,8 @@ mod tests {
                 (decode::decode(w, at), w, at)
             })
             .collect();
-        let (groups, member) = plan_groups(&ops);
+        let (mut groups, mut member) = (Vec::new(), Vec::new());
+        plan_groups(&ops, &mut groups, &mut member);
         assert_eq!(groups.len(), 1, "{groups:?}");
         let sp = groups[0];
         assert_eq!(
@@ -2498,7 +2546,8 @@ mod tests {
         assert_eq!(sp.hb, 17);
         // Off x1 alone, the first three are a group (the third loads into
         // its base, and ends it).
-        let (groups, member) = plan_groups(&ops[3..7]);
+        let (mut groups, mut member) = (Vec::new(), Vec::new());
+        plan_groups(&ops[3..7], &mut groups, &mut member);
         assert_eq!(groups.len(), 1, "{groups:?}");
         let x1 = groups[0];
         assert_eq!((x1.base, x1.first, x1.last, x1.lo, x1.hi), (1, 0, 2, 0, 19));

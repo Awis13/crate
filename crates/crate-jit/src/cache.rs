@@ -94,6 +94,9 @@ pub struct CodeCache {
     /// Bumped whenever the cache is emptied, so a chain site recorded before
     /// it is known to be gone.
     epoch: u64,
+    /// The memory the last translation used, emptied, so the next one reuses
+    /// it instead of allocating its own.
+    spare: translate::Spare,
 }
 
 /// A fault while translating: the region filled up.
@@ -116,6 +119,7 @@ impl CodeCache {
             helper,
             fast,
             epoch: 0,
+            spare: translate::Spare::default(),
         };
         cache.cold = cache.capacity;
         cache.emit_stubs();
@@ -190,7 +194,8 @@ impl CodeCache {
     /// epoch).
     pub fn translate(&mut self, key: BlockKey, pc: u64, words: &[u32], ctx: Ctx) -> u64 {
         let limit = if ctx.debug { 1 } else { MAX_BLOCK };
-        let block = translate::translate(ctx, pc, words, limit);
+        let spare = std::mem::take(&mut self.spare);
+        let block = translate::translate(ctx, pc, words, limit, spare);
         self.install(key, block, ctx.debug).unwrap_or_else(|_| {
             self.reset();
             let block = translate::translate(
@@ -201,6 +206,7 @@ impl CodeCache {
                 pc,
                 words,
                 limit,
+                translate::Spare::default(),
             );
             self.install(key, block, ctx.debug)
                 .expect("a block in an empty cache")
@@ -209,7 +215,7 @@ impl CodeCache {
 
     /// A block that only raises an instruction abort; run once, never cached.
     pub fn fetch_fault(&mut self, pc: u64, fsc: u8, ctx: Ctx) -> u64 {
-        let block = translate::fetch_fault(ctx, pc, fsc);
+        let block = translate::fetch_fault(ctx, pc, fsc, std::mem::take(&mut self.spare));
         let key = BlockKey {
             pa: u64::MAX,
             mode: 0,
@@ -223,6 +229,7 @@ impl CodeCache {
                 },
                 pc,
                 fsc,
+                translate::Spare::default(),
             );
             self.install(key, block, false)
                 .expect("a block in an empty cache")
@@ -232,7 +239,7 @@ impl CodeCache {
     fn install(
         &mut self,
         key: BlockKey,
-        block: translate::Block,
+        mut block: translate::Block,
         _debug: bool,
     ) -> Result<u64, TranslateError> {
         // Before resolving the block's branches: one to the stubs from past
@@ -243,30 +250,27 @@ impl CodeCache {
         }
         let base = self.exec(self.cursor);
         let fetch_faulted = block.fetch_faulted;
-        // The block's further entries (where its calls return to), each the
-        // block for its own guest PC from now on.
-        let entries: Vec<(BlockKey, usize)> = block
-            .entries
-            .iter()
-            .map(|&(pc, label)| {
-                let key = BlockKey {
-                    pa: key.pa.wrapping_add(pc.wrapping_sub(block.start)),
-                    mode: key.mode,
-                };
-                (key, block.asm.offset_of(label) as usize)
-            })
-            .collect();
-        let (words, cold_words) = block.asm.finish_split(base, self.exec(cold));
+        block.asm.finish_split(base, self.exec(cold));
+        let cold_words = block.asm.cold_words();
         if !cold_words.is_empty() {
             let mut w = self.region.writer();
-            w.write_words(cold, &cold_words);
+            w.write_words(cold, cold_words);
             drop(w);
             self.region.flush(cold, cold_words.len() * 4);
             self.cold = cold;
         }
         let off = self.cursor;
-        self.put(&words);
+        self.put(&block.asm.words);
         if !fetch_faulted {
+            // The block's further entries (where its calls return to) are
+            // each the block for their own guest PC from now on.
+            let entries = block.entries.iter().map(|&(pc, label)| {
+                let k = BlockKey {
+                    pa: key.pa.wrapping_add(pc.wrapping_sub(block.start)),
+                    mode: key.mode,
+                };
+                (k, block.asm.offset_of(label) as usize)
+            });
             let keys = self.pages.entry(key.pa >> 12).or_default();
             for (k, at) in std::iter::once((key, 0)).chain(entries) {
                 if self.blocks.insert(k, off + at).is_none() {
@@ -274,6 +278,7 @@ impl CodeCache {
                 }
             }
         }
+        self.spare = block.into_spare();
         Ok(self.exec(off))
     }
 

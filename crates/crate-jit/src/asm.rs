@@ -52,18 +52,64 @@ pub fn mov_sp(rd: Reg, rn: Reg) -> u32 {
     add_imm(true, rd, rn, 0, false)
 }
 
+/// A short instruction sequence, made without allocating: what `mov_imm`
+/// and `add_const` return (at most five words), which translation makes many
+/// of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Seq {
+    words: [u32; 5],
+    len: usize,
+}
+
+impl Seq {
+    fn of(word: u32) -> Seq {
+        let mut s = Seq::default();
+        s.push(word);
+        s
+    }
+
+    fn push(&mut self, word: u32) {
+        self.words[self.len] = word;
+        self.len += 1;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[u32] {
+        &self.words[..self.len]
+    }
+}
+
+impl IntoIterator for Seq {
+    type Item = u32;
+    type IntoIter = std::iter::Take<std::array::IntoIter<u32, 5>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.words.into_iter().take(self.len)
+    }
+}
+
+impl PartialEq<Vec<u32>> for Seq {
+    fn eq(&self, other: &Vec<u32>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
 /// The shortest MOVZ/MOVN/MOVK sequence for a 64-bit constant.
-pub fn mov_imm(rd: Reg, value: u64) -> Vec<u32> {
-    let halves: Vec<u32> = (0..4)
-        .map(|i| ((value >> (16 * i)) & 0xffff) as u32)
-        .collect();
+pub fn mov_imm(rd: Reg, value: u64) -> Seq {
+    let halves: [u32; 4] = std::array::from_fn(|i| ((value >> (16 * i)) & 0xffff) as u32);
     let zeros = halves.iter().filter(|&&h| h == 0).count();
     let ones = halves.iter().filter(|&&h| h == 0xffff).count();
-    let mut out = Vec::new();
+    let mut out = Seq::default();
     if zeros < 3 && ones < 3 {
         if let Some(f) = logical_imm(value, true) {
             // ORR Rd, XZR, #value.
-            return vec![0xb200_0000 | f << 10 | XZR << 5 | rd];
+            return Seq::of(0xb200_0000 | f << 10 | XZR << 5 | rd);
         }
     }
     if ones > zeros {
@@ -114,14 +160,14 @@ pub fn sub_imm(sf: bool, rd: Reg, rn: Reg, imm12: u32, shift12: bool) -> u32 {
 /// Rd = Rn + value for any 64-bit value, through `tmp` when it takes more
 /// than two ADD or SUB immediates. Rd and Rn may be SP; `tmp` may equal Rd
 /// only when Rd is not SP and differs from Rn.
-pub fn add_const(rd: Reg, rn: Reg, value: i64, tmp: Reg) -> Vec<u32> {
+pub fn add_const(rd: Reg, rn: Reg, value: i64, tmp: Reg) -> Seq {
     let mag = value.unsigned_abs();
     let op = if value < 0 { sub_imm } else { add_imm };
     if mag < 4096 {
-        return vec![op(true, rd, rn, mag as u32, false)];
+        return Seq::of(op(true, rd, rn, mag as u32, false));
     }
     if mag < 1 << 24 {
-        let mut out = vec![op(true, rd, rn, (mag >> 12) as u32, true)];
+        let mut out = Seq::of(op(true, rd, rn, (mag >> 12) as u32, true));
         if mag & 0xfff != 0 {
             out.push(op(true, rd, rd, (mag & 0xfff) as u32, false));
         }
@@ -479,6 +525,8 @@ pub struct Asm {
     external: Vec<(bool, u32, Fixup, u64)>,
     /// 64-bit words placed after the code of their section.
     literals: Vec<(bool, Label, Literal)>,
+    /// Where `finish_split` puts address literals (kept for its memory).
+    addresses: Vec<(bool, u32, Label)>,
 }
 
 enum Literal {
@@ -506,6 +554,7 @@ impl Asm {
             fixups: Vec::with_capacity(256),
             external: Vec::with_capacity(64),
             literals: Vec::new(),
+            addresses: Vec::new(),
         }
     }
 
@@ -695,18 +744,36 @@ impl Asm {
         }
     }
 
+    /// Empties the code for another block, keeping the memory.
+    pub fn clear(&mut self) {
+        self.words.clear();
+        self.cold.clear();
+        self.in_cold = false;
+        self.labels.clear();
+        self.fixups.clear();
+        self.external.clear();
+        self.literals.clear();
+    }
+
+    /// The cold section, once `finish_split` has laid it out.
+    pub fn cold_words(&self) -> &[u32] {
+        &self.cold
+    }
+
     /// Lays out the literals and resolves every branch for code that will
     /// run at `base`, which has no cold section.
-    pub fn finish(self, base: u64) -> Vec<u32> {
+    pub fn finish(mut self, base: u64) -> Vec<u32> {
         assert!(self.cold.is_empty(), "cold code with nowhere to go");
-        self.finish_split(base, 0).0
+        self.finish_split(base, 0);
+        self.words
     }
 
     /// Lays out the literals and resolves every branch for a code section
-    /// that will run at `base` and a cold section at `cold_base`.
-    pub fn finish_split(mut self, base: u64, cold_base: u64) -> (Vec<u32>, Vec<u32>) {
+    /// that will run at `base` and a cold section at `cold_base`, in place:
+    /// the code is then `words` and `cold_words`.
+    pub fn finish_split(&mut self, base: u64, cold_base: u64) {
         let literals = std::mem::take(&mut self.literals);
-        let mut addresses = Vec::new();
+        let mut addresses = std::mem::take(&mut self.addresses);
         for cold in [false, true] {
             self.in_cold = cold;
             let mut first = true;
@@ -731,7 +798,7 @@ impl Asm {
             }
         }
         let addr = |cold: bool, off: u32| if cold { cold_base } else { base } + off as u64;
-        for (cold, at, of) in addresses {
+        for &(cold, at, of) in &addresses {
             let (to_cold, to) = self.labels[of.0 as usize].expect("label never bound");
             let value = addr(to_cold, to);
             let words = if cold {
@@ -764,7 +831,10 @@ impl Asm {
             let i = at as usize / 4;
             words[i] = Self::patch(words[i], kind, delta);
         }
-        (self.words, self.cold)
+        // Their memory, for the next block (`clear` empties them).
+        addresses.clear();
+        self.addresses = addresses;
+        self.literals = literals;
     }
 }
 
@@ -845,7 +915,8 @@ mod tests {
         let lit = a.address_literal(back);
         a.ldr_literal(0, lit);
         a.b(back);
-        let (hot, cold) = a.finish_split(0x1000, 0x8000);
+        a.finish_split(0x1000, 0x8000);
+        let (hot, cold) = (a.words.clone(), a.cold_words().to_vec());
         assert_eq!(hot, vec![b(0x8000 - 0x1000), ret()]);
         assert_eq!(cold[0], ldr_literal(0, 8));
         assert_eq!(cold[1], b(0x1004 - 0x8004));

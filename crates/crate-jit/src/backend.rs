@@ -396,6 +396,8 @@ pub(crate) struct Counters {
     pub wfe: u64,
     pub slow_mem: u64,
     pub translated: u64,
+    /// Time spent translating, in microseconds.
+    pub translate_us: u64,
     pub remote: u64,
     pub jc_flushes: u64,
     pub jc_misses: u64,
@@ -675,7 +677,11 @@ impl Cpu {
                 }
                 let epoch = cache.epoch();
                 self.counters.translated += 1;
+                let started = self.trace.stats.then(std::time::Instant::now);
                 let e = cache.translate(key, pc, &words[..n], ctx);
+                if let Some(t) = started {
+                    self.counters.translate_us += t.elapsed().as_micros() as u64;
+                }
                 if cache.epoch() != epoch {
                     // The region filled and was emptied: every jump-cache
                     // entry points at code that is gone.
