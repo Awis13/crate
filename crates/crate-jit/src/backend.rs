@@ -24,7 +24,7 @@ use crate::mmu::{self, Access};
 use crate::smp::{Remote, Smp};
 use crate::state::{
     CpuState, Exit, JC_ENTRIES, JcEntry, MONITOR_CLEAR, MmuRegs, TLB_BITS, TLB_ENTRIES,
-    TLB_INVALID, TlbEntry, TlbKind, offsets, tlb_index,
+    TLB_INVALID, TLB_SHIFT, TlbEntry, TlbKind, offsets, tlb_index,
 };
 use crate::translate::{Ctx, ERET_MARKER, FETCH_ABORT, SYSTEM_WORD_MARKER};
 
@@ -259,8 +259,8 @@ pub(crate) struct TlbBook {
     /// Entries for the lower half of the address space (TTBR0); for the EL0
     /// TLBs that is every entry.
     low: [Filled; 4],
-    /// Entries from mappings larger than a TLB entry, by half of the address
-    /// space (0 lower, 1 upper): a TLBI of one address drops every piece.
+    /// Entries from blocks, by half of the address space (0 lower, 1 upper):
+    /// a TLBI of one address drops every piece.
     large: [[Filled; 2]; 4],
     /// Some upper-half entry is non-global (only with a split kernel map).
     ng_high: [bool; 4],
@@ -268,10 +268,9 @@ pub(crate) struct TlbBook {
     /// address space can still reach (in the EL0 TLBs, which otherwise hold
     /// only the running address space's lower-half translations).
     shared: [bool; 4],
-    /// The largest mapping any entry came from, as log2 of its size (0 for
-    /// none larger than an entry), so an invalidation of one address looks
-    /// for the pieces of a block only among the entries the largest block
-    /// around it could have.
+    /// The largest block any entry came from, as log2 of its size (0 for
+    /// none), so an invalidation of one address looks for the pieces of a
+    /// block only among the entries the largest block around it could have.
     max_shift: [u8; 4],
 }
 
@@ -309,7 +308,9 @@ impl TlbBook {
         if high || global {
             self.shared[tlb] = true;
         }
-        if shift > crate::state::TLB_SHIFT as u8 {
+        // A piece of a block (a page, of any granule, is dropped by the
+        // pieces of the page a TLBI names).
+        if shift as u32 > mmu::PAGE_MAX_SHIFT {
             self.large[tlb][high as usize].push(i);
             self.max_shift[tlb] = self.max_shift[tlb].max(shift);
         }
@@ -790,7 +791,14 @@ impl Cpu {
             self.state.jc[el_i].entries[i] = JcEntry { tag, host: entry };
             self.jc.filled[el_i].push(i);
             self.jc.pages[el_i].insert(pc >> 12);
-            if size_shift > 12 {
+            if size_shift > 12 && size_shift <= mmu::PAGE_MAX_SHIFT {
+                // A page of a 16 or 64 KiB granule: a TLBI of any of its
+                // pieces reaches the code.
+                let first = pc >> size_shift << size_shift >> 12;
+                for piece in first..first + (1 << (size_shift - 12)) {
+                    self.jc.pages[el_i].insert(piece);
+                }
+            } else if size_shift > 12 {
                 let region = (size_shift.min(63), pc >> size_shift.min(63));
                 if let Some(list) = &mut self.jc.large[el_i] {
                     if !list.contains(&region) {
@@ -1034,14 +1042,20 @@ impl Cpu {
         // translations, and only those unless they hold a global or an
         // upper-half one, which a TLBI for any address space reaches.
         let other = half == 1 || asid.is_some_and(|a| self.asid.is_some_and(|r| r != a));
+        // The page the address is in: several entries with a 16 or 64 KiB
+        // granule.
+        let page_shift = mmu::page_shift_of(&self.state.mmu, va);
+        let first = va >> page_shift << page_shift;
         for t in 0..4 {
             let el0 = t == tlb_index(0, TlbKind::Load) || t == tlb_index(0, TlbKind::Store);
             if other && el0 && !self.tlbs.shared[t] {
                 continue;
             }
-            let i = TlbEntry::index(t, va);
-            if self.state.tlb[t].entries[i].tag == page {
-                self.state.tlb[t].entries[i].tag = TLB_INVALID;
+            for piece in (first..first + (1 << page_shift)).step_by(1 << TLB_SHIFT) {
+                let i = TlbEntry::index(t, piece);
+                if self.state.tlb[t].entries[i].tag == piece >> TLB_SHIFT {
+                    self.state.tlb[t].entries[i].tag = TLB_INVALID;
+                }
             }
             let covers = |tag: u64, meta: u8| {
                 let shift = (meta & !META_NG) as u32;
@@ -2861,6 +2875,51 @@ mod tests {
             (300, Stop::Brk(3)),
             "global, remapped"
         );
+    }
+
+    /// With a 16 KiB granule, one miss fills every 4 KiB piece of the page,
+    /// and a TLBI of any piece drops them all, with no block to look for.
+    #[test]
+    fn a_16k_page_fills_and_drops_all_its_pieces() {
+        use crate_core::memory::{HeapRam, RamBlock};
+        const RAM: u64 = 0x4000_0000;
+        let block: Arc<dyn RamBlock> = Arc::new(HeapRam::new(0x40_0000).unwrap());
+        let mem = Arc::new(GuestMemory::new(vec![(RAM, block)]).unwrap());
+        // T0SZ 17 (47 bits) with 16 KiB pages: three levels of 11 bits.
+        let (l1, l2, l3) = (RAM + 0x10_0000, RAM + 0x10_4000, RAM + 0x10_8000);
+        let va = 0x40_0000u64;
+        let pa = RAM + 0x20_0000;
+        mem.write_u64(l1 + ((va >> 36) & 0x7ff) * 8, l2 | 3)
+            .unwrap();
+        mem.write_u64(l2 + ((va >> 25) & 0x7ff) * 8, l3 | 3)
+            .unwrap();
+        mem.write_u64(l3 + ((va >> 14) & 0x7ff) * 8, pa | 3 | 1 << 10)
+            .unwrap();
+        mem.write_u64(pa + 0x2008, 0x1234_5678).unwrap();
+        let mut cpu = Cpu::new(mem);
+        cpu.state.pstate = 0b0101; // EL1h
+        cpu.state.mmu = MmuRegs {
+            sctlr_el1: 1,
+            ttbr0_el1: l1,
+            tcr_el1: 17 | 0b10 << 14, // TG0 16 KiB
+            ..Default::default()
+        };
+        cpu.state.x[1] = va + 0x2008;
+        // LDR x5, [x1]
+        cpu.memory_access(0xf940_0025, 0).unwrap();
+        assert_eq!(cpu.state.x[5], 0x1234_5678);
+        let t = tlb_index(1, TlbKind::Load);
+        for piece in 0..4 {
+            assert!(holds(&cpu, t, va + piece * 0x1000), "piece {piece} filled");
+        }
+        assert!(cpu.tlbs.large[t][0].idx.is_empty(), "a page is no block");
+        cpu.flush_va(va + 0x3000, None);
+        for piece in 0..4 {
+            assert!(
+                !holds(&cpu, t, va + piece * 0x1000),
+                "piece {piece} dropped"
+            );
+        }
     }
 
     #[test]

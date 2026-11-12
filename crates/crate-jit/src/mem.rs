@@ -877,32 +877,35 @@ impl Cpu {
         }
     }
 
-    /// Records the translation of the 4 KiB guest page holding `va` in the
-    /// software TLB for `el` and `kind` (a store's translation also serves
-    /// loads), if the page is RAM and the fast paths can use it.
+    /// Records the translation of the guest page holding `va` in the software
+    /// TLB for `el` and `kind` (a store's translation also serves loads), if
+    /// the page is RAM and the fast paths can use it: every 4 KiB piece of it
+    /// at once, so a 16 or 64 KiB page misses once, not once a piece.
     pub(crate) fn tlb_fill(&mut self, el: u32, kind: TlbKind, va: u64, t: &mmu::Translation) {
         if self.debug_active() {
             return; // every access goes through here to meet the watchpoints
         }
-        let page_pa = t.pa & !((1 << TLB_SHIFT) - 1);
-        let Ok(host) = self.mem.host_range(page_pa, 1 << TLB_SHIFT) else {
-            return;
-        };
-        let page_va = va & !((1u64 << TLB_SHIFT) - 1);
-        let delta = (host as u64).wrapping_sub(page_va);
+        let page = (1u64 << t.page_shift.max(TLB_SHIFT)) - 1;
         let kinds: &[TlbKind] = if kind == TlbKind::Store {
             &[TlbKind::Store, TlbKind::Load]
         } else {
             &[TlbKind::Load]
         };
-        for &k in kinds {
-            let ti = tlb_index(el, k);
-            let i = TlbEntry::index(ti, va);
-            self.state.tlb[ti].entries[i] = TlbEntry {
-                tag: TlbEntry::tag_for(va),
-                delta,
+        for piece in (0..=page).step_by(1 << TLB_SHIFT) {
+            let (piece_va, piece_pa) = ((va & !page) + piece, (t.pa & !page) + piece);
+            let Ok(host) = self.mem.host_range(piece_pa, 1 << TLB_SHIFT) else {
+                return;
             };
-            self.tlbs.filled(ti, i, va, t.size_shift, t.global);
+            let delta = (host as u64).wrapping_sub(piece_va);
+            for &k in kinds {
+                let ti = tlb_index(el, k);
+                let i = TlbEntry::index(ti, piece_va);
+                self.state.tlb[ti].entries[i] = TlbEntry {
+                    tag: TlbEntry::tag_for(piece_va),
+                    delta,
+                };
+                self.tlbs.filled(ti, i, piece_va, t.size_shift, t.global);
+            }
         }
     }
 }
