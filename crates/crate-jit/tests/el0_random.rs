@@ -274,6 +274,14 @@ impl Rng {
     fn bool(&mut self) -> bool {
         self.next() & 1 != 0
     }
+    fn reg_not_in(&mut self, avoid: &[u32]) -> u32 {
+        loop {
+            let r = self.reg();
+            if !avoid.contains(&r) {
+                return r;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- the stream
@@ -807,6 +815,60 @@ impl Gen<'_> {
                 out.push(sub_ext(SP, SP, k, EXT_UXTX, 4));
                 out.push(add_ext(r, SP, k, EXT_UXTX, 4));
                 out.push(add_ext(SP, SP, k, EXT_UXTX, 4));
+            }
+            64 | 65 => {
+                // Accesses off one base (a group) with the base changed
+                // between them: added to, replaced, written back by a pre- or
+                // post-indexed access, or loaded from memory.
+                let base = self.base();
+                let slot = (self.rng.next() as usize % (DATA_LEN / 8 - 32)) * 8;
+                out.extend(mov_imm(base, scratch + slot as u64));
+                let (rt, rt2, rt3) = (
+                    self.reg_not(&[base]),
+                    self.reg_not(&[base]),
+                    self.reg_not(&[base]),
+                );
+                out.push(str_imm(3, rt, base, 8 * self.rng.bits(2)));
+                match self.rng.next() % 5 {
+                    0 => out.push(add_imm(true, base, base, 16, false)),
+                    1 => {
+                        let other = (self.rng.next() as usize % (DATA_LEN / 8 - 32)) * 8;
+                        out.extend(mov_imm(base, scratch + other as u64));
+                    }
+                    2 => out.push(str_imm_wb(3, rt2, base, 8, true)),
+                    3 => out.push(ldr_imm_wb(3, rt2, base, 8, false)),
+                    _ => {
+                        // A pointer to another slot, stored, then loaded into
+                        // the base itself.
+                        let other = (self.rng.next() as usize % (DATA_LEN / 8 - 32)) * 8;
+                        out.extend(mov_imm(rt2, scratch + other as u64));
+                        out.push(str_imm(3, rt2, base, 32));
+                        out.push(ldr_imm(3, base, base, 32));
+                    }
+                }
+                out.push(ldr_imm(3, rt3, base, 8 * self.rng.bits(2)));
+                out.push(str_imm(3, rt, base, 8 * self.rng.bits(2)));
+            }
+            66 | 67 => {
+                // A group whose offsets straddle a page: its base just either
+                // side of a page boundary in the data region, accesses below
+                // and above it.
+                let base = self.base();
+                let k = (self.rng.next() % 7) as i64 * 8 - 24;
+                out.extend(mov_imm(base, (scratch as i64 + 0x1000 + k) as u64));
+                for _ in 0..2 + self.rng.next() % 3 {
+                    let off = (self.rng.next() % 8) as i32 * 8 - 32;
+                    let r = self.reg_not(&[base]);
+                    match self.rng.next() % 4 {
+                        0 => out.push(stur(3, r, base, off)),
+                        1 => out.push(ldur(3, r, base, off)),
+                        2 => out.push(stp(r, self.reg_not(&[base]), base, off)),
+                        _ => {
+                            let r2 = self.reg_not(&[base, r]);
+                            out.push(ldp(r, r2, base, off));
+                        }
+                    }
+                }
             }
             _ => out.push(add_reg(sf, rd, rn, rm, arith_shift, amount)),
         }
@@ -1405,6 +1467,157 @@ fn translations_are_shared_across_addresses() {
     for iter in 0..iterations() / 2 {
         check_stream(&shared, &mut rng, iter, false, Some(alias));
     }
+}
+
+/// A fault on a later access of a group (accesses off one base sharing one
+/// TLB check) must leave every guest register, and memory, as the
+/// instructions before it left them, with the PC at the faulting access. The
+/// data region's second page is unmapped; each program runs a group from the
+/// page below it into it, with other instructions between the accesses, and
+/// the CPU's own registers at a BRK where the faulting access is are the
+/// oracle.
+#[test]
+fn a_fault_in_a_group_leaves_every_register_exact() {
+    use asm::*;
+    let shared = Shared::new(RAM_SIZE);
+    let mut rng = Rng(0x0fa0_17ed_0000_0001);
+    let hole = shared.addr() + DATA_OFF as u64 + 0x1000;
+    let mut skipped = 0;
+    let runs = iterations() / 4;
+    for iter in 0..runs {
+        // The body: the base, then accesses at rising offsets, each with an
+        // ALU instruction after it, until one touches the hole.
+        let base = 1 + (rng.next() % 17) as u32;
+        let mut body = Vec::new();
+        let start = hole - 8 * (2 + rng.next() % 6);
+        body.extend(mov_imm(base, start));
+        let mut addr = start;
+        let pre = rng.bool();
+        if pre {
+            // A pre-indexed first access moves the base.
+            body.push(str_imm_wb(3, rng.reg_not_in(&[base]), base, -16, true));
+            addr -= 16;
+        }
+        let mut fault_at = None;
+        let mut off = 0i64;
+        while fault_at.is_none() {
+            let r = rng.reg_not_in(&[base]);
+            let kind = rng.next() % 3;
+            let size = if kind == 2 { 16 } else { 8 };
+            if addr + off as u64 + size > hole {
+                fault_at = Some(body.len());
+            }
+            body.push(match kind {
+                0 => str_imm(3, r, base, off as u32),
+                1 => ldr_imm(3, r, base, off as u32),
+                _ => stp(r, rng.reg_not_in(&[base]), base, off as i32),
+            });
+            let k = rng.reg_not_in(&[base]);
+            body.push(add_imm(true, k, k, 1 + rng.bits(8), false));
+            off += 8;
+        }
+        let fault_at = fault_at.unwrap();
+        let code_off = 0x100;
+        let mut words = trampoline();
+        let body_start = words.len();
+        words.extend(&body);
+        words.push(0xd4200000); // brk #0
+        // The oracle: the same code with a BRK where the faulting access is.
+        let mut cut = trampoline();
+        cut.extend(&body[..fault_at]);
+        cut.push(0xd4200000);
+
+        let mut init = random_init(&mut rng, &shared);
+        init.x[18] = 0;
+        shared.write(DATA_OFF, &vec![0u8; DATA_LEN]);
+        let exec = JitRegion::new(cut.len() * 4 + 4096).unwrap();
+        exec.writer().write_words(0, &cut);
+        exec.flush(0, cut.len() * 4);
+        let native = run_native(exec.exec_base() as u64, &init);
+        // As in `check_stream`, a native run that does not reach the BRK is
+        // no oracle (with other tests forking at the same time, the child
+        // now and then takes SIGBUS on its first instruction).
+        if native.sig != libc::SIGTRAP as u64 {
+            skipped += 1;
+            continue;
+        }
+        let native_data = shared.read(DATA_OFF, DATA_LEN);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        shared.write(0, &[0u8; 0x4000]);
+        shared.write(code_off, &code);
+        let at = shared.addr() + code_off as u64;
+        let l0 = page_tables(&shared, at & !0xfff, 0..1);
+        unmap(&shared, l0, hole);
+        for fast in [true, false] {
+            shared.write(DATA_OFF, &vec![0u8; DATA_LEN]);
+            let mut cache = CodeCache::with_mode(4 << 20, fast).unwrap();
+            let mut cpu = Cpu::new(guest_memory(&shared));
+            cpu.state.x[..31].copy_from_slice(&init.x);
+            cpu.state.sp = init.sp;
+            cpu.state.nzcv = init.nzcv;
+            cpu.state.v = init.v;
+            cpu.state.mmu = crate_jit::state::MmuRegs {
+                sctlr_el1: 1,
+                ttbr0_el1: l0,
+                tcr_el1: 16,
+                ..Default::default()
+            };
+            cpu.state.pc = at + (body_start * 4) as u64;
+            let stop = cpu.run(&mut cache);
+            let fault_pc = at + ((body_start + fault_at) * 4) as u64;
+            let mut got = Captured::default();
+            got.x.copy_from_slice(&cpu.state.x[..31]);
+            got.sp = cpu.state.sp;
+            got.nzcv = cpu.state.nzcv & 0xf000_0000;
+            got.v = cpu.state.v;
+            let mut want = native;
+            want.pc = 0;
+            want.done = 0;
+            want.sig = 0;
+            want.x[18] = 0;
+            got.x[18] = 0;
+            let data = shared.read(DATA_OFF, DATA_LEN);
+            if stop != Stop::Exception
+                || cpu.state.pc != fault_pc
+                || got != want
+                || data != native_data
+            {
+                eprintln!(
+                    "iteration {iter}, fast {fast}: stop {stop:?} at {:#x}, want {fault_pc:#x}",
+                    cpu.state.pc
+                );
+                report_divergence(
+                    iter,
+                    &Program {
+                        words: words.clone(),
+                        guest_pc: at + (body_start * 4) as u64,
+                        body_start,
+                    },
+                    &init,
+                    &want,
+                    &got,
+                );
+                panic!("a fault in a group left the state wrong");
+            }
+        }
+    }
+    assert!(skipped * 10 <= runs, "{skipped} of {runs} oracles failed");
+}
+
+/// Makes the 4 KiB page at `va` unmapped in the tables `page_tables` built.
+fn unmap(shared: &Shared, l0: u64, va: u64) {
+    let base = shared.addr();
+    let read = |pa: u64| -> u64 {
+        u64::from_le_bytes(shared.read((pa - base) as usize, 8).try_into().unwrap())
+    };
+    let mut table = l0;
+    for level in 0..3 {
+        let shift = 39 - 9 * level;
+        table = read(table + ((va >> shift) & 0x1ff) * 8) & 0x0000_ffff_ffff_f000;
+    }
+    let slot = table + ((va >> 12) & 0x1ff) * 8;
+    shared.write((slot - base) as usize, &0u64.to_le_bytes());
 }
 
 fn report_divergence(
