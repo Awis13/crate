@@ -3,10 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Translated code: one region of executable memory per CPU, the shared stubs
-//! at its start, and the blocks after them. Each block's cold code (its slow
-//! paths and the exits it takes until a chain is patched) goes at the far end
-//! of the region instead, which fills downwards, so the code that runs is
-//! packed together for the CPU's instruction cache.
+//! at its start, and the blocks after them. The region is used in segments of
+//! a MiB: the code that runs fills a segment upwards from its start, and each
+//! block's cold code (its slow paths and the exits it takes until a chain is
+//! patched) fills it downwards from its end, so the code that runs is packed
+//! together for the CPU's instruction cache, yet a block's conditional
+//! branches (which reach a MiB) go straight to its cold code.
 //!
 //! A block is found by the physical address its guest PC translated to and
 //! the mode it was translated for (its exception level, and whether debug
@@ -70,17 +72,22 @@ const MAX_BLOCK: usize = 512;
 /// region's start with B and BL, which reach 128 MiB back.
 pub const MAX_REGION: usize = 128 << 20;
 
+/// The size of a segment: as far as CBNZ and B.cond reach.
+const SEGMENT: usize = 1 << 20;
+
 /// Translated host code for one CPU.
 pub struct CodeCache {
     region: JitRegion,
     /// How much of the region is used: all of it up to `MAX_REGION`.
     capacity: usize,
+    /// The size of a segment: `SEGMENT`, or the whole capacity if smaller.
+    segment: usize,
     /// Next free byte in the region for the code that runs, which grows up
-    /// from the stubs.
+    /// from the stubs, then from the start of each segment.
     cursor: usize,
-    /// Where the cold code (slow paths, exits taken once) starts: it grows
-    /// down from the end of the capacity, so it stays out of the way of the
-    /// code that runs and within reach of the stubs.
+    /// Where the current segment's cold code (slow paths, exits taken once)
+    /// starts: it grows down from the segment's end, so it stays out of the
+    /// way of the code that runs and within reach of its branches.
     cold: usize,
     /// Every live block, by key, to the offset of its entry.
     blocks: FastMap<BlockKey, usize>,
@@ -108,8 +115,10 @@ pub enum TranslateError {
 impl CodeCache {
     /// A cache in `region`, whose slow path calls `helper`.
     pub fn with_region(region: JitRegion, helper: u64, fast: bool) -> Self {
+        let capacity = region.len().min(MAX_REGION);
         let mut cache = CodeCache {
-            capacity: region.len().min(MAX_REGION),
+            capacity,
+            segment: SEGMENT.min(capacity),
             region,
             cursor: 0,
             cold: 0,
@@ -121,7 +130,7 @@ impl CodeCache {
             epoch: 0,
             spare: translate::Spare::default(),
         };
-        cache.cold = cache.capacity;
+        cache.cold = cache.segment;
         cache.emit_stubs();
         cache
     }
@@ -148,18 +157,15 @@ impl CodeCache {
         self.stubs.mem = self.place(asm);
         let stats = std::env::var_os("CRATE_JIT_STATS").is_some();
         for el in 0..2 {
-            for ret in [false, true] {
-                let mut asm = Asm::new();
-                let base = self.exec(self.cursor);
-                let (at, miss) = emit::jc_stub(&mut asm, el, self.stubs.save, stats, ret);
-                self.place(asm);
-                if ret {
-                    self.stubs.jc_ret[el as usize] = base + at as u64;
-                } else {
-                    self.stubs.jc[el as usize] = base + at as u64;
-                    self.stubs.jc_miss[el as usize] = base + miss as u64;
-                }
-            }
+            let mut asm = Asm::new();
+            let base = self.exec(self.cursor);
+            let at = emit::jc_stubs(&mut asm, el, self.stubs.save, stats, emit::JC_COPIES);
+            self.place(asm);
+            let el = el as usize;
+            self.stubs.jc[el] = base + at.first as u64;
+            self.stubs.jc_stride[el] = at.stride as u64;
+            self.stubs.jc_ret[el] = base + at.ret as u64;
+            self.stubs.jc_miss[el] = base + at.miss as u64;
         }
     }
 
@@ -244,9 +250,20 @@ impl CodeCache {
     ) -> Result<u64, TranslateError> {
         // Before resolving the block's branches: one to the stubs from past
         // the end of the capacity would not reach them.
-        let cold = self.cold.saturating_sub(block.asm.cold_size()) & !15;
-        if self.cursor + block.asm.size_bound() + 16 > cold {
-            return Err(TranslateError::OutOfSpace);
+        let hot = block.asm.size_bound() + 16;
+        let mut cold = self.cold.saturating_sub(block.asm.cold_size()) & !15;
+        if self.cursor + hot > cold {
+            // The next segment, if there is one.
+            let next = (self.cursor / self.segment + 1) * self.segment;
+            if next + self.segment > self.capacity {
+                return Err(TranslateError::OutOfSpace);
+            }
+            self.cursor = next;
+            self.cold = next + self.segment;
+            cold = self.cold.saturating_sub(block.asm.cold_size()) & !15;
+            if self.cursor + hot > cold {
+                return Err(TranslateError::OutOfSpace);
+            }
         }
         let base = self.exec(self.cursor);
         let fetch_faulted = block.fetch_faulted;
@@ -326,7 +343,7 @@ impl CodeCache {
     /// Empties the cache. Safe only between block runs.
     pub fn reset(&mut self) {
         self.cursor = 0;
-        self.cold = self.capacity;
+        self.cold = self.segment;
         self.blocks.clear();
         self.pages.clear();
         self.epoch += 1;
@@ -337,9 +354,11 @@ impl CodeCache {
         self.blocks.len()
     }
 
-    /// Bytes of code in use.
+    /// Bytes of the region taken: all of it below the cursor, and the
+    /// current segment's cold code.
     pub fn used(&self) -> usize {
-        self.cursor + (self.capacity - self.cold)
+        let end = (self.cursor / self.segment + 1) * self.segment;
+        self.cursor + (end - self.cold)
     }
 }
 
@@ -355,6 +374,7 @@ mod tests {
         // Just short of the end, where the block's branches back to the
         // stubs would be out of reach.
         cache.cursor = MAX_REGION - 16;
+        cache.cold = MAX_REGION;
         let ctx = Ctx {
             el: 1,
             fast: true,

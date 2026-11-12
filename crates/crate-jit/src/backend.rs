@@ -50,10 +50,11 @@ core::arch::global_asm!(
     "stp d10, d11, [sp, #112]",
     "stp d12, d13, [sp, #128]",
     "stp d14, d15, [sp, #144]",
-    // Remember the host stack, then make SP the state block's address.
+    // Remember the host stack, then make SP the address of the state's
+    // registers (`offsets::ANCHOR` into it).
     "mov x9, sp",
-    "str x9, [x0, #{host_sp}]",
-    "mov sp, x0",
+    "add sp, x0, #{anchor}, lsl #12",
+    "str x9, [sp, #{host_sp}]",
     // Load the guest's flags and SIMD registers. The guest's FPCR and FPSR
     // stay in the host's registers between runs (the dispatcher does no
     // floating point, and reading or writing them stalls the pipeline), so
@@ -113,6 +114,7 @@ core::arch::global_asm!(
     "ldp x19, x20, [sp, #16]",
     "ldp x29, x30, [sp], #176",
     "ret",
+    anchor = const offsets::ANCHOR >> 12,
     host_sp = const offsets::HOST_SP,
     nzcv = const offsets::NZCV,
     v = const offsets::V,
@@ -877,7 +879,7 @@ impl Cpu {
         let page = va >> 12;
         let half = ((va >> 55) & 1) as usize;
         for t in 0..4 {
-            let i = TlbEntry::index(va);
+            let i = TlbEntry::index(t, va);
             if self.state.tlb[t].entries[i].tag == page {
                 self.state.tlb[t].entries[i].tag = TLB_INVALID;
             }
@@ -2530,7 +2532,7 @@ mod tests {
         cpu.state.x[1] = va;
         // LDR x5, [x1, #8] fills the EL1 load TLB for the page.
         cpu.memory_access(0xf940_0425, 0).unwrap();
-        let i = TlbEntry::index(va);
+        let i = TlbEntry::index(0, va);
         assert_eq!(cpu.state.tlb[0].entries[i].tag, va >> 12);
         let host = cpu.state.tlb[0].entries[i].delta.wrapping_add(va + 8);
         // SAFETY: the host address of guest RAM the test owns.

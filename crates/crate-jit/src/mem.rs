@@ -891,7 +891,7 @@ impl Cpu {
         };
         for &k in kinds {
             let ti = tlb_index(el, k);
-            let i = TlbEntry::index(va);
+            let i = TlbEntry::index(ti, va);
             self.state.tlb[ti].entries[i] = TlbEntry {
                 tag: TlbEntry::tag_for(va),
                 delta,

@@ -82,8 +82,16 @@ impl Default for TlbEntry {
 }
 
 impl TlbEntry {
-    pub fn index(va: u64) -> usize {
-        ((va >> TLB_SHIFT) as usize) & (TLB_ENTRIES - 1)
+    /// The entry of TLB `tlb` (see `tlb_index`) for `va`. The table that ends
+    /// at SP holds its entries in reverse order, which is how code that
+    /// subtracts the index from SP reaches them.
+    pub fn index(tlb: usize, va: u64) -> usize {
+        let i = ((va >> TLB_SHIFT) as usize) & (TLB_ENTRIES - 1);
+        if tlb == TLB_NEAR {
+            i ^ (TLB_ENTRIES - 1)
+        } else {
+            i
+        }
     }
 
     pub fn tag_for(va: u64) -> u64 {
@@ -92,8 +100,8 @@ impl TlbEntry {
 }
 
 /// A direct-mapped TLB for one kind of access at one exception level. Page
-/// aligned, so translated code reaches an entry with an `ADD` of the table's
-/// page and a pair load at offset zero.
+/// aligned, so translated code reaches an entry with a `SUB` of the table's
+/// distance below SP in pages and a pair load.
 #[repr(C, align(4096))]
 pub struct Tlb {
     pub entries: [TlbEntry; TLB_ENTRIES],
@@ -228,8 +236,14 @@ impl Exit {
 /// checks the ranges the emitted instructions need.
 #[repr(C, align(16))]
 pub struct CpuState {
+    /// The software TLBs, indexed by `tlb_index(el, kind)`. Translated code
+    /// has the address of `x` in SP, so they are below it, and the last, the
+    /// one for EL0 loads, ends right there: code reaches its entry for an
+    /// index with one instruction (`SUB Xd, SP, Xi, LSL #4`) rather than two.
+    pub tlb: [Tlb; 4],
     /// Guest X0..X30. Index 31 is unused (the encoding's register 31 is the
-    /// zero register or SP, never X31).
+    /// zero register or SP, never X31). Translated code has their address in
+    /// SP, and every offset in `offsets` is from there.
     pub x: [u64; 32],
     /// Where the memory fast path parks the host registers it borrows.
     pub scratch: [u64; 4],
@@ -332,8 +346,6 @@ pub struct CpuState {
     pub mmu: MmuRegs,
     pub debug: Debug,
 
-    /// The software TLBs, indexed by `tlb_index(el, kind)`.
-    pub tlb: [Tlb; 4],
     /// The jump caches for EL0 and EL1 code.
     pub jc: [JumpCache; 2],
 }
@@ -341,12 +353,16 @@ pub struct CpuState {
 /// Which of `CpuState::tlb` an access at `el` of `kind` uses.
 pub fn tlb_index(el: u32, kind: TlbKind) -> usize {
     match (el, kind) {
-        (0, TlbKind::Load) => 2,
-        (0, TlbKind::Store) => 3,
+        (0, TlbKind::Load) => TLB_NEAR,
+        (0, TlbKind::Store) => 2,
         (_, TlbKind::Load) => 0,
         (_, TlbKind::Store) => 1,
     }
 }
+
+/// The TLB that ends where translated code's SP points: EL0's loads, the
+/// most frequent accesses of the programs a machine runs.
+pub const TLB_NEAR: usize = 3;
 
 impl CpuState {
     pub fn new() -> Box<Self> {
@@ -404,53 +420,60 @@ pub mod offsets {
     use super::*;
     use std::mem::offset_of;
 
-    pub const X: u32 = offset_of!(CpuState, x) as u32;
-    pub const SCRATCH: u32 = offset_of!(CpuState, scratch) as u32;
-    pub const SP: u32 = offset_of!(CpuState, sp) as u32;
-    pub const PC: u32 = offset_of!(CpuState, pc) as u32;
-    pub const NZCV: u32 = offset_of!(CpuState, nzcv) as u32;
-    pub const PSTATE: u32 = offset_of!(CpuState, pstate) as u32;
-    pub const EXIT_REQUEST: u32 = offset_of!(CpuState, exit_request) as u32;
-    pub const IRQ_HINT: u32 = offset_of!(CpuState, irq_hint) as u32;
-    pub const EXIT: u32 = offset_of!(CpuState, exit) as u32;
-    pub const NEXT_PC: u32 = offset_of!(CpuState, next_pc) as u32;
-    pub const PAGE_VA: u32 = offset_of!(CpuState, page_va) as u32;
-    pub const CHAIN_SITE: u32 = offset_of!(CpuState, chain_site) as u32;
-    pub const SLOW_SITE: u32 = offset_of!(CpuState, slow_site) as u32;
-    pub const SLOW_RET: u32 = offset_of!(CpuState, slow_ret) as u32;
-    pub const MONITOR: u32 = offset_of!(CpuState, monitor) as u32;
-    pub const MONITOR_VALUE: u32 = offset_of!(CpuState, monitor_value) as u32;
-    pub const MONITOR_VALUE2: u32 = offset_of!(CpuState, monitor_value2) as u32;
-    pub const V: u32 = offset_of!(CpuState, v) as u32;
-    pub const FPCR: u32 = offset_of!(CpuState, fpcr) as u32;
-    pub const FPSR: u32 = offset_of!(CpuState, fpsr) as u32;
-    pub const EXCEPTION_KIND: u32 = offset_of!(CpuState, exception_kind) as u32;
-    pub const EXCEPTION_SYNDROME: u32 = offset_of!(CpuState, exception_syndrome) as u32;
-    pub const EXCEPTION_FAR: u32 = offset_of!(CpuState, exception_far) as u32;
-    pub const SYSREG: u32 = offset_of!(CpuState, sysreg) as u32;
-    pub const SYSREG_RT: u32 = offset_of!(CpuState, sysreg_rt) as u32;
-    pub const SYSREG_READ: u32 = offset_of!(CpuState, sysreg_read) as u32;
-    pub const HOST_SP: u32 = offset_of!(CpuState, host_sp) as u32;
-    pub const JC_MISSES: u32 = offset_of!(CpuState, jc_misses) as u32;
-    pub const JC_LOOKUPS: u32 = offset_of!(CpuState, jc_lookups) as u32;
-    pub const JC_CONTEXT: u32 = offset_of!(CpuState, jc_context) as u32;
-    pub const SELF_PTR: u32 = offset_of!(CpuState, self_ptr) as u32;
-    pub const CPU_PTR: u32 = offset_of!(CpuState, cpu_ptr) as u32;
-    pub const DISPATCH_TARGET: u32 = offset_of!(CpuState, dispatch_target) as u32;
-    pub const EPILOGUE: u32 = offset_of!(CpuState, epilogue) as u32;
-    pub const BANKED: u32 = offset_of!(CpuState, banked) as u32;
+    /// Where translated code's SP points in the state: at `x`.
+    pub const ANCHOR: usize = offset_of!(CpuState, x);
+
+    /// The offset from SP of a field at `offset` in the state.
+    const fn at(offset: usize) -> u32 {
+        (offset - ANCHOR) as u32
+    }
+
+    pub const X: u32 = at(offset_of!(CpuState, x));
+    pub const SCRATCH: u32 = at(offset_of!(CpuState, scratch));
+    pub const SP: u32 = at(offset_of!(CpuState, sp));
+    pub const PC: u32 = at(offset_of!(CpuState, pc));
+    pub const NZCV: u32 = at(offset_of!(CpuState, nzcv));
+    pub const PSTATE: u32 = at(offset_of!(CpuState, pstate));
+    pub const EXIT_REQUEST: u32 = at(offset_of!(CpuState, exit_request));
+    pub const IRQ_HINT: u32 = at(offset_of!(CpuState, irq_hint));
+    pub const EXIT: u32 = at(offset_of!(CpuState, exit));
+    pub const NEXT_PC: u32 = at(offset_of!(CpuState, next_pc));
+    pub const PAGE_VA: u32 = at(offset_of!(CpuState, page_va));
+    pub const CHAIN_SITE: u32 = at(offset_of!(CpuState, chain_site));
+    pub const SLOW_SITE: u32 = at(offset_of!(CpuState, slow_site));
+    pub const SLOW_RET: u32 = at(offset_of!(CpuState, slow_ret));
+    pub const MONITOR: u32 = at(offset_of!(CpuState, monitor));
+    pub const MONITOR_VALUE: u32 = at(offset_of!(CpuState, monitor_value));
+    pub const MONITOR_VALUE2: u32 = at(offset_of!(CpuState, monitor_value2));
+    pub const V: u32 = at(offset_of!(CpuState, v));
+    pub const FPCR: u32 = at(offset_of!(CpuState, fpcr));
+    pub const FPSR: u32 = at(offset_of!(CpuState, fpsr));
+    pub const EXCEPTION_KIND: u32 = at(offset_of!(CpuState, exception_kind));
+    pub const EXCEPTION_SYNDROME: u32 = at(offset_of!(CpuState, exception_syndrome));
+    pub const EXCEPTION_FAR: u32 = at(offset_of!(CpuState, exception_far));
+    pub const SYSREG: u32 = at(offset_of!(CpuState, sysreg));
+    pub const SYSREG_RT: u32 = at(offset_of!(CpuState, sysreg_rt));
+    pub const SYSREG_READ: u32 = at(offset_of!(CpuState, sysreg_read));
+    pub const HOST_SP: u32 = at(offset_of!(CpuState, host_sp));
+    pub const JC_MISSES: u32 = at(offset_of!(CpuState, jc_misses));
+    pub const JC_LOOKUPS: u32 = at(offset_of!(CpuState, jc_lookups));
+    pub const JC_CONTEXT: u32 = at(offset_of!(CpuState, jc_context));
+    pub const SELF_PTR: u32 = at(offset_of!(CpuState, self_ptr));
+    pub const CPU_PTR: u32 = at(offset_of!(CpuState, cpu_ptr));
+    pub const DISPATCH_TARGET: u32 = at(offset_of!(CpuState, dispatch_target));
+    pub const EPILOGUE: u32 = at(offset_of!(CpuState, epilogue));
+    pub const BANKED: u32 = at(offset_of!(CpuState, banked));
     pub const TPIDR_EL0: u32 = BANKED + offset_of!(Banked, tpidr_el0) as u32;
     pub const TPIDRRO_EL0: u32 = BANKED + offset_of!(Banked, tpidrro_el0) as u32;
     pub const TPIDR_EL1: u32 = BANKED + offset_of!(Banked, tpidr_el1) as u32;
     pub const SP_EL0: u32 = BANKED + offset_of!(Banked, sp_el0) as u32;
-    pub const MMU: u32 = offset_of!(CpuState, mmu) as u32;
+    pub const MMU: u32 = at(offset_of!(CpuState, mmu));
 
     /// The offset of a banked register, from its offset in `Banked`.
     pub const fn banked(off: usize) -> u32 {
         BANKED + off as u32
     }
-    pub const TLB: u32 = offset_of!(CpuState, tlb) as u32;
-    pub const JC: u32 = offset_of!(CpuState, jc) as u32;
+    pub const JC: u32 = at(offset_of!(CpuState, jc));
 
     /// The offset of guest register `n`'s spill slot.
     pub const fn x(n: u32) -> u32 {
@@ -467,9 +490,9 @@ pub mod offsets {
         SCRATCH + n * 8
     }
 
-    /// The offset of the first entry of TLB `index` (see `tlb_index`).
-    pub const fn tlb(index: usize) -> u32 {
-        TLB + (index * std::mem::size_of::<Tlb>()) as u32
+    /// How far below SP TLB `index` (see `tlb_index`) starts.
+    pub const fn tlb_below(index: usize) -> u32 {
+        (ANCHOR - offset_of!(CpuState, tlb) - index * std::mem::size_of::<Tlb>()) as u32
     }
 
     /// The offset of the first entry of the jump cache for `el`.
@@ -515,7 +538,7 @@ mod tests {
         // two requests ISB tests with one LDR X.
         assert_eq!(offsets::EXIT_REQUEST % 8, 0);
         assert_eq!(
-            std::mem::offset_of!(CpuState, sync_request) as u32,
+            (std::mem::offset_of!(CpuState, sync_request) - offsets::ANCHOR) as u32,
             offsets::EXIT_REQUEST + 4
         );
         assert_eq!(offsets::IRQ_HINT % 4, 0);
@@ -524,11 +547,15 @@ mod tests {
         // Pairs of Q registers reach 1008.
         assert_eq!(offsets::V % 16, 0);
         assert!(offsets::v(30) <= 1008);
-        // Every table starts on a page of the block: code adds the page and
-        // loads an entry at offset zero.
+        // Every table starts on a page of the block: code subtracts the
+        // pages; the near one ends at SP.
         for i in 0..4 {
-            assert_eq!(offsets::tlb(i) & 0xfff, 0);
+            assert_eq!(offsets::tlb_below(i) & 0xfff, 0);
         }
+        assert_eq!(
+            offsets::tlb_below(TLB_NEAR) as usize,
+            std::mem::size_of::<Tlb>()
+        );
         for el in 0..2 {
             assert_eq!(offsets::jc(el) & 0xfff, 0);
         }
@@ -562,7 +589,8 @@ mod tests {
             TLB_INVALID,
             "a zero VA still tags valid"
         );
-        assert_eq!(TlbEntry::index(0x5_0000) & !(TLB_ENTRIES - 1), 0);
+        assert_eq!(TlbEntry::index(0, 0x5_0000) & !(TLB_ENTRIES - 1), 0);
+        assert_eq!(TlbEntry::index(TLB_NEAR, 0), TLB_ENTRIES - 1);
         let s = CpuState::new();
         assert!(
             s.tlb

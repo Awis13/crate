@@ -47,7 +47,9 @@ use crate::decode::{self, CallKind, CondKind, Mem, MemKind, Op};
 use crate::emit::{self, ExitInfo, JUMP_REG, Next, Stubs};
 use std::mem::offset_of;
 
-use crate::state::{Banked, Exit, MmuRegs, TLB_BITS, TLB_SHIFT, TlbKind, offsets, tlb_index};
+use crate::state::{
+    Banked, Exit, MmuRegs, TLB_BITS, TLB_NEAR, TLB_SHIFT, TlbEntry, TlbKind, offsets, tlb_index,
+};
 
 /// What every block of one translation context shares.
 #[derive(Clone, Copy, Debug)]
@@ -549,9 +551,6 @@ pub struct Block {
     /// The link value of a call just translated: the next instruction, if it
     /// is translated right after the call, is an entry.
     returns_to: Option<u64>,
-    /// Branches after the block's code to labels in the cold section (or out
-    /// of reach of a conditional branch): (where, to).
-    tramps: Vec<(Label, Label)>,
     /// Host registers no scratch choice may take: a group's host base.
     pinned: u32,
     /// The groups of accesses one TLB check covers, and for each instruction
@@ -574,7 +573,6 @@ pub struct Spare {
     ahead: Vec<(u32, u32)>,
     entries: Vec<(u64, Label)>,
     calls: Vec<(Label, u64, u64, Option<u64>)>,
-    tramps: Vec<(Label, Label)>,
     groups: Vec<Group>,
     member: Vec<Option<usize>>,
 }
@@ -665,7 +663,6 @@ impl Block {
             entries: spare.entries,
             calls: spare.calls,
             returns_to: None,
-            tramps: spare.tramps,
             pinned: 0,
             groups: spare.groups,
             member: spare.member,
@@ -683,7 +680,6 @@ impl Block {
             ahead: self.ahead,
             entries: self.entries,
             calls: self.calls,
-            tramps: self.tramps,
             groups: self.groups,
             member: self.member,
         };
@@ -694,7 +690,6 @@ impl Block {
         spare.ahead.clear();
         spare.entries.clear();
         spare.calls.clear();
-        spare.tramps.clear();
         spare.groups.clear();
         spare.member.clear();
         spare
@@ -793,7 +788,7 @@ impl Block {
                 false
             }
             Op::IndBranch { link, ret, rn } => {
-                self.goto_reg(rn, link.then_some(pc.wrapping_add(4)), ret);
+                self.goto_reg(rn, link.then_some(pc.wrapping_add(4)), ret, pc);
                 true
             }
             Op::Sysreg { read, reg, rt } => {
@@ -1357,13 +1352,12 @@ impl Block {
         let [a, b, c] = self.scratch(ops.mask());
         let cache = self.cache;
         let slow = self.asm.label();
-        let tramp = self.reach(slow);
         let resume = self.asm.label();
 
         let va = self.emit_va(&m, literal, a, c);
         if m.align > 1 {
             self.asm.emit(and_imm(true, c, va, (m.align - 1) as u64));
-            self.asm.cbnz(true, c, tramp);
+            self.asm.cbnz(true, c, slow);
         }
         let el = if m.unprivileged { 0 } else { self.ctx.el };
         let kind = if m.load
@@ -1376,10 +1370,13 @@ impl Block {
             TlbKind::Store
         };
         let crosses = m.total > 1 && m.align < m.total;
-        self.emit_tlb_check(m.total, crosses, tlb_index(el, kind), va, b, c, tramp);
-        // The host address of the access; the host does it at that address
-        // with no offset.
-        self.asm.emit(add_reg(true, b, b, va, LSL, 0));
+        self.emit_tlb_check(m.total, crosses, tlb_index(el, kind), va, b, c, slow);
+        // A single register's access adds the offset to the host page itself
+        // (`[va, b]`); the others run at the host address with no offset.
+        let indexed = matches!(m.kind, MemKind::Gpr | MemKind::Vec);
+        if !indexed {
+            self.asm.emit(add_reg(true, b, b, va, LSL, 0));
+        }
         // `a` is free unless it holds the address an exclusive still needs or
         // a writeback starts from.
         let free = if va == a
@@ -1390,7 +1387,7 @@ impl Block {
         } else {
             Some(a)
         };
-        self.emit_access(&m, va, b, c, free);
+        self.emit_access(&m, va, b, c, free, indexed);
         self.emit_writeback(&m, va, c, free);
         self.asm.bind(resume);
         self.slow.push(SlowSite {
@@ -1422,8 +1419,7 @@ impl Block {
         }
         let alt = self.asm.label();
         let back = self.asm.label();
-        let to_alt = self.reach(alt);
-        self.asm.cbz(true, g.hb, to_alt);
+        self.asm.cbz(true, g.hb, alt);
         let hb = g.hb;
         self.asm.emit(match (m.writeback, m.kind) {
             // A pre-indexed first or post-indexed last access is at the
@@ -1502,21 +1498,18 @@ impl Block {
         } else {
             self.asm.emit(ubfx(b, anchor, TLB_SHIFT, TLB_BITS));
         }
-        self.asm.emit(add_ext(b, SP, b, EXT_UXTX, 4));
         let kind = if g.store {
             TlbKind::Store
         } else {
             TlbKind::Load
         };
-        let off = offsets::tlb(tlb_index(self.ctx.el, kind));
-        self.asm.emit(add_imm(true, b, b, off >> 12, true));
-        self.asm.emit(ldp(hb, b, b, 0));
+        let at = self.emit_tlb_entry(b, tlb_index(self.ctx.el, kind));
+        self.asm.emit(ldp(hb, b, b, at));
         self.asm
             .emit(emit::sub_reg_shifted(hb, hb, anchor, LSR, TLB_SHIFT));
         let fail = self.asm.label();
         let ok = self.asm.label();
-        let to_fail = self.reach(fail);
-        self.asm.cbnz(true, hb, to_fail);
+        self.asm.cbnz(true, hb, fail);
         self.asm.emit(add_reg(true, hb, b, anchor, LSL, 0));
         if g.lo != 0 {
             self.asm.emit_all(add_const(hb, hb, -g.lo, b));
@@ -1543,18 +1536,6 @@ impl Block {
             })
         });
         self.cache = target;
-    }
-
-    /// A label a conditional branch here can reach that leads to `to`, a
-    /// label in the cold section: `to` itself from cold code, else a branch
-    /// after the block's code.
-    fn reach(&mut self, to: Label) -> Label {
-        if self.asm.is_cold() {
-            return to;
-        }
-        let tramp = self.asm.label();
-        self.tramps.push((tramp, to));
-        tramp
     }
 
     /// The guest virtual address of the access's first byte: the base
@@ -1615,21 +1596,34 @@ impl Block {
         } else {
             self.asm.emit(ubfx(b, va, TLB_SHIFT, TLB_BITS));
         }
-        self.asm.emit(add_ext(b, SP, b, EXT_UXTX, 4));
-        let off = offsets::tlb(tlb);
-        debug_assert_eq!(off & 0xfff, 0);
-        self.asm.emit(add_imm(true, b, b, off >> 12, true));
-        self.asm.emit(ldp(c, b, b, 0));
+        let at = self.emit_tlb_entry(b, tlb);
+        self.asm.emit(ldp(c, b, b, at));
         self.asm
             .emit(emit::sub_reg_shifted(c, c, va, LSR, TLB_SHIFT));
         self.asm.cbnz(true, c, slow);
     }
 
+    /// Makes `b`, an entry's index in TLB `tlb`, the address its entry is
+    /// loaded from at the offset this returns: the near table's (EL0 loads,
+    /// see `CpuState::tlb`) in one instruction, any other's in two.
+    fn emit_tlb_entry(&mut self, b: Reg, tlb: usize) -> i32 {
+        if tlb == TLB_NEAR {
+            self.asm.emit(sub_ext(b, SP, b, EXT_UXTX, 4));
+            return -(std::mem::size_of::<TlbEntry>() as i32);
+        }
+        self.asm.emit(add_ext(b, SP, b, EXT_UXTX, 4));
+        let below = offsets::tlb_below(tlb);
+        debug_assert_eq!(below & 0xfff, 0);
+        self.asm.emit(sub_imm(true, b, b, below >> 12, true));
+        0
+    }
+
     /// The access itself, at the host address in `b`: the guest's own
     /// instruction with that as its base and no offset (the writeback is done
-    /// apart). `c` is scratch for X18 data, and `free`, when there is one, for
-    /// a store-exclusive.
-    fn emit_access(&mut self, m: &Mem, va: Reg, b: Reg, c: Reg, free: Option<Reg>) {
+    /// apart), or, `indexed`, a single register's at `va` plus the offset of
+    /// its host page in `b`. `c` is scratch for X18 data, and `free`, when
+    /// there is one, for a store-exclusive.
+    fn emit_access(&mut self, m: &Mem, va: Reg, b: Reg, c: Reg, free: Option<Reg>, indexed: bool) {
         match m.kind {
             MemKind::Gpr | MemKind::Vec | MemKind::Pair | MemKind::VecPair => {
                 let gpr = matches!(m.kind, MemKind::Gpr | MemKind::Pair);
@@ -1642,6 +1636,10 @@ impl Block {
                 let w = if pair {
                     // LDP/STP (signed offset) of the same kind, at [b].
                     (m.word & 0xc440_0000) | 0x2900_0000 | rt2 << 10 | b << 5 | rt
+                } else if indexed {
+                    // LDR/STR (register offset) of the same size and kind, at
+                    // [va, b].
+                    (m.word & 0xc4c0_0000) | 0x3820_6800 | b << 16 | va << 5 | rt
                 } else {
                     // LDUR/STUR of the same size and kind, at [b].
                     (m.word & 0xc4c0_0000) | 0x3800_0000 | b << 5 | rt
@@ -1766,7 +1764,6 @@ impl Block {
         let [a, b, c] = self.scratch(avoid);
         let cache = self.cache;
         let slow = self.asm.label();
-        let tramp = self.reach(slow);
         let resume = self.asm.label();
         match rt {
             31 => self.asm.emit(movz(true, a, 0, 0)),
@@ -1778,7 +1775,7 @@ impl Block {
         }
         // A 64-byte aligned block never crosses a page.
         let tlb = tlb_index(self.ctx.el, TlbKind::Store);
-        self.emit_tlb_check(64, false, tlb, a, b, c, tramp);
+        self.emit_tlb_check(64, false, tlb, a, b, c, slow);
         self.asm.emit(add_reg(true, b, b, a, LSL, 0));
         for off in [0, 16, 32, 48] {
             self.asm.emit(stp(XZR, XZR, b, off));
@@ -1823,14 +1820,11 @@ impl Block {
     }
 
     /// The out-of-line slow paths of the block's fast loads and stores, in
-    /// the cold section, reached through branches after the block's code;
-    /// then the literals of every slow-path call, in the section of the call.
+    /// the cold section, which their conditional branches reach directly (it
+    /// is in the same segment of the code region); then the literals of every
+    /// slow-path call, in the section of the call.
     fn emit_slow_sites(&mut self) {
         let sites = std::mem::take(&mut self.slow);
-        for (tramp, to) in std::mem::take(&mut self.tramps) {
-            self.asm.bind(tramp);
-            self.asm.b(to);
-        }
         self.asm.set_cold(true);
         for site in sites {
             self.asm.bind(site.label);
@@ -1907,17 +1901,11 @@ impl Block {
             let site = self.asm.label();
             if target <= pc {
                 // Backward: a chained loop must still let the CPU leave.
-                let kicked = self.asm.label();
                 self.asm.emit(ldr_imm(2, 16, SP, offsets::EXIT_REQUEST));
-                self.asm.cbnz(false, 16, kicked);
-                self.asm.bind(site);
-                self.asm.b(exit);
-                self.asm.bind(kicked);
-                self.asm.b(exit);
-            } else {
-                self.asm.bind(site);
-                self.asm.b(exit);
+                self.asm.cbnz(false, 16, exit);
             }
+            self.asm.bind(site);
+            self.asm.b(exit);
             // The exit runs until the site is patched: it goes in the cold
             // section.
             self.asm.set_cold(true);
@@ -1933,15 +1921,23 @@ impl Block {
             self.asm.set_cold(false);
             return;
         }
-        // Another page: through the jump cache.
-        emit::guest_va(&mut self.asm, JUMP_REG, target, self.page << 12, 17);
+        // Another page: through the jump cache. A link value is a guest
+        // address already in a register.
+        match link {
+            Some(ret) => {
+                self.asm
+                    .emit_all(add_const(JUMP_REG, 30, target.wrapping_sub(ret) as i64, 17))
+            }
+            None => emit::guest_va(&mut self.asm, JUMP_REG, target, self.page << 12, 17),
+        }
         self.asm
-            .b_abs(self.ctx.stubs.jc[self.ctx.el.min(1) as usize]);
+            .b_abs(self.ctx.stubs.jc_for(self.ctx.el.min(1) as usize, pc));
         self.terminated = true;
     }
 
-    /// Continues at the address in guest register `rn` (BR, BLR, RET).
-    fn goto_reg(&mut self, rn: u32, link: Option<u64>, ret: bool) {
+    /// Continues at the address in guest register `rn` (BR, BLR, RET at
+    /// `pc`).
+    fn goto_reg(&mut self, rn: u32, link: Option<u64>, ret: bool, pc: u64) {
         if !self.ctx.fast_paths() {
             self.exit(
                 Exit::Branch as u32,
@@ -1959,8 +1955,11 @@ impl Block {
         }
         let el = self.ctx.el.min(1) as usize;
         let stubs = &self.ctx.stubs;
-        self.asm
-            .b_abs(if ret { stubs.jc_ret[el] } else { stubs.jc[el] });
+        self.asm.b_abs(if ret {
+            stubs.jc_ret[el]
+        } else {
+            stubs.jc_for(el, pc)
+        });
         self.terminated = true;
     }
 
@@ -2009,12 +2008,12 @@ impl Block {
         for (tail, link, pc, target) in std::mem::take(&mut self.calls) {
             self.asm.bind(tail);
             self.cache = RegCache::default();
-            emit::guest_va(&mut self.asm, 30, link, self.page << 12, 31);
             match target {
-                Some(target) => self.goto_const(target, None, pc),
+                Some(target) => self.goto_const(target, Some(link), pc),
                 None => {
+                    emit::guest_va(&mut self.asm, 30, link, self.page << 12, 31);
                     let el = self.ctx.el.min(1) as usize;
-                    self.asm.b_abs(self.ctx.stubs.jc[el]);
+                    self.asm.b_abs(self.ctx.stubs.jc_for(el, pc));
                 }
             }
         }
