@@ -133,7 +133,13 @@ gcc -O2 10.0-10.6 s (22-26), four compiles at once 15.0-16.8 s (48-49), xz -T4
 16.6 s (34-38) and 1000 spawns 0.7-0.8 s (1.6-2.1), with every output hash
 unchanged and the kvm-unit-tests passing or skipping as before. Debian reaches
 a root prompt in 7.0 s on the Mac (4 CPUs), Chrome's V8 gives the same results
-faster, and Omarchy boots. PLAN's own items for this milestone remain: 16
+faster, and Omarchy boots. On the iPhone (aTerm crate with this code, Debian,
+jit, 3 CPUs, 1950 MiB, two launches) the root prompt came 5.4-5.7 s after
+launch (milestone 5: 6.6-7.0) and the desktop 6.5 s (8.2-8.4); in the guest,
+every output matching the Mac's, sha256 of 100 MB took 85-90 ms, a perl loop
+of 3 million 410-421 ms, sorting 300 thousand lines 87-101 ms, gzip and gunzip
+of 50 MB 416-426 ms, three sha256 of 50 MB at once 95-108 ms and `claude
+--version` 111-164 ms. PLAN's own items for this milestone remain: 16
 KB-page guest kernels, paravirtual TLB flushes and idle, guest memory mapped
 by the host MMU, translations kept across launches; so do a code cache shared
 by the CPUs and chained branches to another page. The largest cost left in a
