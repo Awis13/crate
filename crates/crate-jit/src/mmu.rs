@@ -124,6 +124,25 @@ pub fn ttbr0_page_shift(regs: &MmuRegs) -> u32 {
     tg0_page_shift(regs.tcr_el1).unwrap_or(12)
 }
 
+/// The page shift of the half of the address space `va` is in (TTBR0's or
+/// TTBR1's, by bit 55), from TCR: 12, 14 or 16 with the MMU on, 12 with it
+/// off.
+pub fn page_shift_of(regs: &MmuRegs, va: u64) -> u32 {
+    if regs.sctlr_el1 & SCTLR_M == 0 {
+        return 12;
+    }
+    let tg = if (va >> 55) & 1 == 0 {
+        tg0_page_shift(regs.tcr_el1)
+    } else {
+        tg1_page_shift(regs.tcr_el1)
+    };
+    tg.unwrap_or(12)
+}
+
+/// The largest mapping that is one page of its granule (4, 16 or 64 KiB), as
+/// log2 of its size; anything larger is a block, of 2 MiB or more.
+pub const PAGE_MAX_SHIFT: u32 = 16;
+
 /// The level of a walk whose descriptors `WalkCache` keeps: the one above
 /// the pages, whose entries cover 2 MiB each with the 4 KiB granule.
 const CACHED_LEVEL: i32 = 2;
