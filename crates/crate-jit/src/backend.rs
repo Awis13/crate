@@ -1919,9 +1919,22 @@ impl crate_core::board::CpuBackend for Jit {
     }
 }
 
+/// Asks the host to run this thread as work the user is waiting on: on a
+/// host with cores of two kinds the default class may put a vCPU on a slow
+/// one while other work runs. Not the class of the user interface itself,
+/// which a busy guest would then compete with.
+fn user_initiated_thread() {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // SAFETY: changes only the calling thread's QoS class.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+    }
+}
+
 impl Cpu {
     /// Starts the CPU each time it is turned on, until the machine stops.
     fn power_cycle(&mut self, board: &Board, cache: &mut CodeCache) {
+        user_initiated_thread();
         let mut start = (self.cpu == 0).then_some((board.boot.pc, board.boot.x));
         loop {
             let (pc, x) = match start.take() {
