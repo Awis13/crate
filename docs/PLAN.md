@@ -164,7 +164,15 @@ copies of the jump-cache stub per EL, so each indirect branch is predicted
 from few sites; and the TLB refills, 15% of a compile, which a page-walk cache
 and a larger TLB cut, while TLB invalidations stopped scanning whole tables
 (a boot's work fell by two thirds). A code cache shared by the CPUs was
-measured not to matter: a second compile translates almost nothing.
+measured not to matter: a second compile translates almost nothing. On the
+iPhone (aTerm crate with this code, Debian, jit, 3 CPUs, 1950 MiB, launched
+through StikDebug) the root prompt came 5.3 s after launch and the desktop
+6.3 s, with labwc and xfce4-panel running and no faults; in the guest, every
+output matching the Mac's, sha256 of 100 MB took 84 ms, the perl loop 312 ms
+(410-421 after the first three steps), sorting 72 ms, gzip and gunzip of 50 MB
+363 ms, three sha256 at once 81 ms, `claude --version` 165 ms, and headless
+Chrome ran a V8 loop of 10 million to the expected result in 2.4 s, Chrome's
+start included.
 
 ## How aTerm adopts it
 
