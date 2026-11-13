@@ -132,7 +132,7 @@ context, because virglrenderer makes the new context current to set it up yet
 believes the earlier one still is; and its `virgl_box` is taken to be the
 virtio box (six 32-bit fields). `CRATE_GL_DEBUG=1` makes debug contexts and
 logs ANGLE's own messages, which name the failing call. Once started,
-virglrenderer stays for the life of the process, as the iOS code region does:
+virglrenderer stays for the life of the process:
 `virgl_renderer_cleanup` waits for the thread of its render server, which the
 build crate uses starts even without venus and never finishes. A freed machine
 resets the renderer and releases its context, and the next one takes it up on
@@ -356,16 +356,15 @@ code runs again: a block's install and the chain patched to it used to be
 three calls to `sys_icache_invalidate`, each with two DSBs and an ISB.
 
 **On iOS** an app cannot make memory executable on its own; a debugger
-attached to it can, and StikDebug's scripts handle one `brk #0x69` stop a
-launch. `JitRegion::shared` maps the region executable (private, anonymous),
-checks that a debugger is tracing the process (a stop with none would kill
-it), stops with the region's address in x0 and its length in x1, and once the
-debugger has prepared every page and resumed past the instruction, remaps the
-same pages (copy = false) as the writable alias. The order matters: made the
-other way round, a writable mapping with an executable alias that the debugger
-prepares, the pages fault on execution. The region is kept for the life of the
-process, so a later machine gets it back. Every page is made resident when it
-is prepared, so it counts against the app's memory limit from the start.
+attached to it can. Attaching one, and the convention by which it is asked to
+prepare a region, belong to the app, so crate never claims a region there:
+the app passes one in with `crate_config_set_jit_region`, and without one
+`JitRegion::shared` fails. The app maps the region executable (private,
+anonymous), has the debugger prepare it, then remaps the same pages
+(copy = false) as the writable alias. The order matters: made the other way
+round, a writable mapping with an executable alias that the debugger prepares,
+the pages fault on execution. Every page is made resident when it is prepared,
+so it counts against the app's memory limit from the start.
 
 **The fast paths can be turned off** (`CRATE_JIT_SLOW=1`): every load and store
 then calls the slow path, every branch returns to the dispatcher, and system

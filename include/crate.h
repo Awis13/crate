@@ -100,18 +100,16 @@ crate_status crate_config_set_memory(crate_config *config, uint64_t bytes);
 
 /* Executable memory for the translator.
  *
- * By default crate gets its own: a region mapped twice (once writable, once
- * executable). On iOS an attached debugger is asked to authorize it, the
- * convention StikDebug's scripts follow: crate stops on `brk #0x69` with the
- * executable alias's address in x0 and its length in x1, and the debugger
- * prepares those pages and resumes it past the instruction. A script handles
- * one such stop per launch, so crate asks once and keeps the region for the
- * life of the process; a later machine gets the same region back, and one
- * that wants a larger region fails. Without a debugger attached creating the
- * machine fails with CRATE_ERR_JIT instead of stopping, which would kill the
- * process.
+ * On a Mac or Linux crate gets its own by default: a region mapped twice (once
+ * writable, once executable). On iOS it cannot, since only a debugger attached
+ * to the app can make memory executable there: the app has the region
+ * prepared and passes it here, and without one creating the machine fails
+ * with CRATE_ERR_JIT. iOS accepts it one way round: mapped executable first
+ * and prepared, then the same pages remapped (copy = false) as the writable
+ * alias; a writable mapping given an executable alias faults on execution.
+ * Every page is made resident when it is prepared, so it counts against the
+ * app's memory limit from the start.
  *
- * An app that gets executable memory some other way passes it here:
  * `executable` is where code runs, `writable` an alias of the same pages where
  * it is written (the same address where the host allows both at once). It
  * must stay valid until the machine is freed.
@@ -121,10 +119,8 @@ crate_status crate_config_set_memory(crate_config *config, uint64_t bytes);
 crate_status crate_config_set_jit_region(crate_config *config, void *executable, void *writable,
                                          size_t size);
 
-/* How much executable memory crate asks for when it gets its own, for the
-   whole machine: by default 128 MiB per CPU. On iOS every page is made
-   resident when it is authorized, so it counts against the app's memory
-   limit from the start. */
+/* How much executable memory crate asks for when it gets its own (never on
+   iOS), for the whole machine: by default 128 MiB per CPU. */
 crate_status crate_config_set_jit_size(crate_config *config, size_t bytes);
 
 /* Linux's boot protocol: an arm64 Image (raw or gzip-compressed), an optional
