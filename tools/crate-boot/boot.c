@@ -14,7 +14,9 @@
  * --display adds a screen with a keyboard and a tablet, seen through --vnc;
  * with --frames the app's own callback takes frames too, and counts them.
  * --runs N boots the machine again, in the same process, each time the guest
- * powers off, as an app does when the user starts it again.
+ * powers off, as an app does when the user starts it again. --later-modes
+ * T:WxH,... offers the display new modes T seconds after the first start, as
+ * an app does when the phone rotates; it may be given more than once.
  */
 #include <errno.h>
 #include <pthread.h>
@@ -156,6 +158,37 @@ static void *feed(void *arg) {
     }
 }
 
+/* "WxH,WxH,...": up to `max` modes into `list`; returns how many. */
+static size_t parse_modes(const char *text, crate_display_mode *list, size_t max) {
+    size_t count = 0;
+    for (const char *m = text; m && count < max; m = strchr(m, ',')) {
+        if (*m == ',') m++;
+        if (sscanf(m, "%ux%u", &list[count].width, &list[count].height) == 2) count++;
+    }
+    return count;
+}
+
+static struct {
+    double at;
+    const char *modes;
+} later[8];
+static int nlater;
+
+/* Offers --later-modes at their times, counted from `started`. */
+static void *offer_later(void *arg) {
+    double start = *(double *)arg;
+    for (int i = 0; i < nlater; i++) {
+        double wait = start + later[i].at - now();
+        if (wait > 0) usleep((useconds_t)(wait * 1e6));
+        crate_display_mode list[45];
+        size_t count = parse_modes(later[i].modes, list, 45);
+        crate_status status = crate_display_set_modes(machine, 0, list, count);
+        fprintf(stderr, "crate-boot: offered %s at %.2f s (status %d)\n", later[i].modes,
+                now() - start, status);
+    }
+    return NULL;
+}
+
 #ifdef __APPLE__
 /* Two mappings of the same pages, as an app would make for iOS. */
 static int app_region(size_t size, void **exec, void **write) {
@@ -185,7 +218,8 @@ static const char usage[] =
     "                  [--cpus N] [--memory MIB] [--forward HOSTPORT:GUESTPORT]...\n"
     "                  [--backend auto|jit|hvf] [--jit-size MIB] [--app-region MIB]\n"
     "                  [--virtio-console] [--display 2d|virgl [--modes WxH,...]\n"
-    "                  [--vnc unix:PATH|tcp:HOST:PORT] [--frames]] [--runs N]\n";
+    "                  [--vnc unix:PATH|tcp:HOST:PORT] [--frames]\n"
+    "                  [--later-modes SECONDS:WxH,...]...] [--runs N]\n";
 
 int main(int argc, char **argv) {
     const char *kernel = NULL, *initrd = NULL, *cmdline = "console=ttyAMA0";
@@ -227,6 +261,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--display")) display = v;
         else if (!strcmp(a, "--modes")) modes = v;
         else if (!strcmp(a, "--vnc")) vnc = v;
+        else if (!strcmp(a, "--later-modes") && nlater < 8 && strchr(v, ':')) {
+            later[nlater].at = atof(v);
+            later[nlater++].modes = strchr(v, ':') + 1;
+        }
         else if (!strcmp(a, "--backend"))
             backend = !strcmp(v, "jit") ? CRATE_CPU_JIT
                       : !strcmp(v, "hvf") ? CRATE_CPU_HVF
@@ -303,11 +341,7 @@ int main(int argc, char **argv) {
             check(crate_config_add_display(config, gpu, &screen, &index), "display");
             if (modes) {
                 crate_display_mode list[45];
-                size_t count = 0;
-                for (const char *m = modes; m && count < 45; m = strchr(m, ',')) {
-                    if (*m == ',') m++;
-                    if (sscanf(m, "%ux%u", &list[count].width, &list[count].height) == 2) count++;
-                }
+                size_t count = parse_modes(modes, list, 45);
                 check(crate_config_set_display_modes(config, index, list, count), "modes");
             }
             if (vnc) check(crate_config_add_vnc(config, index, vnc), "vnc");
@@ -326,6 +360,13 @@ int main(int argc, char **argv) {
             pthread_t feeder;
             pthread_create(&feeder, NULL, feed, NULL);
             pthread_detach(feeder);
+            if (display && nlater) {
+                static double first_start;
+                first_start = started;
+                pthread_t offerer;
+                pthread_create(&offerer, NULL, offer_later, &first_start);
+                pthread_detach(offerer);
+            }
         }
 
         check(crate_machine_wait(machine, -1), "wait");

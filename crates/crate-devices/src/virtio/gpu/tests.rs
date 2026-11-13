@@ -220,16 +220,132 @@ fn offers_its_modes() {
         &answer[HEADER + 8..HEADER + 16],
         &[0, 255, 255, 255, 255, 255, 255, 0]
     );
+}
 
+impl Machine {
+    fn events(&self) -> u32 {
+        let mut events = [0u8; 4];
+        self.gpu.read_config(0, &mut events);
+        u32::from_le_bytes(events)
+    }
+
+    /// The first scanout's width, height and enabled flag.
+    fn display(&mut self) -> [u32; 3] {
+        let answer = self.send(&header(CMD_GET_DISPLAY_INFO, 0, 0));
+        let at = |i: usize| u32::from_le_bytes(answer[i..i + 4].try_into().unwrap());
+        [at(HEADER + 8), at(HEADER + 12), at(HEADER + 16)]
+    }
+
+    fn edid_size(&mut self) -> u32 {
+        let mut r = header(CMD_GET_EDID, 0, 0);
+        r.extend(words(&[0, 0]));
+        let answer = self.send(&r);
+        u32::from_le_bytes(answer[HEADER..HEADER + 4].try_into().unwrap())
+    }
+}
+
+#[test]
+fn new_modes_unplug_the_display_and_plug_it_back_in() {
+    let mut m = machine(None);
     m.gpu.control().set_modes(vec![Mode::new(1024, 768)]);
-    let mut events = [0u8; 4];
-    m.gpu.read_config(0, &mut events);
-    assert_eq!(events, [1, 0, 0, 0], "a display event");
+    assert_eq!(m.events(), EVENT_DISPLAY, "a display event");
+    assert_eq!(m.display(), [0, 0, 0], "unplugged");
+    assert_eq!(m.edid_size(), 0, "no EDID while unplugged");
     m.gpu.write_config(4, &[1, 0, 0, 0]);
-    m.gpu.read_config(0, &mut events);
+    assert_eq!(m.events(), 0);
+    // The compositor lets go of the display it lost.
+    m.send_ok(CMD_SET_SCANOUT, &[0, 0, 0, 0, 0, 0]);
+    assert_eq!(m.events(), EVENT_DISPLAY, "plugged back in");
+    assert_eq!(m.display(), [1024, 768, 1]);
+    assert_eq!(m.edid_size(), 128);
+}
+
+#[test]
+fn a_replug_before_the_guest_clears_the_unplug_is_raised_after() {
+    let mut m = machine(None);
+    m.gpu.control().set_modes(vec![Mode::new(1024, 768)]);
+    assert_eq!(m.display(), [0, 0, 0]);
+    m.send_ok(CMD_SET_SCANOUT, &[0, 0, 0, 0, 0, 0]);
+    assert_eq!(m.events(), EVENT_DISPLAY);
+    // Clearing the unplug's event must not lose the replug's.
+    m.gpu.write_config(4, &[1, 0, 0, 0]);
+    assert_eq!(m.events(), EVENT_DISPLAY, "raised again");
+    m.gpu.write_config(4, &[1, 0, 0, 0]);
+    assert_eq!(m.events(), 0);
+    assert_eq!(m.display(), [1024, 768, 1]);
+}
+
+#[test]
+fn a_display_turned_off_before_the_guest_saw_it_unplugged_stays_out() {
+    let mut m = machine(None);
+    m.gpu.control().set_modes(vec![Mode::new(1024, 768)]);
+    m.send_ok(CMD_SET_SCANOUT, &[0, 0, 0, 0, 0, 0]);
+    m.gpu.write_config(4, &[1, 0, 0, 0]);
+    assert_eq!(m.events(), 0, "no replug yet");
+    assert_eq!(m.display(), [0, 0, 0]);
+}
+
+#[test]
+fn modes_that_arrive_while_unplugged_are_what_comes_back() {
+    let mut m = machine(None);
+    let control = m.gpu.control();
+    control.set_modes(vec![Mode::new(800, 600), Mode::new(640, 480)]);
+    assert_eq!(m.events(), 0, "the same modes change nothing");
+    control.set_modes(vec![Mode::new(1024, 768)]);
+    m.gpu.write_config(4, &[1, 0, 0, 0]);
+    control.set_modes(vec![Mode::new(600, 800)]);
+    control.set_modes(vec![Mode::new(768, 1024)]);
+    assert_eq!(m.events(), 0, "one unplug");
+    assert_eq!(m.display(), [0, 0, 0]);
+    m.send_ok(CMD_SET_SCANOUT, &[0, 0, 0, 0, 0, 0]);
+    assert_eq!(m.display(), [768, 1024, 1]);
+}
+
+#[test]
+fn a_display_the_guest_keeps_comes_back_on_its_own() {
+    let mut m = machine(None);
+    m.gpu.control().set_modes(vec![Mode::new(1024, 768)]);
+    assert_eq!(m.display(), [0, 0, 0]);
+    m.gpu.write_config(4, &[1, 0, 0, 0]);
+    let start = Instant::now();
+    while m.events() == 0 {
+        assert!(start.elapsed() < REPLUG_AFTER * 3, "never plugged back in");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(start.elapsed() >= REPLUG_AFTER / 2);
+    assert_eq!(m.display(), [1024, 768, 1]);
+}
+
+#[test]
+fn modes_before_the_driver_starts_need_no_unplug() {
+    let memory = memory();
+    let mut gpu = Gpu::new(GpuConfig {
+        modes: vec![Mode::new(800, 600)],
+        sink: Arc::new(Screen::default()),
+        renderer: None,
+    })
+    .unwrap();
+    gpu.control().set_modes(vec![Mode::new(1024, 768)]);
+    let mut events = [0u8; 4];
+    gpu.read_config(0, &mut events);
     assert_eq!(events, [0; 4]);
-    let answer = m.send(&header(CMD_GET_DISPLAY_INFO, 0, 0));
-    assert_eq!(&answer[HEADER + 8..HEADER + 16], &words(&[1024, 768])[..]);
+    gpu.activate(Activation {
+        memory: memory.clone(),
+        queues: vec![
+            Queue::new(memory.clone(), config(16)),
+            Queue::new(memory.clone(), cursor_config()),
+        ],
+        interrupt: Interrupt::new(IrqLine::new(Arc::new(LevelRecorder::default()), 0)),
+        features: F_VERSION_1,
+    });
+    let mut m = Machine {
+        gpu,
+        control: Driver::new(memory.clone(), 16),
+        cursor: Driver::at(memory.clone(), cursor_config()),
+        memory,
+        screen: Arc::new(Screen::default()),
+    };
+    assert_eq!(m.display(), [1024, 768, 1]);
 }
 
 #[test]

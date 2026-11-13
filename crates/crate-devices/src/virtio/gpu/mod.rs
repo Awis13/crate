@@ -18,12 +18,19 @@
 //! cursor drawn in. A flush makes a frame only while the sink is active;
 //! otherwise the device remembers the screen is stale and makes a whole frame
 //! when asked (`GpuControl::refresh`).
+//!
+//! New modes while the guest runs (`GpuControl::set_modes`) arrive as a
+//! display unplugged and plugged back in: the scanout first reads as disabled,
+//! with no EDID, and comes back with the new modes once the guest has turned
+//! it off, or after `REPLUG_AFTER`. A compositor reads a connector's modes
+//! when it is connected, not again while it stays connected, so only a new
+//! connection makes it take the new preferred mode.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate_core::display::{DisplayControl, DisplaySink, Frame, Mode, Rect};
 use crate_core::gpu::{Box3d, Capset, HostSlice, Renderer, RendererFactory, Resource3d, Transfer};
@@ -95,6 +102,9 @@ const MAX_BACKING_ENTRIES: u32 = 1 << 20;
 /// How long the GPU thread waits between looks at the renderer's fences while
 /// some are outstanding.
 const FENCE_POLL: Duration = Duration::from_micros(500);
+/// How long the display stays unplugged at most when the guest does not turn
+/// it off, so it is never left out.
+const REPLUG_AFTER: Duration = Duration::from_secs(1);
 
 pub struct GpuConfig {
     /// Offered to the guest in this order; the first is the preferred size.
@@ -119,8 +129,52 @@ struct Work {
     /// The thread has ended; nobody will finish a reset.
     gone: bool,
     events: u32,
+    /// A display event to raise once the guest clears the one it has, which
+    /// would clear a second one raised now along with it.
+    event_again: bool,
     interrupt: Option<Arc<Interrupt>>,
+    /// What the guest is offered; while the display is out, what it comes
+    /// back with.
     modes: Vec<Mode>,
+    plug: Plug,
+}
+
+/// Whether the display reads as connected.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Plug {
+    In,
+    /// Unplugged for new modes until the guest turns the scanout off, once it
+    /// has read the display as disabled (`seen`), or `by` passes.
+    Out {
+        by: Instant,
+        seen: bool,
+    },
+}
+
+impl Work {
+    fn raise_display_event(&mut self) {
+        if self.events & EVENT_DISPLAY != 0 {
+            self.event_again = true;
+            return;
+        }
+        self.events |= EVENT_DISPLAY;
+        if let Some(interrupt) = &self.interrupt {
+            interrupt.signal_config();
+        }
+    }
+
+    fn plug_in(&mut self) {
+        self.plug = Plug::In;
+        self.raise_display_event();
+    }
+
+    /// When the display must be back, while it is out.
+    fn plug_by(&self) -> Option<Instant> {
+        match self.plug {
+            Plug::In => None,
+            Plug::Out { by, .. } => Some(by),
+        }
+    }
 }
 
 struct Shared {
@@ -141,18 +195,31 @@ impl Shared {
 pub struct GpuControl(Arc<Shared>);
 
 impl GpuControl {
-    /// Offers the guest new modes, the first preferred, and tells it the
-    /// display changed.
+    /// Offers the guest new modes, the first preferred, by unplugging the
+    /// display and plugging it back in with them (see the module comment).
+    /// The same modes again change nothing; new ones while the display is out
+    /// are what it comes back with.
     pub fn set_modes(&self, modes: Vec<Mode>) {
         if modes.is_empty() {
             return;
         }
         let mut w = self.0.work.lock().unwrap();
-        w.modes = modes;
-        w.events |= EVENT_DISPLAY;
-        if let Some(interrupt) = &w.interrupt {
-            interrupt.signal_config();
+        if w.modes == modes {
+            return;
         }
+        w.modes = modes;
+        // Without a driver there is nobody to tell; it reads them when it
+        // starts.
+        if w.interrupt.is_none() || w.plug != Plug::In {
+            return;
+        }
+        w.plug = Plug::Out {
+            by: Instant::now() + REPLUG_AFTER,
+            seen: false,
+        };
+        w.raise_display_event();
+        // The GPU thread keeps the time.
+        self.0.wake.notify_one();
     }
 }
 
@@ -186,8 +253,10 @@ impl Gpu {
                 exit: false,
                 gone: false,
                 events: 0,
+                event_again: false,
                 interrupt: None,
                 modes: config.modes,
+                plug: Plug::In,
             }),
             wake: Condvar::new(),
             reset_done: Condvar::new(),
@@ -290,7 +359,12 @@ impl VirtioDevice for Gpu {
         // events_clear, at 4: the driver acknowledges the events it has seen.
         if offset == 4 && data.len() == 4 {
             let clear = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            self.shared.work.lock().unwrap().events &= !clear;
+            let mut w = self.shared.work.lock().unwrap();
+            w.events &= !clear;
+            if clear & EVENT_DISPLAY != 0 && w.event_again {
+                w.event_again = false;
+                w.raise_display_event();
+            }
         }
     }
 
@@ -314,6 +388,8 @@ impl VirtioDevice for Gpu {
         w.interrupt = None;
         w.notified = 0;
         w.events = 0;
+        w.event_again = false;
+        w.plug = Plug::In;
         w.resets_asked += 1;
         let asked = w.resets_asked;
         self.shared.wake.notify_one();
@@ -480,6 +556,11 @@ impl Worker {
                     if w.exit {
                         return;
                     }
+                    let plug_by = w.plug_by();
+                    if plug_by.is_some_and(|by| Instant::now() >= by) {
+                        w.plug_in();
+                        continue;
+                    }
                     if w.notified != 0
                         || w.refresh
                         || w.resets_asked != w.resets_done
@@ -487,14 +568,20 @@ impl Worker {
                     {
                         break;
                     }
-                    if self.fenced.is_empty() {
+                    if self.fenced.is_empty() && plug_by.is_none() {
                         w = self.shared.wake.wait(w).unwrap();
-                    } else {
-                        let (guard, wait) = self.shared.wake.wait_timeout(w, FENCE_POLL).unwrap();
-                        w = guard;
-                        if wait.timed_out() {
-                            break;
-                        }
+                        continue;
+                    }
+                    let mut wait = plug_by.map_or(FENCE_POLL, |by| {
+                        by.saturating_duration_since(Instant::now())
+                    });
+                    if !self.fenced.is_empty() {
+                        wait = wait.min(FENCE_POLL);
+                    }
+                    let (guard, waited) = self.shared.wake.wait_timeout(w, wait).unwrap();
+                    w = guard;
+                    if waited.timed_out() && !self.fenced.is_empty() {
+                        break;
                     }
                 }
                 // A reset drops any activation and notifications before it,
@@ -750,8 +837,14 @@ impl Worker {
                 if r.u32(0) as usize >= self.scanouts.len() {
                     return err(RESP_ERR_INVALID_SCANOUT_ID);
                 }
-                let modes = self.shared.work.lock().unwrap().modes.clone();
-                let blob = edid::edid(&modes);
+                let w = self.shared.work.lock().unwrap();
+                // Unplugged: no EDID.
+                let blob = if w.plug == Plug::In {
+                    edid::edid(&w.modes)
+                } else {
+                    Vec::new()
+                };
+                drop(w);
                 let mut data = vec![0u8; 8 + 1024];
                 data[0..4].copy_from_slice(&(blob.len() as u32).to_le_bytes());
                 data[8..8 + blob.len()].copy_from_slice(&blob);
@@ -801,8 +894,13 @@ impl Worker {
 
     fn display_info(&self) -> Vec<u8> {
         let mut data = vec![0u8; 24 * MAX_SCANOUTS];
-        let modes = self.shared.work.lock().unwrap().modes.clone();
-        if let Some(mode) = modes.first() {
+        let mut w = self.shared.work.lock().unwrap();
+        if let Plug::Out { seen, .. } = &mut w.plug {
+            // Unplugged: every scanout disabled, and the guest now knows.
+            *seen = true;
+            return data;
+        }
+        if let Some(mode) = w.modes.first() {
             for one in data.chunks_exact_mut(24).take(self.scanouts.len()) {
                 one[8..12].copy_from_slice(&mode.width.to_le_bytes());
                 one[12..16].copy_from_slice(&mode.height.to_le_bytes());
@@ -874,6 +972,13 @@ impl Worker {
             return Err(RESP_ERR_INVALID_SCANOUT_ID);
         }
         if id == 0 {
+            // The guest let go of a display it read as unplugged: plug it
+            // back in.
+            let mut w = self.shared.work.lock().unwrap();
+            if matches!(w.plug, Plug::Out { seen: true, .. }) {
+                w.plug_in();
+            }
+            drop(w);
             // Off: the screen goes black.
             let scanout = &mut self.scanouts[index];
             scanout.resource = 0;

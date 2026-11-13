@@ -106,8 +106,18 @@ the first, and the EDID (VESA E-EDID 1.4) carries each as a detailed timing
 with CVT timings at 60 Hz (reduced blanking when the CRT timing's clock is too
 fast for a descriptor), three in the base block beside a monitor name and six
 in each CTA-861 extension block. Linux lists exactly those modes, and the guest
-changes between them itself; the app can offer new ones while it runs, which
-raises a display event.
+changes between them itself. The app can offer new ones while it runs (a phone
+rotating or folding), and they arrive as the display unplugged and plugged back
+in, because a compositor reads a connector's modes when it connects and not
+again while it stays connected (labwc on wlroots 0.18 keeps the old list). The
+scanout reads as disabled, with no EDID, and a display event is raised; once
+the guest has read that and turned the scanout off, or after a second if it
+does not, the display comes back with the new modes and a second event. Each
+compositor then makes a new output at the new preferred mode, with nothing to
+install in the guest. Modes that arrive while the display is out replace the
+ones it comes back with, and the same modes again change nothing. A second
+event raised before the guest clears the first waits for the clear, which
+would otherwise take both.
 
 **Frames** go to a `DisplaySink` as R, G, B, A, with the cursor drawn in (from
 UPDATE_CURSOR's resource; the fourth byte is read as alpha even when the

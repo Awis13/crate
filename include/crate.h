@@ -285,9 +285,13 @@ crate_status crate_config_add_vnc(crate_config *config, uint32_t display, const 
    app, with no copy, is planned. */
 void crate_display_set_active(crate_machine *machine, uint32_t display, bool active);
 
-/* Offers the guest new modes while it runs, as crate_config_set_display_modes
-   does, and tells it the display changed. The guest decides whether to change
-   to the new preferred mode. */
+/* Offers the guest new modes while it runs, the first preferred, as a display
+   unplugged and plugged back in with them: a compositor reads modes when a
+   display connects, so this is what makes a desktop take the new preferred
+   mode (a phone rotating or folding) with nothing installed in the guest. The
+   display reads as disconnected until the guest turns it off, or for a second
+   at most, then connects again. Modes given while it is out are the ones it
+   comes back with; the same modes as now change nothing. */
 crate_status crate_display_set_modes(crate_machine *machine, uint32_t display,
                                      const crate_display_mode *modes, size_t count);
 
