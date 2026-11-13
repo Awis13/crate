@@ -277,6 +277,13 @@ an optimizing second tier for hot code might give about 1.5x on compute
 - With breakpoints or single-step active, the dispatcher keeps a pending
   same-page chain across a breakpoint or step, so a chain site could be
   patched to the debug exception's block.
+- **Xfce on Wayland does not follow new modes.** `crate_display_set_modes`
+  unplugs the display and plugs it back in, and the compositor takes the new
+  preferred mode (labwc, with its bar and background, follows a rotation), but
+  xfce4-panel disappears and xfdesktop stays at the old size: neither comes
+  back when its only output goes away. Possible fixes, none started: connect
+  the new modes as a second output before removing the old one, so the guest
+  always has one; or restart the two in the guest when outputs change.
 
 ## How aTerm adopts it
 
