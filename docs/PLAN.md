@@ -80,12 +80,12 @@ jump-cache lookups), are the input to milestone 6.
 The first part of milestone 5 was reached on 2026-11-11, everything but what
 needs milestone 4's GPU: the C API is implemented, crate builds as an
 XCFramework for iOS and macOS, and aTerm runs Debian on it as a third engine
-beside QEMU and Henge. On an iPhone (A20, iOS 27.1, JIT from StikDebug's
+beside its other two. On an iPhone (A20, iOS 27.1, JIT from StikDebug's
 legacy.js), Debian on three CPUs reaches a root prompt 6.3-6.6 s after the app
 launches, the debugger's authorization of the 384 MiB code region included
-(Henge: 7 s); a second tab connects over SSH, port forwards work, Claude Code
-runs, and poweroff and relaunch work. The desktop, resolution changes and the
-Omarchy guest wait for milestone 4.
+(the other translator: 7 s); a second tab connects over SSH, port forwards
+work, Claude Code runs, and poweroff and relaunch work. The desktop,
+resolution changes and the Omarchy guest wait for milestone 4.
 
 Milestone 4 was reached on 2026-11-11: a virtio-gpu with virgl (virglrenderer
 over ANGLE on Vulkan, OpenGL ES 3.1 in the guest), a keyboard and a tablet,
@@ -195,6 +195,88 @@ delta apart (the CPU predicts a plain load's value, but the extra instruction
 cost more), indexing the other TLBs down from SP like the near one (neutral),
 and a virtio-blk thread (the host serves the reads from its cache in
 microseconds; small reads got slower).
+
+## Remaining work
+
+Everything known to be left, as of 2026-11-12. Gains are time saved, measured
+or estimated on the Mac; "on hold" means the owner has decided to wait.
+
+### Milestones
+
+- **Milestone 7, ready to publish.** On hold.
+- **An interpreter backend**, for hosts where the app may not create
+  executable memory (on iOS, a launch without a debugger). Not started. It is
+  the one piece that would let an app use crate on every launch.
+- **Other guests as machines of their own.** Not started.
+  - Windows 11 on Arm needs UEFI firmware (EDK2, a separate binary under
+    its own license) and ACPI tables, since it reads no device tree; PCIe
+    with MSIs (the GIC's ITS and LPIs); NVMe and an xHCI controller with a
+    USB keyboard and tablet, which it has drivers for; the firmware's
+    framebuffer for a display; and virtio-net over PCI. The translator will
+    also meet instructions and registers Linux never used. Estimated at about
+    the size of milestones 1 to 5 together. A first step would boot the
+    firmware on `hvf` and run Windows' boot loader from the existing
+    virtio-mmio disk, proving firmware, ACPI, CPU, interrupts and timers
+    before any PCIe.
+  - macOS, later.
+- **PCIe** as a second virtio transport, which both of those need.
+
+### Speed
+
+Milestone 6's own list:
+
+- **16 KB-page guest kernels: done.** A 16 KiB page fills its four 4 KiB TLB
+  pieces at once and a TLBI drops them together. Against the same kernel at
+  4 KB: compute ties, boot about 5% faster, 1000 spawns 15-20% faster; it uses
+  more memory (about 250 MB more in use with a desktop at 1950 MiB, and
+  Chrome's anonymous memory 55-64% more). Which page size a guest uses is the
+  machine's or the app's choice.
+- **Paravirtual TLB flushes and idle.** Not started. Would be a machine's
+  setting, since only Linux has the hooks.
+- **Guest memory mapped by the host MMU.** Shelved. On the Mac it would cut
+  compute lines by 20-40% but make spawning 2-3x slower, unless used per
+  address space. A guest's 47-bit address space does not fit even in macOS's;
+  on an iPhone the app gets 7.5 GiB of address space (6 GiB in its largest
+  range), and every alias of guest RAM it touches costs a page of the app's
+  memory. Only for guests with small address spaces.
+- **Translations kept across launches.** On hold: every launch starts cold,
+  so a reboot reproduces a test.
+
+Found since, by profiling (estimates, together about 10-20%). On hold:
+
+1. Guest SP and its page address kept in registers within a block: gcc and
+   spawns 3-6%.
+2. A return-address stack for RET: 1-4% on most lines.
+3. A code cache shared by the CPUs: boot 5-8%, elsewhere nothing.
+4. A faster translator (decode, emit, install): boot 4-7%, `node -e 0` 3-5%.
+5. Indirect branches looked up at the site: awk 8-12%.
+6. IC IVAU without an exit (CTR_EL0.DIC set, stores to translated pages
+   caught in the store TLB): `node -e 0` about 6%.
+7. Flushes handed off the vCPU in virtio-blk: boot 2-5%.
+8. Cheaper exits: spawns 3-5%.
+9. A cheaper check for exit requests at backward branches: loops 0-5%.
+
+Beyond those, translated code itself runs at about 1.8x native in a compile;
+an optimizing second tier for hot code might give about 1.5x on compute
+(a guess, not measured).
+
+### Gaps and known bugs
+
+- **No virtio-net offloads or event index**, so TCP moves about 20 MB/s. The
+  gap a user notices most (package installs, clones).
+- Pause and resume, the power button and disk discard are in `crate.h` but
+  return CRATE_ERR_UNSUPPORTED.
+- No virtio-gpu blob resources: every frame shown is a GL readback and a copy.
+- PL031 alarms never fire.
+- An MMIO access the CPU cannot describe (ISV clear) stops the machine. Linux
+  never makes one; other guests may.
+- vCPU threads run translated code with SP just above the CPU state's TLB and
+  no alternate signal stack, so a signal delivered to one (the SIGUSR1 dump
+  handler is installed without SA_ONSTACK) would write its frame over the
+  TLB. Nothing sends one today.
+- With breakpoints or single-step active, the dispatcher keeps a pending
+  same-page chain across a breakpoint or step, so a chain site could be
+  patched to the debug exception's block.
 
 ## How aTerm adopts it
 
