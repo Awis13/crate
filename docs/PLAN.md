@@ -75,12 +75,14 @@ CPUs, 4 GB) prints the same output hashes on `jit` as on `hvf`; on `jit`
 
 | | crate `jit` | QEMU's TCG | native |
 |---|---|---|---|
-| the whole pass, one task at a time | 24.5 s | 130.5 s | 9 s |
-| gcc -O2 | 6.9 s | 35 s | |
-| 1000 process spawns | 0.54 s | 4.4 s | |
-| four compiles at once | 9.2 s | 56-77 s | |
+| the whole pass, one task at a time | 24.5 s | 130.5 s | 9.1 s |
+| gcc -O2 | 6.9 s | 35 s | 1.6 s |
+| 1000 process spawns | 0.52 s | 4.4 s | 0.13 s |
+| four compiles at once | 9.2 s | 56-77 s | 1.8 s |
 
-QEMU's figures are from milestone 3, on the same machine and guest.
+QEMU's and native's figures are from 2026-11-07, on the same machine and
+guest. Every line of the benchmark is in the README's
+[Benchmarks](../README.md#benchmarks) section.
 
 A virtio-gpu with virgl (virglrenderer over ANGLE on Vulkan, OpenGL ES 3.1 in
 the guest), a keyboard and a tablet run Xfce, labwc and Hyprland desktops on the

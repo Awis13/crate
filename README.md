@@ -116,6 +116,61 @@ macOS drops `DYLD_*` variables on the way through system binaries such as
     target/release/crate-run ... --display virgl --vnc vnc.sock
     tools/vnc.py vnc.sock shot screen.png
 
+## Benchmarks
+
+A Debian 13 guest runs a fixed set of workloads once it has booted, and prints
+each one's time and a hash of what it printed; every engine must print the same
+hashes as native. Seconds, medians of 3, on an M3 MacBook Air with 4 CPUs and
+4 GB for the guest. crate is its `jit` backend (2026-11-11). Native is QEMU on
+Apple's Hypervisor framework (`-accel hvf -cpu host`), and QEMU's TCG is QEMU
+10.0.2's translator (`-accel tcg,tb-size=512,split-wx=on -cpu max,sve=off`),
+both measured 2026-11-07 on the same machine and guest.
+
+| one at a time | crate `jit` | QEMU's TCG | native |
+|---|---|---|---|
+| boot to the benchmark | 2.97 | 13.80 | 1.82 |
+| gcc -O2, one large file | 6.93 | 35.30 | 1.59 |
+| gcc again | 6.67 | 34.17 | 1.48 |
+| `node -e 0` | 0.41 | 1.44 | 0.13 |
+| node, integer loop | 0.51 | 1.98 | 0.16 |
+| node, floating-point loop | 0.91 | 5.61 | 0.32 |
+| python loop | 1.36 | 12.97 | 0.26 |
+| awk, sqrt loop | 0.58 | 7.94 | 0.27 |
+| xz -6, 4 MB | 1.39 | 4.93 | 0.65 |
+| sha256, 50 MB | 0.06 | 0.30 | 0.04 |
+| 1000 process spawns | 0.52 | 4.42 | 0.13 |
+| find /usr | 0.50 | 2.50 | 0.45 |
+| **the whole pass** | **24.5** | **130.5** | **9.1** |
+
+| all four CPUs at once | crate `jit` | QEMU's TCG | native |
+|---|---|---|---|
+| 4 x gcc -O2 | 9.20 | 56-77 | 1.83 |
+| xz -T4, 50 MB | 11.40 | 43-61 | 6.09 |
+| 4 x 250 process spawns | 0.13 | 2.31-2.52 | 0.03 |
+
+QEMU's TCG had two runs of these, so its column gives both. An idle shell costs
+crate about 0.65% of a host core, and QEMU's TCG 1.0%. On a fanless laptop wall
+times move 5-20% between identical runs, so smaller changes in crate are judged
+by the process's retired cycles instead.
+
+**On an iPhone.** An iPhone Duo (A20, iOS 27.1), `jit` with 3 CPUs and 1950 MiB,
+executable memory from StikDebug's `legacy.js`, measured 2026-11-11 (before the
+last round of speed work above). Every output matched the Mac's.
+
+| | crate `jit` |
+|---|---|
+| root prompt, from the app's launch | 5.3 s |
+| desktop drawn, from the app's launch | 6.3 s |
+| sha256, 100 MB | 84 ms |
+| perl loop of 3 million | 312 ms |
+| sort, 300,000 lines | 72 ms |
+| gzip and gunzip, 50 MB | 363 ms |
+| three sha256 of 50 MB at once | 81 ms |
+| `claude --version` (Claude Code) | 165 ms |
+| headless Chrome: start, then a V8 loop of 10 million | 2.4 s |
+
+The benchmark's guest image (3 GB) is not part of this repository.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md): crate is written from public
