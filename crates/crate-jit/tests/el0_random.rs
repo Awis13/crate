@@ -1208,8 +1208,8 @@ fn run_translated(
             cpu.state.pc, run.fast
         );
         eprintln!("  esr/far syndrome {:#x}", cpu.state.exception_syndrome);
-        for i in 0..31 {
-            eprintln!("    x{i} = {:#x}", cpu.state.x[i]);
+        for (i, x) in cpu.state.x.iter().take(31).enumerate() {
+            eprintln!("    x{i} = {x:#x}");
         }
         eprintln!("    sp = {:#x}", cpu.state.sp);
         eprintln!("  guest_pc {:#x}, body:", prog.guest_pc);

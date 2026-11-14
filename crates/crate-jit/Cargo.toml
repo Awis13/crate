@@ -11,7 +11,6 @@ publish.workspace = true
 [dependencies]
 libc.workspace = true
 crate-core.workspace = true
-crate-devices.workspace = true
 crate-host.workspace = true
 
 [lints]

@@ -58,7 +58,6 @@ name = "crate-jit"
 version = "0.1.0"
 dependencies = [
  "crate-core",
- "crate-devices",
  "crate-host",
  "libc",
 ]
