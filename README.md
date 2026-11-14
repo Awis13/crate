@@ -76,7 +76,9 @@ on Apple silicon and Macs on arm64, with the header and a module map for Swift
 (`import CrateEngine`); it needs the `aarch64-apple-ios` and
 `aarch64-apple-ios-sim` Rust targets. Pushing a tag `vX.Y.Z`, the workspace
 version, publishes it as a release (`.github/workflows/release.yml`): the zip and
-its SHA-256, which an app pins. The app links libslirp itself. On iOS the
+its SHA-256, which an app pins, and for every release after v0.1.0 GitHub's
+attestation of the commit and workflow that built it. The app links libslirp
+itself. On iOS the
 app passes in executable memory that a debugger it attached has prepared (see
 `crate_config_set_jit_region`); crate cannot get its own there.
 
