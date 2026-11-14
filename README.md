@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" alt="crate's icon: a wooden crate holding a terminal and two other windows" width="128" height="128">
+</p>
+
 # crate
 
 **Compact Runtime for Arm64 Translation and Emulation.**
