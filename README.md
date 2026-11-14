@@ -11,20 +11,18 @@ Hypervisor framework.
 
 crate is a library, not an app. An app links it, describes a machine through
 its API, and gets the console, the screen and input back as callbacks; the
-engine never assumes what the app looks like. The first app built on it is
-[aTerm](https://github.com/oneamendez/aterm-ios), a terminal for a local Linux
-machine.
+engine never assumes what the app looks like.
 
 Status: early. The `virt` machine boots Debian to a shell on a Mac through
-Apple's Hypervisor framework (milestone 1) and through the translator, on one
-to four CPUs, faster than QEMU's TCG (milestone 3). The C API is implemented
-and a virtio-gpu with virgl (virglrenderer over ANGLE) and a keyboard and
-tablet run aTerm's desktops and Chrome with hardware compositing on a Mac, on
-both backends (milestone 4). aTerm runs Debian and Omarchy on crate on an
-iPhone, desktops included, with executable memory from an attached debugger
-(milestone 5). See
-[docs/PLAN.md](docs/PLAN.md) and, for how the pieces fit,
-[docs/DESIGN.md](docs/DESIGN.md).
+Apple's Hypervisor framework and through the translator, on one to four CPUs,
+several times faster than QEMU's TCG. A virtio-gpu with virgl (virglrenderer
+over ANGLE), a keyboard and a tablet run Linux desktops and Chrome with
+hardware compositing, on a Mac and on an iPhone, where the app gets executable
+memory from an attached debugger. **The C API is a draft**: until 1.0 it
+changes incompatibly as needed (see
+[milestone 7](docs/PLAN.md#milestone-7-firming-up-the-api)). See
+[docs/PLAN.md](docs/PLAN.md) for what is done and what is left, and
+[docs/DESIGN.md](docs/DESIGN.md) for how the pieces fit.
 
 ## Goals
 
@@ -66,7 +64,9 @@ Needs Rust 1.85 or later, and libslirp for user-mode networking
 
 ## The C API and iOS
 
-`include/crate.h` is the API. `tools/xcframework.sh` builds it (release) as
+`include/crate.h` is the API, a draft until 1.0: its minor version changes with
+every incompatible change, so pin a release. `tools/xcframework.sh` builds it
+(release) as
 `target/xcframework/Crate.xcframework`, a static library for iPhones, Simulators
 on Apple silicon and Macs on arm64, with the header and a module map for Swift
 (`import CrateEngine`); it needs the `aarch64-apple-ios` and
@@ -111,6 +111,12 @@ macOS drops `DYLD_*` variables on the way through system binaries such as
     export DYLD_LIBRARY_PATH=$GPU/lib:/opt/homebrew/opt/molten-vk/lib
     target/release/crate-run ... --display virgl --vnc vnc.sock
     tools/vnc.py vnc.sock shot screen.png
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md): crate is written from public
+specifications only, and contributions are too. Security issues go privately,
+as [SECURITY.md](SECURITY.md) says.
 
 ## License
 

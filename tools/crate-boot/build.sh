@@ -1,4 +1,8 @@
 #!/bin/sh
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 # Builds crate-boot, a C program that boots a guest through crate's C API, and
 # links it against the static library (release, as debug is far too slow to
 # boot anything). Signs it ad hoc with the hypervisor entitlement so it can

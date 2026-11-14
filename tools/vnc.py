@@ -16,9 +16,9 @@
                                             a+b holds a while pressing b
     tools/vnc.py SERVER watch SECONDS       counts updates for that long
 
-SERVER is a Unix socket path or HOST:PORT. It asks for the pixel format aTerm's
-client asks for (red at bit 0, green 8, blue 16) and the encodings it offers
-(Raw, CopyRect, DesktopSize), so it sees what aTerm will.
+SERVER is a Unix socket path or HOST:PORT. It asks for a common client's pixel
+format (red at bit 0, green 8, blue 16) and encodings (Raw, CopyRect,
+DesktopSize), so it sees what such a client will.
 """
 import os
 import socket
@@ -196,7 +196,7 @@ def main(argv):
             c.pointer(x, y, 0)
             time.sleep(0.03)
     elif command == "type":
-        # As aTerm sends text: Shift around shifted symbols, capitals alone.
+        # As some clients send text: Shift around shifted symbols, capitals alone.
         for ch in " ".join(args):
             if ch == "\n":
                 keysym = 0xFF0D

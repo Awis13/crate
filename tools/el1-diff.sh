@@ -1,4 +1,8 @@
 #!/bin/sh
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 # Differential test of the jit backend against hvf (the oracle) on small EL1
 # bare-metal programs: assembles each `.s` under crates/crate-jit/tests/el1,
 # runs the same image on both backends through the signed crate-run, and checks

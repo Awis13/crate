@@ -162,7 +162,7 @@ client is connected; the first client's answers wait up to half a second for
 the whole frame the server asks for. Each client has a thread reading its
 messages and one sending updates. Keysyms become the Linux key codes of a US
 keyboard, with Shift pressed around a symbol that needs it when the client
-holds none (aTerm sends capitals without Shift); RFB's wheel buttons scroll.
+holds none (some clients send capitals without Shift); RFB's wheel buttons scroll.
 
 ## The virt memory map
 
@@ -407,8 +407,8 @@ programs on jit and hvf.
 as a static library; `tools/xcframework.sh` packages it with the header and a
 module map (Swift's `import CrateEngine`) as an XCFramework for iPhones,
 Simulators and Macs on arm64, and a version tag publishes that as a release. The
-app links libslirp itself: on iOS the framework it ships (aTerm's
-`slirp.0.framework`; Homebrew's libslirp is a macOS library), on a Mac
+app links libslirp itself: on iOS a `slirp.0.framework` it ships (Homebrew's
+libslirp is a macOS library), on a Mac
 Homebrew's, and the Hypervisor framework there.
 
 A config is checked as it is built, each call failing on its own mistake. A

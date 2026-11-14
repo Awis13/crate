@@ -13,7 +13,7 @@ VM app on it without touching the engine.
 
 ## Shape
 
-    app (aTerm, crate-run, anyone's)
+    app (crate-run, anyone's)
       |  C API (include/crate.h), Rust API, Swift package
     machine     the board: memory map, firmware tables, boot protocol    crate-virt
       |  device interface (MMIO, PCI functions, interrupts, reset, state)
@@ -23,8 +23,9 @@ VM app on it without touching the engine.
       |  host interface
     host        executable memory, guest RAM, disks, network, GPU        crate-host
 
-Each line is an interface a third party can implement: a new machine, a device,
-a CPU backend or a host backend, without changing the others.
+Each line is meant to be an interface a third party can implement: a new
+machine, a device, a CPU backend or a host backend, without changing the
+others.
 
 **CPU backends.** `jit` is the point of crate: the translator, for hosts where
 the app may create executable memory (with a debugger attached on iOS). `hvf`
@@ -44,166 +45,112 @@ cross the API as calls and callbacks, not sockets: an app embeds crate, it does
 not talk to it over a network. A VNC server can still be offered as an
 optional piece for apps that want one.
 
+
 ## Milestones
 
-Each ends in something that runs.
-
-| # | Milestone | Done when |
+| # | Milestone | Status |
 |---|---|---|
-| 0 | Repo, plan, C API draft, workspace | `crate.h` v0 reviewed |
-| 1 | `virt` machine and devices on the `hvf` backend | aTerm's Debian image boots to a prompt on a Mac: disk, network, console, port forwards |
-| 2 | Translator on its own: instruction copying, MMU with 4 KB and 16 KB granules, exceptions, system registers, timers | random instruction streams give the same results as the CPU itself; the arm64 kvm-unit-tests pass |
-| 3 | Full system on `jit`: several CPUs, TLB maintenance across CPUs, exclusives, self-modifying code | Debian boots on 4 CPUs; benchmark outputs byte-identical to native; faster than QEMU's TCG |
-| 4 | GPU, display, input: virtio-gpu 2D and virgl (virglrenderer over ANGLE), keyboard and tablet | aTerm's desktops, Chrome and Claude Code run under `crate-run` on a Mac |
-| 5 | iOS: XCFramework, iOS executable-memory provider, aTerm adopts crate beside its current engines | Debian and Omarchy on a device pass aTerm's checklist: console, SSH tabs, forwards, desktop, resolution change, Claude Code |
-| 6 | Speed: the translator's own costs first (scratch registers for loads and stores, cold code apart, predicted returns), then 16 KB-page guest kernels, Linux paravirtual hooks (TLB flushes, idle), guest memory mapped by the host MMU, translations kept across launches | on an M3, jit, 4 CPUs: every line of crate-bench ties (medians of 3, within about 5%) or beats the other translator its README compares, every output hash unchanged, kvm-unit-tests as before; on the iPhone, Debian still at its prompt in about 7 s and its desktop in about 8.4 s |
-| 7 | Ready to publish: device and machine interfaces frozen as v1, documentation, a minimal sample app | the owner decides to open the repository |
-| later | Other guests (macOS) as machines of their own | |
+| 0 | Repository, plan, C API draft, Rust workspace | Done |
+| 1 | `virt` machine and devices on the `hvf` backend: Debian boots to a prompt on a Mac, with disk, network, console and port forwards | Reached 2026-11-10 |
+| 2 | Translator on its own: instruction copying, MMU with 4 KB and 16 KB granules, exceptions, system registers, timers; random instruction streams give the same results as the CPU itself, and the arm64 kvm-unit-tests pass | Reached 2026-11-10 |
+| 3 | Full system on `jit`: several CPUs, TLB maintenance across CPUs, exclusives, self-modifying code; Debian on 4 CPUs, benchmark outputs identical to native, faster than QEMU's TCG | Reached 2026-11-10 |
+| 4 | GPU, display, input: virtio-gpu 2D and virgl (virglrenderer over ANGLE), keyboard and tablet; Linux desktops and Chrome on a Mac | Reached 2026-11-11 |
+| 5 | iOS: an XCFramework, executable memory from an app with a debugger attached; Linux with a desktop on an iPhone | Reached 2026-11-11 |
+| 6 | Speed: the translator's own costs first | Reached 2026-11-11; more under [Speed](#speed) |
+| 7 | Firming up the API: the C API frozen as 1.0, documentation, a sample app | Open; see [below](#milestone-7-firming-up-the-api) |
+| later | Other guests as machines of their own | Not started |
 
-Milestone 1 was reached on 2026-11-10: aTerm's Debian 13 image boots to a root
-prompt under `crate-run` on an M3 in about 1.2 s, with 4 CPUs, its disk, user
-networking, SSH through a port forward, and serial and virtio consoles.
+## Where it stands
 
-Milestone 2 was reached on 2026-11-10 (random instruction streams match the
-CPU; the single-CPU kvm-unit-tests pass), and milestone 3 on 2026-11-10: on
-`jit`, Debian boots to a root prompt on one CPU in about 13 s and on four in
-about 10 s, with SSH through a port forward. Every arm64 kvm-unit-test, single-
-and multi-CPU, passes or skips on `jit` at 4 and 16 KiB pages and on `hvf`
-(gicv2 and migration tests are not applicable). The engine benchmark
-(crate-bench, 4 CPUs, 4 GB) prints the same output hashes as `hvf` on every
-line, and every line is faster than QEMU's TCG: the single pass takes 73-81 s
-against TCG's 130.5 (native 9), gcc -O2 22-26 s against 35, 1000 spawns 1.6-2.1
-s against 4.4; on all four CPUs four compiles take 48-49 s against 56-77. The
-measurements, and where the remaining time goes (ordinary loads and stores,
-jump-cache lookups), are the input to milestone 6.
+Measured on an M3 MacBook Air, and on an iPhone with an A20 on iOS 27.1, whose
+executable memory came from StikDebug's `legacy.js` script.
 
-The first part of milestone 5 was reached on 2026-11-11, everything but what
-needs milestone 4's GPU: the C API is implemented, crate builds as an
-XCFramework for iOS and macOS, and aTerm runs Debian on it as a third engine
-beside its other two. On an iPhone (A20, iOS 27.1, JIT from StikDebug's
-legacy.js), Debian on three CPUs reaches a root prompt 6.3-6.6 s after the app
-launches, the debugger's authorization of the 384 MiB code region included
-(the other translator: 7 s); a second tab connects over SSH, port forwards
-work, Claude Code runs, and poweroff and relaunch work. The desktop,
-resolution changes and the Omarchy guest wait for milestone 4.
+**On a Mac.** Debian 13 boots to a root prompt in about 1.2 s on `hvf` and
+about 3 s on `jit`, with 4 CPUs, its disk, user networking, SSH through a port
+forward, and serial and virtio consoles. Every arm64 kvm-unit-test, single- and
+multi-CPU, passes or skips on `jit` at 4 and 16 KiB pages and on `hvf` (the
+gicv2 and migration tests do not apply). A benchmark run inside the guest (4
+CPUs, 4 GB) prints the same output hashes on `jit` as on `hvf`; on `jit`
+(medians of 3):
 
-Milestone 4 was reached on 2026-11-11: a virtio-gpu with virgl (virglrenderer
-over ANGLE on Vulkan, OpenGL ES 3.1 in the guest), a keyboard and a tablet,
-the display and input calls of the C API, and an optional VNC server. Under
-`crate-run` on an M3, on `jit` and on `hvf`, aTerm's Debian runs all three
-desktop styles (Xfce, simple, Hyprland) on the GPU, with clicks, right clicks,
-the wheel and the keyboard working and `aterm-resolution` changing modes;
-Chrome composites, rasterizes and runs WebGL and WebGPU on the GPU, and Claude
-Code runs in a terminal on the desktop. On `jit` Chrome starts and shows a page
-in 3.1-4.3 s (hvf 0.8 s) and loads a 2000-row page with script in 1.4-1.5 s
-(hvf 0.12 s); a WebGL canvas runs at 60 frames a second on both. An idle Xfce
-desktop costs 1.2-1.5% of a host core on `jit` and 0.4% on `hvf`.
+| | crate `jit` | QEMU's TCG | native |
+|---|---|---|---|
+| the whole pass, one task at a time | 24.5 s | 130.5 s | 9 s |
+| gcc -O2 | 6.9 s | 35 s | |
+| 1000 process spawns | 0.54 s | 4.4 s | |
+| four compiles at once | 9.2 s | 56-77 s | |
 
-Milestone 5 was reached on 2026-11-11. On the same iPhone, aTerm runs crate
-with its display (virgl over the ANGLE and virglrenderer frameworks the app
-embeds, served to the app by crate's VNC server) and keyboard and tablet,
-under the 1950 MiB the app's provisioning profile leaves a guest. Debian
-reaches a root prompt 6.6-7.0 s after launch and a drawn desktop 8.2-8.4 s
-after; all three desktop styles run on the GPU, Chrome composites on it,
-Claude Code runs in a terminal on the desktop, resolution changes work, and
-taps, long presses, two-finger scrolls and the key bar reach the guest.
-Omarchy (Linux 7.3, Hyprland) needed only a generic fix (AIDR_EL1, which
-Linux 7 reads at boot, was undefined); it reaches a prompt in 10-13 s and its
-desktop in 43-56 s (18 s and 77 s on its first boot), with SSH tabs, port
-forwards, Claude Code and resolution changes working. Its first boot once
-stopped responding after two desktop restarts in quick succession, with the
-guest short of memory; it did not happen again on the phone or on a Mac at
-the same memory. Forwarded sockets no longer raise SIGPIPE when a connection's
-other end has gone.
+QEMU's figures are from milestone 3, on the same machine and guest.
 
-Milestone 6's targets were met on the Mac on 2026-11-11. The speed came from
-the translator's own costs, which a profile of a compile showed were most of
-its time: loads and stores spilled and reloaded four registers each, every
-block entered through the jump cache stalled on its first instruction, and
-half of the code was cold. Guest X15..X17 now live in the state between
-blocks, so the memory fast path has three scratch registers whenever an access
-does not name them, borrows others only otherwise and puts them back lazily,
-and runs every access at its host address with no offset; code that runs once
-or never goes to the far end of a CPU's code region, so the code that runs is
-packed for the instruction cache; and a call is a host BL whose return address
-is the translation of the instruction after it, so a return jumps there with
-RET and the CPU predicts it. On jit with 4 CPUs and 4 GB, crate-bench's single
-pass takes 34.8-36.4 s (milestone 3: 73-81 s; QEMU's TCG 130.5; native 9),
-gcc -O2 10.0-10.6 s (22-26), four compiles at once 15.0-16.8 s (48-49), xz -T4
-16.6 s (34-38) and 1000 spawns 0.7-0.8 s (1.6-2.1), with every output hash
-unchanged and the kvm-unit-tests passing or skipping as before. Debian reaches
-a root prompt in 7.0 s on the Mac (4 CPUs), Chrome's V8 gives the same results
-faster, and Omarchy boots. On the iPhone (aTerm crate with this code, Debian,
-jit, 3 CPUs, 1950 MiB, two launches) the root prompt came 5.4-5.7 s after
-launch (milestone 5: 6.6-7.0) and the desktop 6.5 s (8.2-8.4); in the guest,
-every output matching the Mac's, sha256 of 100 MB took 85-90 ms, a perl loop
-of 3 million 410-421 ms, sorting 300 thousand lines 87-101 ms, gzip and gunzip
-of 50 MB 416-426 ms, three sha256 of 50 MB at once 95-108 ms and `claude
---version` 111-164 ms. PLAN's own items for this milestone remain: 16
-KB-page guest kernels, paravirtual TLB flushes and idle, guest memory mapped
-by the host MMU, translations kept across launches; so do a code cache shared
-by the CPUs and chained branches to another page. The largest cost left in a
-compile is the TLB lookup, a load on the path to every access's data.
+A virtio-gpu with virgl (virglrenderer over ANGLE on Vulkan, OpenGL ES 3.1 in
+the guest), a keyboard and a tablet run Xfce, labwc and Hyprland desktops on the
+GPU on both backends. Chrome composites, rasterizes and runs WebGL and WebGPU
+on the GPU: on `jit` it shows a page 3.1-4.3 s after starting (0.8 s on `hvf`),
+a WebGL canvas runs at 60 frames a second, and an idle Xfce desktop costs
+1.2-1.5% of a host core.
 
-The milestone's goal then became to tie or beat the other translator
-crate-bench compares on every line, which it does on the Mac since
-2026-11-11 (medians of 3, M3 MacBook Air under the user's other work): boot
-2.9 s (5.27), gcc -O2 8.0 s (9.34), gcc again 7.6-8.3 (8.16), node -e 0 0.42-0.43
-(0.42), node's integer loop 0.52-0.55 (0.59), its FP loop 0.92-0.95 (1.03),
-python 1.45-1.56 (1.96), awk 0.65-0.73 (0.72), xz 1.41-1.43 (1.79), sha256
-0.05 (0.07), find 0.49-0.53 (0.59), 1000 spawns 0.54 (3.39), the whole pass
-27-31 s (36.1); four compiles at once 12.4-15.8 s (21.4), xz -T4 12.7-16.0
-(18.2), 4 x 250 spawns 0.20 (1.88); an idle shell 0.65% of a core (2.1%).
-Wall time on that machine is too noisy for a few percent, so changes were
-judged by the process's retired cycles over repeated compiles. What did it:
-footprint first (32 bytes of never-run padding per block made gcc 17-23%
-slower), so slow paths moved into the same MiB segment as their block and the
-trampolines left the code that runs, single loads and stores take the TLB
-delta as a register offset, and the EL0 load TLB sits right below SP; 32
-copies of the jump-cache stub per EL, so each indirect branch is predicted
-from few sites; and the TLB refills, 15% of a compile, which a page-walk cache
-and a larger TLB cut, while TLB invalidations stopped scanning whole tables
-(a boot's work fell by two thirds). A code cache shared by the CPUs was
-measured not to matter: a second compile translates almost nothing. On the
-iPhone (aTerm crate with this code, Debian, jit, 3 CPUs, 1950 MiB, launched
-through StikDebug) the root prompt came 5.3 s after launch and the desktop
-6.3 s, with labwc and xfce4-panel running and no faults; in the guest, every
-output matching the Mac's, sha256 of 100 MB took 84 ms, the perl loop 312 ms
-(410-421 after the first three steps), sorting 72 ms, gzip and gunzip of 50 MB
-363 ms, three sha256 at once 81 ms, `claude --version` 165 ms, and headless
-Chrome ran a V8 loop of 10 million to the expected result in 2.4 s, Chrome's
-start included.
+**On an iPhone.** With 3 CPUs and 1950 MiB of guest memory, Debian reaches a
+root prompt about 5.3 s after the app launches and a drawn desktop at about
+6.3 s. Desktops run on the GPU, Chrome composites on it, the desktop follows the
+phone as it rotates or folds, and taps, long presses, two-finger scrolls and a
+keyboard reach the guest. In the guest, sha256 of 100 MB takes 84 ms, and
+headless Chrome runs a V8 loop of 10 million in 2.4 s, its start included. A
+second distribution, on Linux 7.3, needed only one generic fix (AIDR_EL1,
+which Linux 7 reads at boot).
 
-A second round of speed work followed (2026-11-11), each change measured and
-kept only if it won. Direct branches and calls to another page, half of a
-compile's jump-cache lookups, are chained behind a guard: a key of the target
-address with the jump cache's own context number or generation in its top
-bits, which changes exactly when a lookup would stop finding the block, so the
-guard is right on any OS's TLB discipline, not Linux's. Instruction-cache
-maintenance after writing code is done once per dispatcher visit, with one
-set of barriers. A group of accesses off one base runs each access as a single
-host instruction, and a failed check runs a cold copy of the whole stretch.
-On the way, a TLBI for another address space was found to skip global and
-upper-half EL0 translations, which the architecture says it reaches. Medians
-of 3 against milestone 6 in the same session (M3 Air, jit, 4 CPUs, 4 GB, a
-minute's rest before each pass, load 2-6): gcc -O2 6.93 s (8.07), gcc again
-6.67 (7.86), node -e 0 0.41 (0.43), python 1.36 (1.40), xz 1.39 (1.42), the
-whole pass 24.5 s (26.9); four compiles at once 9.20 s (10.47), xz -T4 11.40
-(11.47); boot 2.97 s (2.89); every output hash unchanged and the
-kvm-unit-tests as before. Measured and dropped: loading a TLB entry's tag and
-delta apart (the CPU predicts a plain load's value, but the extra instruction
-cost more), indexing the other TLBs down from SP like the near one (neutral),
-and a virtio-blk thread (the host serves the reads from its cache in
-microseconds; small reads got slower).
+**Where the speed came from.** A profile of a compile showed most of the time
+was the translator's own. Loads and stores now have scratch registers of their
+own and run at their host address with no offset. Code that runs rarely sits
+apart from code that runs, so the instruction cache holds what matters. A call
+is a host call whose return the CPU predicts, and each indirect branch is
+predicted from few sites. TLB refills go through a page-walk cache, and
+invalidations no longer scan whole tables. Direct branches to another page are
+chained behind a guard that stays right whatever the guest's TLB discipline. A
+group of accesses off one base runs each as a single host instruction, with a
+cold copy for when a check fails. Each change was judged by the process's
+retired cycles over repeated compiles, since wall time was too noisy, and kept
+only if it won. Measured and dropped: a code cache shared by the CPUs (a second
+compile translates almost nothing), loading a TLB entry's tag and delta apart,
+and a virtio-blk thread.
+
+## Milestone 7: firming up the API
+
+crate's C API (`include/crate.h`) is a draft. Until 1.0, its minor version
+changes with every incompatible change (0.1 today), so an app pins the release
+it builds against. Before 1.0:
+
+- **Unfinished calls.** Pausing and resuming a machine, the power button and
+  disk discard are declared in `crate.h` but return `CRATE_ERR_UNSUPPORTED`.
+  Each gets implemented or removed.
+- **Calls no app relies on yet.** The apps built on crate so far use the
+  configuration, console, display and input calls, and start and kill a
+  machine. Port forwards, VNC, a fixed network MAC address, asking the guest to
+  shut down, waiting on a machine and reading its state are used by the
+  development tools at most. Each gets a test through the C API before it is
+  frozen.
+- **What VM apps will want next.** Faster networking (virtio-net has no
+  offloads yet, so TCP moves about 20 MB/s), shared folders, a shared
+  clipboard, sound, and saving and restoring a running machine. Which of these
+  1.0 needs is open. Structs passed in begin with their own size and everything
+  else is set through functions, so later versions can add them without
+  breaking apps.
+- **Which interfaces are stable.** 1.0 freezes the C API. Whether the Rust
+  crates' interfaces (machines, devices, CPU and host backends) become stable
+  too, or stay internal with the C API as the one stable surface, is open.
+- **A Swift package** over the XCFramework each release publishes.
+- **Documentation and a sample.** A guide for app developers, and a minimal
+  sample app beside `tools/crate-boot`, a C program that boots a guest through
+  the API.
+- **Fuzzing** of everything that parses guest-controlled data (virtio queues,
+  device registers), since an app may run guests it does not trust.
 
 ## Remaining work
 
-Everything known to be left, as of 2026-11-12. Gains are time saved, measured
-or estimated on the Mac; "on hold" means the owner has decided to wait.
+Everything else known to be left, as of 2026-11-13. Gains are time saved,
+measured or estimated on a Mac.
 
-### Milestones
+### Larger pieces
 
-- **Milestone 7, ready to publish.** On hold.
 - **An interpreter backend**, for hosts where the app may not create
   executable memory (on iOS, a launch without a debugger). Not started. It is
   the one piece that would let an app use crate on every launch.
@@ -223,8 +170,6 @@ or estimated on the Mac; "on hold" means the owner has decided to wait.
 
 ### Speed
 
-Milestone 6's own list:
-
 - **16 KB-page guest kernels: done.** A 16 KiB page fills its four 4 KiB TLB
   pieces at once and a TLBI drops them together. Against the same kernel at
   4 KB: compute ties, boot about 5% faster, 1000 spawns 15-20% faster; it uses
@@ -239,10 +184,10 @@ Milestone 6's own list:
   on an iPhone the app gets 7.5 GiB of address space (6 GiB in its largest
   range), and every alias of guest RAM it touches costs a page of the app's
   memory. Only for guests with small address spaces.
-- **Translations kept across launches.** On hold: every launch starts cold,
-  so a reboot reproduces a test.
+- **Translations kept across launches.** Not planned for now: every launch
+  starts cold, so a reboot reproduces a test.
 
-Found since, by profiling (estimates, together about 10-20%). On hold:
+Found by profiling since (estimates, together about 10-20%), not started:
 
 1. Guest SP and its page address kept in registers within a block: gcc and
    spawns 3-6%.
@@ -265,7 +210,7 @@ an optimizing second tier for hot code might give about 1.5x on compute
 - **No virtio-net offloads or event index**, so TCP moves about 20 MB/s. The
   gap a user notices most (package installs, clones).
 - Pause and resume, the power button and disk discard are in `crate.h` but
-  return CRATE_ERR_UNSUPPORTED.
+  return CRATE_ERR_UNSUPPORTED (see milestone 7).
 - No virtio-gpu blob resources: every frame shown is a GL readback and a copy.
 - PL031 alarms never fire.
 - An MMIO access the CPU cannot describe (ISV clear) stops the machine. Linux
@@ -284,12 +229,6 @@ an optimizing second tier for hot code might give about 1.5x on compute
   back when its only output goes away. Possible fixes, none started: connect
   the new modes as a second output before removing the old one, so the guest
   always has one; or restart the two in the guest when outputs change.
-
-## How aTerm adopts it
-
-aTerm already chooses an engine at launch. crate becomes another choice beside
-the current ones, and replaces them only once it passes aTerm's checklist on a
-device. Until then nothing in aTerm depends on crate.
 
 ## Testing
 
@@ -315,4 +254,5 @@ device. Until then nothing in aTerm depends on crate.
 ## Rules
 
 - Written from public specifications only; see [PROVENANCE.md](PROVENANCE.md).
-- Private until the owner decides otherwise.
+  Contributions follow the same rule; see
+  [CONTRIBUTING.md](../CONTRIBUTING.md).

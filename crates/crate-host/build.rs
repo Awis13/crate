@@ -4,8 +4,8 @@
 
 //! Finds libslirp for the `slirp` feature: pkg-config's answer, else
 //! Homebrew's prefix. On iOS, which has no libslirp and where Homebrew's is a
-//! macOS library, it is the framework the app ships (aTerm's
-//! `Frameworks/ios-arm64/slirp.0.framework`), found in `SLIRP_FRAMEWORK_DIR`.
+//! macOS library, it is the framework the app ships (`slirp.0.framework`),
+//! found in `SLIRP_FRAMEWORK_DIR`.
 
 use std::process::Command;
 

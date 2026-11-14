@@ -76,7 +76,7 @@ impl TestClient {
         (TestClient { s }, w, h)
     }
 
-    /// aTerm's: 32 bits, little-endian, red at 0, green 8, blue 16.
+    /// A common client's: 32 bits, little-endian, red at 0, green 8, blue 16.
     fn set_format(&mut self, red: u8, blue: u8, bpp: u8) {
         let mut m = vec![0u8, 0, 0, 0, bpp, 24, 0, 1];
         let max: u16 = if bpp == 16 { 31 } else { 255 };
