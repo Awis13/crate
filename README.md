@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/icon-dark.png">
+    <img src="docs/icon.png" alt="crate's icon: a wooden crate holding a terminal and two other windows" width="128" height="128">
+  </picture>
+</p>
+
 # crate
 
 **Compact Runtime for Arm64 Translation and Emulation.**
