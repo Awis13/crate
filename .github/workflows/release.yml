@@ -1,0 +1,63 @@
+# Publishes the C API as Crate.xcframework (tools/xcframework.sh), zipped, when
+# a version tag is pushed: vX.Y.Z, the workspace version in Cargo.toml. Apps
+# pin a release by its tag and the zip's SHA-256. Run by hand, it builds the
+# same zip as a workflow artifact and releases nothing.
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  xcframework:
+    # xcodebuild packages the XCFramework, so this needs a Mac.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+      - name: Check the tag is the workspace version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+              jq -r '.packages[] | select(.name == "crate-ffi") | .version')
+          [ "$GITHUB_REF_NAME" = "v$version" ] || {
+              echo "tag $GITHUB_REF_NAME, but Cargo.toml says $version" >&2; exit 1; }
+      - run: tools/xcframework.sh "$RUNNER_TEMP/out/Crate.xcframework"
+      - name: Zip
+        working-directory: ${{ runner.temp }}/out
+        run: |
+          ditto -c -k --keepParent Crate.xcframework Crate.xcframework.zip
+          shasum -a 256 Crate.xcframework.zip | tee Crate.xcframework.zip.sha256
+      - if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crate.xcframework
+          path: |
+            ${{ runner.temp }}/out/Crate.xcframework.zip
+            ${{ runner.temp }}/out/Crate.xcframework.zip.sha256
+      - name: Release
+        if: github.ref_type == 'tag'
+        working-directory: ${{ runner.temp }}/out
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          major=$(sed -n 's/^#define CRATE_API_VERSION_MAJOR //p' "$GITHUB_WORKSPACE/include/crate.h")
+          minor=$(sed -n 's/^#define CRATE_API_VERSION_MINOR //p' "$GITHUB_WORKSPACE/include/crate.h")
+          cat > notes.md <<EOF
+          crate's C API (\`include/crate.h\`, API $major.$minor) as a static library,
+          built from $GITHUB_SHA with $(rustc --version).
+
+          \`Crate.xcframework.zip\` holds iPhone (\`ios-arm64\`), Simulator on Apple
+          silicon (\`ios-arm64-simulator\`) and Mac (\`macos-arm64\`) slices; Swift
+          imports it as \`CrateEngine\`. The app links libslirp itself, and on a Mac
+          the Hypervisor framework.
+
+              SHA-256 $(cut -d' ' -f1 Crate.xcframework.zip.sha256)
+          EOF
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "crate $GITHUB_REF_NAME" --notes-file notes.md \
+              Crate.xcframework.zip Crate.xcframework.zip.sha256

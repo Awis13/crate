@@ -405,8 +405,9 @@ programs on jit and hvf.
 
 `crate-ffi` implements `include/crate.h` over crate-virt's Rust API and builds
 as a static library; `tools/xcframework.sh` packages it with the header and a
-module map (Swift's `import Crate`) as an XCFramework for iOS and macOS on
-arm64. The app links libslirp itself: on iOS the framework it ships (aTerm's
+module map (Swift's `import CrateEngine`) as an XCFramework for iPhones,
+Simulators and Macs on arm64, and a version tag publishes that as a release. The
+app links libslirp itself: on iOS the framework it ships (aTerm's
 `slirp.0.framework`; Homebrew's libslirp is a macOS library), on a Mac
 Homebrew's, and the Hypervisor framework there.
 

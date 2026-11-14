@@ -67,9 +67,12 @@ Needs Rust 1.85 or later, and libslirp for user-mode networking
 ## The C API and iOS
 
 `include/crate.h` is the API. `tools/xcframework.sh` builds it (release) as
-`target/xcframework/Crate.xcframework`, a static library for iOS and macOS on
-arm64 with the header and a module map for Swift; it needs the
-`aarch64-apple-ios` Rust target. The app links libslirp itself. On iOS the
+`target/xcframework/Crate.xcframework`, a static library for iPhones, Simulators
+on Apple silicon and Macs on arm64, with the header and a module map for Swift
+(`import CrateEngine`); it needs the `aarch64-apple-ios` and
+`aarch64-apple-ios-sim` Rust targets. Pushing a tag `vX.Y.Z`, the workspace
+version, publishes it as a release (`.github/workflows/release.yml`): the zip and
+its SHA-256, which an app pins. The app links libslirp itself. On iOS the
 app passes in executable memory that a debugger it attached has prepared (see
 `crate_config_set_jit_region`); crate cannot get its own there.
 

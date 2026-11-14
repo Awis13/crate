@@ -16,18 +16,18 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "crate-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "crate-devices"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
 ]
 
 [[package]]
 name = "crate-ffi"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
  "crate-devices",
@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "crate-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
  "libc",
@@ -48,14 +48,14 @@ dependencies = [
 
 [[package]]
 name = "crate-hvf"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
 ]
 
 [[package]]
 name = "crate-jit"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
  "crate-devices",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "crate-run"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
  "crate-host",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "crate-virt"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
  "crate-devices",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "crate-vnc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crate-core",
 ]
