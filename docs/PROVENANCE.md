@@ -70,4 +70,14 @@ uses MoltenVK (Apache-2.0) on Apple systems.
 ## Checking
 
 Before a release, crate's sources are compared against the projects named
-above for shared lines, and anything found is rewritten or explained here.
+above for shared lines, and anything found is rewritten or explained here. The
+comparison runs apart from work on crate and reports only crate's side.
+
+For v0.1.0 (2026-11-13), crate's 95 text files (33,159 lines) were compared
+mechanically with about 5.6 million lines of QEMU (8.2.0, and 10.0.2 as UTM
+ships it), UTM and Henge: windows of consecutive lines, comment sentences,
+string literals and runs of numbers. No code, comment or string was shared
+beyond boilerplate (standard includes, the `extern "C"` guard). The numbers
+shared are values the specifications above fix: Arm system-register encodings
+and A64 field positions, PL011, PL031 and virtio-mmio register offsets,
+virtio-gpu formats, EDID 1.4 offsets, and Linux's input key codes in order.
