@@ -1,7 +1,8 @@
 # Publishes the C API as Crate.xcframework (tools/xcframework.sh), zipped, when
 # a version tag is pushed: vX.Y.Z, the workspace version in Cargo.toml. Apps
-# pin a release by its tag and the zip's SHA-256. Run by hand, it builds the
-# same zip as a workflow artifact and releases nothing.
+# pin a release by its tag and the zip's SHA-256, and GitHub attests which
+# commit and workflow built it. Run by hand, it builds the same zip as a
+# workflow artifact and releases nothing.
 name: release
 on:
   push:
@@ -10,6 +11,9 @@ on:
 
 permissions:
   contents: write
+  # The build-provenance attestation of a release's zip.
+  id-token: write
+  attestations: write
 
 jobs:
   xcframework:
@@ -39,6 +43,10 @@ jobs:
           path: |
             ${{ runner.temp }}/out/Crate.xcframework.zip
             ${{ runner.temp }}/out/Crate.xcframework.zip.sha256
+      - if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/out/Crate.xcframework.zip
       - name: Release
         if: github.ref_type == 'tag'
         working-directory: ${{ runner.temp }}/out
@@ -54,7 +62,8 @@ jobs:
           \`Crate.xcframework.zip\` holds iPhone (\`ios-arm64\`), Simulator on Apple
           silicon (\`ios-arm64-simulator\`) and Mac (\`macos-arm64\`) slices; Swift
           imports it as \`CrateEngine\`. The app links libslirp itself, and on a Mac
-          the Hypervisor framework.
+          the Hypervisor framework. Its build provenance is attested:
+          \`gh attestation verify Crate.xcframework.zip -R $GITHUB_REPOSITORY\`.
 
               SHA-256 $(cut -d' ' -f1 Crate.xcframework.zip.sha256)
           EOF
