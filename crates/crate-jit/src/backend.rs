@@ -1839,7 +1839,11 @@ impl Cpu {
         self.timer_fired = [vfired, false];
         if vline != self.vtimer_line {
             if self.trace.irq {
-                crate_core::warn!("cpu{} vtimer line {vline}", self.cpu);
+                crate_core::warn!(
+                    "cpu{} vtimer line {vline} ctl={vctl:#x} now-cval={}",
+                    self.cpu,
+                    now.wrapping_sub(self.state.banked.cntv_cval) as i64
+                );
             }
             self.vtimer_line = vline;
             board.lines.set_ppi(self.cpu, board.vtimer_ppi, vline);
@@ -2455,6 +2459,15 @@ impl Cpu {
                 self.service_timer(board);
             }
             r if r == sr::CNTV_CVAL_EL0 => {
+                if self.trace.irq {
+                    crate_core::warn!(
+                        "cpu{} cval write ahead={} pc={:#x} el={}",
+                        self.cpu,
+                        value.wrapping_sub(self.guest_counter()) as i64,
+                        self.state.pc,
+                        self.el()
+                    );
+                }
                 self.state.banked.cntv_cval = value;
                 self.service_timer(board);
             }

@@ -1682,12 +1682,15 @@ impl Block {
                     .emit((m.word & !(0x1f << 16) & !(1 << 23) & !(0x1f << 5)) | b << 5);
             }
             MemKind::LoadExclusive => {
+                // The reservation's address first: `va` may be the base
+                // register itself, which the load overwrites when Rt == Rn
+                // (musl's exit() does `ldaxr w3, [x3]`).
+                self.asm.emit(str_imm(3, va, SP, offsets::MONITOR));
                 if m.acquire {
                     self.asm.emit(ldar(m.size, m.rt, b));
                 } else {
                     self.asm.emit(ldr_imm(m.size, m.rt, b, 0));
                 }
-                self.asm.emit(str_imm(3, va, SP, offsets::MONITOR));
                 self.asm.emit(str_imm(3, m.rt, SP, offsets::MONITOR_VALUE));
             }
             MemKind::StoreExclusive => {

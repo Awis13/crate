@@ -736,11 +736,26 @@ impl Gen<'_> {
                 let ws = self.reg_not(&[base, rt]);
                 let ordered = self.rng.bool();
                 let size = 2 + self.rng.bits(1);
-                let top = out.len();
-                out.push(ldxr(size, ordered, rt, base));
-                out.push(add_imm(size == 3, rt, rt, 1 + self.rng.bits(8), false));
-                out.push(stxr(size, ordered, ws, rt, base));
-                out.push(cbnz(false, ws, (top as i64 - out.len() as i64) * 4));
+                if self.rng.bool() {
+                    // musl's exit(): the load-exclusive overwrites its own base
+                    // register (`ldaxr w3, [x3]`) and the store goes through a
+                    // second register holding the same address.
+                    let copy = rt;
+                    out.push(add_imm(true, copy, base, 0, false));
+                    let top = out.len();
+                    out.push(add_imm(true, base, copy, 0, false));
+                    out.push(ldxr(size, ordered, base, base));
+                    out.push(add_imm(size == 3, base, base, 1 + self.rng.bits(8), false));
+                    out.push(stxr(size, ordered, ws, base, copy));
+                    out.push(cbnz(false, ws, (top as i64 - out.len() as i64) * 4));
+                    out.push(add_imm(true, base, copy, 0, false));
+                } else {
+                    let top = out.len();
+                    out.push(ldxr(size, ordered, rt, base));
+                    out.push(add_imm(size == 3, rt, rt, 1 + self.rng.bits(8), false));
+                    out.push(stxr(size, ordered, ws, rt, base));
+                    out.push(cbnz(false, ws, (top as i64 - out.len() as i64) * 4));
+                }
             }
             57 => {
                 // Compare-and-swap, which may or may not swap.
