@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 crate-core.workspace = true
+libc.workspace = true

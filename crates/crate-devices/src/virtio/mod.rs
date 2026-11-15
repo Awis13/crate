@@ -26,6 +26,7 @@ pub mod input;
 pub mod mmio;
 pub mod net;
 pub mod queue;
+pub mod vsock;
 
 pub use queue::Queue;
 

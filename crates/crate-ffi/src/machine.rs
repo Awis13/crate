@@ -236,6 +236,7 @@ fn build(config: &Config) -> Result<(VirtMachine, Vec<Arc<AppDisplay>>), Status>
             keyboard: config.input & display::INPUT_KEYBOARD != 0,
             tablet: config.input & display::INPUT_TABLET != 0,
         },
+        vsock: config.vsock,
     })
     .map_err(fail_with)?;
     display::serve(&sinks, &virt)?;

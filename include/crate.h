@@ -215,6 +215,31 @@ crate_status crate_config_add_console(crate_config *config, crate_console_kind k
 size_t crate_console_write(crate_machine *machine, uint32_t console, const uint8_t *bytes,
                            size_t length);
 
+/* ---------------------------------------------------------------- vsock */
+
+/* A virtio socket device: stream connections between the guest and the app
+   without a network. The guest's context ID is `guest_cid`, 3 or more; the
+   host is CID 2. One per machine. */
+crate_status crate_config_add_vsock(crate_config *config, uint64_t guest_cid);
+
+/* Connects to `port`, which a guest program listens on. Blocks until the guest
+   accepts or refuses, or `timeout_ms` passes. On success `*fd` is the app's end
+   of the stream, a connected Unix stream socket the app owns and closes.
+   CRATE_ERR_IO when the guest refused (or its driver is not up yet),
+   CRATE_ERR_TIMEOUT when it did not answer, CRATE_ERR_STATE without a vsock. */
+crate_status crate_vsock_connect(crate_machine *machine, uint32_t port, uint32_t timeout_ms,
+                                 int *fd);
+
+/* Called, on an engine thread, with the app's end of each connection the guest
+   makes to host port `port`. The app owns `fd`. */
+typedef void (*crate_vsock_accept_fn)(void *context, uint32_t port, int fd);
+
+/* Takes the guest's connections to host `port`; CRATE_ERR_STATE when the port
+   already has a listener. */
+crate_status crate_vsock_listen(crate_machine *machine, uint32_t port, crate_vsock_accept_fn fn,
+                                void *context);
+crate_status crate_vsock_unlisten(crate_machine *machine, uint32_t port);
+
 /* ---------------------------------------------------------------- display */
 
 typedef enum crate_gpu {

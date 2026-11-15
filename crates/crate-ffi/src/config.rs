@@ -94,6 +94,8 @@ pub struct Config {
     /// CRATE_INPUT_* bits.
     pub(crate) input: u32,
     pub(crate) state: Option<StateCallback>,
+    /// The guest context ID of a vsock device.
+    pub(crate) vsock: Option<u64>,
 }
 
 /// The config behind a pointer, or INVALID_ARGUMENT.
@@ -186,6 +188,7 @@ pub unsafe extern "C" fn crate_config_new(machine: *const c_char) -> *mut Config
         displays: Vec::new(),
         input: 0,
         state: None,
+        vsock: None,
     }))
 }
 

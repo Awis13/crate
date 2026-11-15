@@ -20,6 +20,7 @@ use crate_core::log::Level;
 mod config;
 mod display;
 mod machine;
+mod vsock;
 
 /// Major version of the C API this library implements.
 pub const API_VERSION_MAJOR: u32 = 0;

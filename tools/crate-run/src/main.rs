@@ -407,6 +407,7 @@ fn run(args: Args) -> Result<StopReason> {
             keyboard: args.display.is_some(),
             tablet: args.display.is_some(),
         },
+        vsock: None,
     })?);
 
     if let (Some(server), Some(control)) = (&vnc, machine.display(0)) {

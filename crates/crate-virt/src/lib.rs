@@ -31,6 +31,7 @@ use crate_devices::virtio::console::{Console, ConsoleInput};
 use crate_devices::virtio::gpu::{Gpu, GpuConfig, GpuControl};
 use crate_devices::virtio::input::{Input, InputKind, Inputs};
 use crate_devices::virtio::mmio::VirtioMmio;
+use crate_devices::virtio::vsock::{Vsock, VsockHandle};
 use crate_devices::virtio::{VirtioDevice, block::Block, net::Net};
 use crate_devices::{pl011, pl011::Pl011, pl031, pl031::Pl031};
 use crate_host::ram::AnonymousRam;
@@ -109,6 +110,8 @@ pub struct VirtConfig {
     /// virtio-gpu devices, each with one screen.
     pub displays: Vec<DisplayConfig>,
     pub input: InputConfig,
+    /// A virtio socket device with this guest context ID (3 or more).
+    pub vsock: Option<u64>,
 }
 
 enum ConsoleHandle {
@@ -122,6 +125,7 @@ pub struct VirtMachine {
     displays: Vec<GpuControl>,
     input: Arc<Inputs>,
     dtb: Vec<u8>,
+    vsock: Option<VsockHandle>,
     _ram: Arc<dyn RamBlock>,
 }
 
@@ -292,6 +296,17 @@ impl VirtMachine {
             tablet = Some(device.sender());
             devices.push(Box::new(device));
         }
+        let mut vsock = None;
+        if let Some(cid) = config.vsock {
+            if cid < 3 || cid >= u32::MAX as u64 {
+                return Err(Error::InvalidArgument(format!(
+                    "vsock: guest context ID {cid} is reserved"
+                )));
+            }
+            let device = Vsock::new(cid).map_err(|e| Error::io("vsock", e))?;
+            vsock = Some(device.handle());
+            devices.push(Box::new(device));
+        }
         let virtio_count = devices.len();
         for (slot, device) in devices.into_iter().enumerate() {
             let irq = IrqLine::new(lines.clone(), VIRTIO_SPI_BASE + slot as u32);
@@ -345,6 +360,7 @@ impl VirtMachine {
             displays,
             input: Arc::new(Inputs::new(keyboard, tablet)),
             dtb,
+            vsock,
             _ram: ram,
         })
     }
@@ -374,6 +390,11 @@ impl VirtMachine {
 
     /// The keyboard and tablet; input for devices the machine lacks goes
     /// nowhere.
+    /// The host's side of the vsock device, if the machine has one.
+    pub fn vsock(&self) -> Option<&VsockHandle> {
+        self.vsock.as_ref()
+    }
+
     pub fn input(&self) -> Arc<dyn InputSink> {
         self.input.clone()
     }
@@ -660,6 +681,7 @@ mod tests {
             consoles: Vec::new(),
             displays: Vec::new(),
             input: InputConfig::default(),
+            vsock: None,
         };
         assert!(matches!(
             VirtMachine::new(config(0, 1 << 30)),
