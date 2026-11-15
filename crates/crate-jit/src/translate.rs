@@ -1343,7 +1343,10 @@ impl Block {
             | MemKind::VecStruct
             | MemKind::LoadAcquire
             | MemKind::StoreRelease => false,
-            MemKind::LoadExclusive | MemKind::StoreExclusive if m.rt2 != 31 => true,
+            MemKind::LoadExclusive | MemKind::StoreExclusive if m.is_exclusive_pair() => true,
+            // The fast path records the loaded register as the monitor's
+            // value, which XZR would lose.
+            MemKind::LoadExclusive if m.rt == 31 => true,
             MemKind::CasPair => [m.rt, m.rs, m.rt + 1, m.rs + 1].contains(&18),
             _ => m.rt == 18 || m.rs == 18,
         }

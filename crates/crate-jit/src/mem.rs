@@ -680,8 +680,7 @@ impl Cpu {
             self.tlb_fill(el, kind, addr, &t);
         }
         let size = m.size;
-        let pair =
-            m.rt2 != 31 && matches!(m.kind, MemKind::LoadExclusive | MemKind::StoreExclusive);
+        let pair = m.is_exclusive_pair();
         // Reads and writes `size`-sized values at an offset into the access.
         let read_at = |cpu: &mut Cpu, off: u64, sz: u32| -> Result<u64, mmu::Fault> {
             match ram {

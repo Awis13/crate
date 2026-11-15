@@ -143,6 +143,13 @@ pub struct Mem {
 }
 
 impl Mem {
+    /// LDXP/LDAXP or STXP/STLXP. Told by the access size, not by `rt2`:
+    /// the second register may be XZR (31), as in `stxp w9, x8, xzr, [x19]`.
+    pub fn is_exclusive_pair(&self) -> bool {
+        matches!(self.kind, MemKind::LoadExclusive | MemKind::StoreExclusive)
+            && self.total == 2u32 << self.size
+    }
+
     fn new(word: u32, kind: MemKind, size: u32, load: bool) -> Mem {
         Mem {
             word,
@@ -1130,6 +1137,19 @@ mod tests {
             Op::Memory(m) => {
                 assert!(m.kind == MemKind::StoreExclusive && m.rt2 == 1 && m.rs == 3);
             }
+            other => panic!("{other:?}"),
+        }
+        // stxp w9, x8, xzr, [x19] and ldxp xzr, x9, [x19]: still pairs, with
+        // XZR as a data register (Swift's task status writes these).
+        for word in [0xc8297e68, 0xc87f267f] {
+            match decode(word, 0) {
+                Op::Memory(m) => assert!(m.is_exclusive_pair() && m.total == 16, "{word:#x}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // ldxr x0, [x2] is not a pair.
+        match decode(0xc85f7c40, 0) {
+            Op::Memory(m) => assert!(m.kind == MemKind::LoadExclusive && !m.is_exclusive_pair()),
             other => panic!("{other:?}"),
         }
         // casal x0, x1, [x2] ; casp x4, x5, x6, x7, [x8]
