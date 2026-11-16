@@ -5,7 +5,7 @@
 //! `crate_machine`: a virt machine built from a config, run on a thread of
 //! its own, with its state reported to the app.
 
-use std::ffi::c_int;
+use std::ffi::{c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, Weak};
@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate_core::board::CpuBackend;
 use crate_core::run::{RunControl, StopReason};
+use crate_core::block::DiskSlot;
 use crate_host::disk::{FileDisk, Flush};
 use crate_host::jit::JitRegion;
 use crate_host::slirp::UserNet;
@@ -108,6 +109,8 @@ impl Shared {
 pub struct Machine {
     pub(crate) virt: Arc<VirtMachine>,
     pub(crate) displays: Vec<Arc<AppDisplay>>,
+    /// The config's disk slots, in order.
+    slots: Vec<Arc<DiskSlot>>,
     backend: Mutex<Option<Box<dyn CpuBackend + Send>>>,
     shared: Arc<Shared>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -168,7 +171,9 @@ fn backend(config: &Config) -> Result<Box<dyn CpuBackend + Send>, Status> {
     Ok(Box::new(Jit::new().in_region(region)))
 }
 
-fn build(config: &Config) -> Result<(VirtMachine, Vec<Arc<AppDisplay>>), Status> {
+type Built = (VirtMachine, Vec<Arc<AppDisplay>>, Vec<Arc<DiskSlot>>);
+
+fn build(config: &Config) -> Result<Built, Status> {
     let kernel = config
         .kernel
         .clone()
@@ -185,6 +190,10 @@ fn build(config: &Config) -> Result<(VirtMachine, Vec<Arc<AppDisplay>>), Status>
         let file = FileDisk::open_with(&disk.path, disk.flags & DISK_READ_ONLY != 0, flush)
             .map_err(fail_with)?;
         disks.push(Arc::new(file));
+    }
+    let slots: Vec<Arc<DiskSlot>> = (0..config.disk_slots).map(|_| Arc::new(DiskSlot::new())).collect();
+    for slot in &slots {
+        disks.push(slot.clone());
     }
     let mut networks = Vec::new();
     for network in &config.networks {
@@ -240,7 +249,7 @@ fn build(config: &Config) -> Result<(VirtMachine, Vec<Arc<AppDisplay>>), Status>
     })
     .map_err(fail_with)?;
     display::serve(&sinks, &virt)?;
-    Ok((virt, sinks))
+    Ok((virt, sinks, slots))
 }
 
 /// `crate_machine_create`.
@@ -266,7 +275,7 @@ pub unsafe extern "C" fn crate_machine_create(
         }
         install_panic_hook();
         let made = backend(config).and_then(|backend| Ok((backend, build(config)?)));
-        let (backend, (virt, displays)) = match made {
+        let (backend, (virt, displays, slots)) = match made {
             Ok(made) => made,
             Err(status) => {
                 EXISTS.store(false, Ordering::Release);
@@ -282,6 +291,7 @@ pub unsafe extern "C" fn crate_machine_create(
         let built = Box::new(Machine {
             virt: Arc::new(virt),
             displays,
+            slots,
             backend: Mutex::new(Some(backend)),
             shared: Arc::new(Shared {
                 status: Mutex::new(Current {
@@ -539,4 +549,53 @@ pub unsafe extern "C" fn crate_console_write(
         m.virt.console_write(console as usize, bytes)
     }))
     .unwrap_or(0)
+}
+
+/// `crate_machine_set_disk_slot`.
+///
+/// # Safety
+///
+/// `machine` is NULL or a live machine; `path` is NULL or a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crate_machine_set_disk_slot(
+    machine: *mut Machine,
+    index: u32,
+    path: *const c_char,
+    flags: u32,
+) -> Status {
+    guarded(|| {
+        // SAFETY: the caller's contract.
+        let Some(m) = (unsafe { machine.as_ref() }) else {
+            return fail(Status::InvalidArgument, "the machine is NULL");
+        };
+        let Some(slot) = m.slots.get(index as usize) else {
+            return fail(Status::InvalidArgument, format!("no disk slot {index}"));
+        };
+        if path.is_null() {
+            slot.set(None);
+            return Status::Ok;
+        }
+        if flags & !(DISK_READ_ONLY | DISK_FULL_FLUSH | DISK_NO_FLUSH) != 0 {
+            return fail(Status::InvalidArgument, format!("unknown disk flags {flags:#x}"));
+        }
+        // SAFETY: the caller's contract.
+        let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => return fail(Status::InvalidArgument, "the disk path is not UTF-8"),
+        };
+        let flush = if flags & DISK_FULL_FLUSH != 0 {
+            Flush::Full
+        } else if flags & DISK_NO_FLUSH != 0 {
+            Flush::Ignore
+        } else {
+            Flush::Data
+        };
+        match FileDisk::open_with(&path, flags & DISK_READ_ONLY != 0, flush) {
+            Ok(file) => {
+                slot.set(Some(Arc::new(file)));
+                Status::Ok
+            }
+            Err(e) => fail_with(e),
+        }
+    })
 }

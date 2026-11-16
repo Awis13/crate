@@ -88,6 +88,8 @@ pub struct Config {
     pub(crate) initrd: Option<PathBuf>,
     pub(crate) cmdline: String,
     pub(crate) disks: Vec<Disk>,
+    /// Empty disks after `disks`, for images put in while the machine runs.
+    pub(crate) disk_slots: u32,
     pub(crate) networks: Vec<Network>,
     pub(crate) consoles: Vec<Console>,
     pub(crate) displays: Vec<crate::display::Display>,
@@ -183,6 +185,7 @@ pub unsafe extern "C" fn crate_config_new(machine: *const c_char) -> *mut Config
         initrd: None,
         cmdline: String::new(),
         disks: Vec::new(),
+        disk_slots: 0,
         networks: Vec::new(),
         consoles: Vec::new(),
         displays: Vec::new(),
@@ -442,6 +445,25 @@ pub unsafe extern "C" fn crate_config_add_disk(
                 }
                 Err(status) => status,
             }
+        })
+    }
+}
+
+/// `crate_config_add_disk_slots`.
+///
+/// # Safety
+///
+/// As for `crate_config_set_kernel`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crate_config_add_disk_slots(config: *mut Config, count: u32) -> Status {
+    // SAFETY: the caller's contract.
+    unsafe {
+        with(config, |c| {
+            if count > 16 {
+                return fail(Status::InvalidArgument, "at most 16 disk slots");
+            }
+            c.disk_slots += count;
+            Status::Ok
         })
     }
 }

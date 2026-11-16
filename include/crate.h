@@ -152,6 +152,17 @@ crate_status crate_config_set_cmdline(crate_config *config, const char *cmdline)
    order they are added (vda, vdb, ...). */
 crate_status crate_config_add_disk(crate_config *config, const char *path, uint32_t flags);
 
+/* `count` more disks after the ones added, empty until an image is put in
+   with crate_machine_set_disk_slot (at most 16). */
+crate_status crate_config_add_disk_slots(crate_config *config, uint32_t count);
+
+/* Puts the image at `path` into disk slot `index` (counted from 0, after
+   the config's disks) of a machine, or takes it out with a NULL path; the
+   guest sees the disk's size change. Change a slot only while the guest
+   does not use it. */
+crate_status crate_machine_set_disk_slot(crate_machine *machine, uint32_t index, const char *path,
+                                         uint32_t flags);
+
 /* ---------------------------------------------------------------- network */
 
 /* A virtio network device on user-mode networking: the guest's traffic leaves
