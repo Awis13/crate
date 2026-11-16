@@ -1343,10 +1343,11 @@ impl Block {
             | MemKind::VecStruct
             | MemKind::LoadAcquire
             | MemKind::StoreRelease => false,
-            MemKind::LoadExclusive | MemKind::StoreExclusive if m.is_exclusive_pair() => true,
-            // The fast path records the loaded register as the monitor's
-            // value, which XZR would lose.
-            MemKind::LoadExclusive if m.rt == 31 => true,
+            // Every exclusive: with several CPUs under load, the inline
+            // monitor hung or crashed the guest kernel (vsock connections
+            // made and closed by thousands, on 6 CPUs) where the slow path,
+            // with the host's atomics, does not. Root cause still open.
+            MemKind::LoadExclusive | MemKind::StoreExclusive => true,
             MemKind::CasPair => [m.rt, m.rs, m.rt + 1, m.rs + 1].contains(&18),
             _ => m.rt == 18 || m.rs == 18,
         }
