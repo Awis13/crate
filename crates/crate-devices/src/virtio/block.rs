@@ -232,7 +232,8 @@ impl VirtioDevice for Block {
     fn activate(&mut self, mut activation: Activation) {
         let queue = activation.queues.remove(0);
         let interrupt = activation.interrupt.clone();
-        self.disk.on_activate(Arc::new(move || interrupt.signal_config()));
+        self.disk
+            .on_activate(Arc::new(move || interrupt.signal_config()));
         self.active = Some((queue, activation.interrupt));
     }
 

@@ -12,9 +12,9 @@ use std::sync::{Arc, Condvar, Mutex, Once, Weak};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
+use crate_core::block::DiskSlot;
 use crate_core::board::CpuBackend;
 use crate_core::run::{RunControl, StopReason};
-use crate_core::block::DiskSlot;
 use crate_host::disk::{FileDisk, Flush};
 use crate_host::jit::JitRegion;
 use crate_host::slirp::UserNet;
@@ -191,7 +191,9 @@ fn build(config: &Config) -> Result<Built, Status> {
             .map_err(fail_with)?;
         disks.push(Arc::new(file));
     }
-    let slots: Vec<Arc<DiskSlot>> = (0..config.disk_slots).map(|_| Arc::new(DiskSlot::new())).collect();
+    let slots: Vec<Arc<DiskSlot>> = (0..config.disk_slots)
+        .map(|_| Arc::new(DiskSlot::new()))
+        .collect();
     for slot in &slots {
         disks.push(slot.clone());
     }
@@ -576,7 +578,10 @@ pub unsafe extern "C" fn crate_machine_set_disk_slot(
             return Status::Ok;
         }
         if flags & !(DISK_READ_ONLY | DISK_FULL_FLUSH | DISK_NO_FLUSH) != 0 {
-            return fail(Status::InvalidArgument, format!("unknown disk flags {flags:#x}"));
+            return fail(
+                Status::InvalidArgument,
+                format!("unknown disk flags {flags:#x}"),
+            );
         }
         // SAFETY: the caller's contract.
         let path = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {

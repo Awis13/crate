@@ -459,7 +459,7 @@ pub unsafe extern "C" fn crate_config_add_disk_slots(config: *mut Config, count:
     // SAFETY: the caller's contract.
     unsafe {
         with(config, |c| {
-            if count > 16 {
+            if c.disk_slots.saturating_add(count) > 16 {
                 return fail(Status::InvalidArgument, "at most 16 disk slots");
             }
             c.disk_slots += count;
