@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate_core::board::Board;
 use crate_core::memory::GuestMemory;
@@ -23,8 +23,8 @@ use crate::cache::{BlockKey, FastHasher};
 use crate::mmu::{self, Access};
 use crate::smp::{Remote, Smp};
 use crate::state::{
-    CpuState, Exit, JC_ENTRIES, JcEntry, MONITOR_CLEAR, MmuRegs, TLB_BITS, TLB_ENTRIES,
-    TLB_INVALID, TLB_SHIFT, TlbEntry, TlbKind, offsets, tlb_index,
+    offsets, tlb_index, CpuState, Exit, JcEntry, MmuRegs, TlbEntry, TlbKind, JC_ENTRIES,
+    MONITOR_CLEAR, TLB_BITS, TLB_ENTRIES, TLB_INVALID, TLB_SHIFT,
 };
 use crate::translate::{Ctx, ERET_MARKER, FETCH_ABORT, SYSTEM_WORD_MARKER};
 
@@ -123,6 +123,15 @@ core::arch::global_asm!(
     exit = const offsets::EXIT,
 );
 
+// Mach-O C symbols have a leading underscore; ELF C symbols do not.
+#[cfg(not(target_vendor = "apple"))]
+core::arch::global_asm!(
+    ".globl crate_jit_enter",
+    ".set crate_jit_enter, _crate_jit_enter",
+    ".globl crate_jit_epilogue",
+    ".set crate_jit_epilogue, _crate_jit_epilogue",
+);
+
 // The guest's FPCR and FPSR live in the host's registers of this thread (see
 // the trampoline); the dispatcher reads and writes them there.
 fn fpcr() -> u64 {
@@ -167,6 +176,7 @@ impl CodeCache {
         Ok(CodeCache::with_region(
             JitRegion::new_dual(bytes)?,
             helper as usize as u64,
+            crate::sm3::jit_sm3 as usize as u64,
             fast,
         ))
     }
@@ -175,7 +185,12 @@ impl CodeCache {
     pub fn in_region(region: JitRegion, fast: bool) -> Self {
         let helper: unsafe extern "C" fn(*mut Cpu, *const u8, *mut CpuState) -> u64 =
             crate::mem::jit_mem;
-        CodeCache::with_region(region, helper as usize as u64, fast)
+        CodeCache::with_region(
+            region,
+            helper as usize as u64,
+            crate::sm3::jit_sm3 as usize as u64,
+            fast,
+        )
     }
 
     pub fn epilogue_addr() -> u64 {

@@ -12,7 +12,7 @@
 //! is read or written with `ADD Xn, SP, #0`. See `state` for why.
 
 use crate::asm::*;
-use crate::state::{Exit, TLB_SHIFT, offsets};
+use crate::state::{offsets, Exit, TLB_SHIFT};
 
 /// A host register the exit prefix and the save stub use as scratch before
 /// the matching guest register is live or after it is saved.
@@ -27,6 +27,7 @@ pub struct Stubs {
     pub save: u64,
     /// The memory slow path (see `mem_stub`).
     pub mem: u64,
+    pub sm3: u64,
     /// The jump-cache lookup for EL0 and EL1 code (see `jc_stubs`): the
     /// first of its `JC_COPIES` copies, `jc_stride` bytes apart.
     pub jc: [u64; 2],
@@ -167,12 +168,35 @@ fn call_rust(asm: &mut Asm, helper: u64, with_site: bool) {
     asm.emit(ldr_imm(3, 9, SP, offsets::HOST_SP));
     asm.emit(mov_sp(SP, 9)); // SP = host stack
     asm.emit(str_imm_pre(3, 2, SP, -16)); // push &state
-    // The helper is in the main binary, too far for a relative BL, so call it
-    // through a register.
+                                          // The helper is in the main binary, too far for a relative BL, so call it
+                                          // through a register.
     asm.mov_imm(16, helper);
     asm.emit(blr(16));
     asm.emit(ldr_imm_post(3, 2, SP, 16)); // x2 = &state
     asm.emit(mov_sp(SP, 2)); // SP = &state
+}
+
+pub fn sm3_stub(asm: &mut Asm, helper: u64) {
+    asm.emit(str_imm(3, 17, SP, offsets::SLOW_SITE));
+    asm.emit(str_imm(3, 30, SP, offsets::SLOW_RET));
+    for n in (0..14).step_by(2) {
+        asm.emit(stp(n, n + 1, SP, offsets::x(n) as i32));
+    }
+    asm.emit(str_imm(3, 14, SP, offsets::x(14)));
+    asm.emit(mrs(0, NZCV));
+    asm.emit(str_imm(3, 0, SP, offsets::NZCV));
+    save_vectors(asm);
+    call_rust(asm, helper, true);
+    load_vectors(asm);
+    asm.emit(ldr_imm(3, 0, SP, offsets::NZCV));
+    asm.emit(msr(NZCV, 0));
+    for n in (0..14).step_by(2) {
+        asm.emit(ldp(n, n + 1, SP, offsets::x(n) as i32));
+    }
+    asm.emit(ldr_imm(3, 14, SP, offsets::x(14)));
+    asm.emit(ldr_imm(3, 16, SP, offsets::SLOW_RET));
+    asm.emit(ldr_imm(3, 30, SP, offsets::x(30)));
+    asm.emit(ret_reg(16));
 }
 
 /// The jump-cache lookups for code at `el`, shared by every indirect branch

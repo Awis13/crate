@@ -97,6 +97,7 @@ pub struct CodeCache {
     stubs: Stubs,
     /// The memory helper the slow path calls.
     helper: u64,
+    sm3_helper: u64,
     /// Fast paths on in the code this cache makes.
     pub fast: bool,
     /// Bumped whenever the cache is emptied, so a chain site recorded before
@@ -126,7 +127,7 @@ pub enum TranslateError {
 
 impl CodeCache {
     /// A cache in `region`, whose slow path calls `helper`.
-    pub fn with_region(region: JitRegion, helper: u64, fast: bool) -> Self {
+    pub fn with_region(region: JitRegion, helper: u64, sm3_helper: u64, fast: bool) -> Self {
         let capacity = region.len().min(MAX_REGION);
         let mut cache = CodeCache {
             capacity,
@@ -138,6 +139,7 @@ impl CodeCache {
             pages: FastMap::default(),
             stubs: Stubs::default(),
             helper,
+            sm3_helper,
             fast,
             epoch: 0,
             spare: translate::Spare::default(),
@@ -171,6 +173,9 @@ impl CodeCache {
         let mut asm = Asm::new();
         emit::mem_stub(&mut asm, self.helper);
         self.stubs.mem = self.place(asm);
+        let mut asm = Asm::new();
+        emit::sm3_stub(&mut asm, self.sm3_helper);
+        self.stubs.sm3 = self.place(asm);
         let stats = std::env::var_os("CRATE_JIT_STATS").is_some();
         for el in 0..2 {
             let mut asm = Asm::new();
@@ -470,7 +475,7 @@ mod tests {
     fn a_block_past_the_reach_of_the_stubs_starts_a_new_epoch() {
         let region = JitRegion::new_dual(MAX_REGION).unwrap();
         // The helper is never called: nothing here runs.
-        let mut cache = CodeCache::with_region(region, 0x1000, true);
+        let mut cache = CodeCache::with_region(region, 0x1000, 0x2000, true);
         // Just short of the end, where the block's branches back to the
         // stubs would be out of reach.
         cache.cursor = MAX_REGION - 16;
@@ -499,7 +504,7 @@ mod tests {
     #[test]
     fn a_call_returns_to_an_entry_of_its_block() {
         let region = JitRegion::new_dual(1 << 20).unwrap();
-        let mut cache = CodeCache::with_region(region, 0x1000, true);
+        let mut cache = CodeCache::with_region(region, 0x1000, 0x2000, true);
         let ctx = Ctx {
             el: 1,
             fast: true,

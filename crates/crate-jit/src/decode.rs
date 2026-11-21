@@ -20,6 +20,8 @@
 pub enum Op {
     /// Copy the word into the host block unchanged.
     Copy,
+    /// An FEAT_SM3 instruction emulated by the software helper.
+    Sm3,
     /// A hint with no effect on this machine (NOP, YIELD, the pointer
     /// authentication and branch-target hints, which the CPU does not offer,
     /// and the data-cache maintenance the translator does not need): emit
@@ -254,9 +256,27 @@ pub fn decode(word: u32, pc: u64) -> Op {
         // Data processing -- register.
         0b0101 | 0b1101 => decode_data_reg(word),
         // Data processing -- SIMD and floating point.
-        0b0111 | 0b1111 => Op::Copy,
+        0b0111 | 0b1111 => decode_simd(word),
         // Reserved / unallocated (op0 0b0000 is reserved; SVE is 0b0010).
         _ => Op::Undefined,
+    }
+}
+
+fn decode_simd(word: u32) -> Op {
+    let sm3 = word & 0xffe0_8000 == 0xce40_0000
+        || matches!(
+            word & 0xffe0_cc00,
+            0xce40_8000 | 0xce40_8400 | 0xce40_8800 | 0xce40_8c00
+        )
+        || matches!(word & 0xffe0_fc00, 0xce60_c000 | 0xce60_c400)
+        // FEAT_SM4 is not available on every Apple CPU either. Reuse the
+        // software crypto helper rather than copying these into host code.
+        || word & 0xffff_fc00 == 0xcec0_8400
+        || word & 0xffe0_fc00 == 0xce60_c800;
+    if sm3 {
+        Op::Sm3
+    } else {
+        Op::Copy
     }
 }
 
@@ -896,6 +916,37 @@ mod tests {
     }
 
     #[test]
+    fn decodes_all_sm3_operations_for_emulation() {
+        for w in [
+            0xce62_c020, // sm3partw1
+            0xce65_c483, // sm3partw2
+            0xce48_24e6, // sm3ss1
+            0xce4c_a16a, // sm3tt1a
+            0xce4f_b5cd, // sm3tt1b
+            0xce52_8a30, // sm3tt2a
+            0xce55_9e93, // sm3tt2b
+            0xce63_c004, // reported crash
+        ] {
+            assert_eq!(decode(w, 0x1000), Op::Sm3);
+        }
+    }
+
+    #[test]
+    fn decodes_sm4_operations_for_emulation() {
+        for w in [
+            0xcec0_8400, // sm4e v0.4s, v0.4s; reported crash
+            0xcec0_863f, // sm4e v31.4s, v17.4s
+            0xce60_c800, // sm4ekey v0.4s, v0.4s, v0.4s
+            0xce69_ca3f, // sm4ekey v31.4s, v17.4s, v9.4s
+        ] {
+            assert_eq!(decode(w, 0x1000), Op::Sm3);
+        }
+        for w in [0xcec0_8000, 0xcec0_8800, 0xce60_cc00] {
+            assert_eq!(decode(w, 0x1000), Op::Copy);
+        }
+    }
+
+    #[test]
     fn finds_sp_forms() {
         // sub sp, sp, #16
         assert!(matches!(
@@ -1041,7 +1092,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(decode(0xd50342df, 0), Op::MsrImm { .. })); // msr daifset
-        // wfi ; wfe ; nop ; paciasp ; autiasp ; bti c
+                                                                     // wfi ; wfe ; nop ; paciasp ; autiasp ; bti c
         assert_eq!(decode(0xd503207f, 0), Op::Wait { event: false });
         assert_eq!(decode(0xd503205f, 0), Op::Wait { event: true });
         assert_eq!(decode(0xd503201f, 0), Op::Nop);
