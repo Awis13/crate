@@ -14,6 +14,7 @@ pub mod decode;
 pub mod emit;
 mod mem;
 pub mod mmu;
+mod sm3;
 pub mod smp;
 pub mod state;
 pub mod translate;

@@ -47,11 +47,11 @@
 
 use crate::asm::*;
 use crate::decode::{self, CallKind, CondKind, Mem, MemKind, Op};
-use crate::emit::{self, ExitInfo, JUMP_REG, Next, Stubs};
+use crate::emit::{self, ExitInfo, Next, Stubs, JUMP_REG};
 use std::mem::offset_of;
 
 use crate::state::{
-    Banked, Exit, MmuRegs, TLB_BITS, TLB_NEAR, TLB_SHIFT, TlbEntry, TlbKind, offsets, tlb_index,
+    offsets, tlb_index, Banked, Exit, MmuRegs, TlbEntry, TlbKind, TLB_BITS, TLB_NEAR, TLB_SHIFT,
 };
 
 /// What every block of one translation context shares.
@@ -239,6 +239,7 @@ fn uses(op: &Op, word: u32) -> (u32, u32) {
     let bit = |r: u32| if r < 31 { 1u32 << r } else { 0 };
     match *op {
         Op::Copy => copy_uses(word),
+        Op::Sm3 => (0, 0),
         Op::PcRel { rd, .. } => (0, bit(rd)),
         Op::AddSubSpImm { rd, rn, .. } => (bit(rn), bit(rd)),
         Op::AddSubSpExt { rd, rn, rm, .. } => (bit(rn) | bit(rm), bit(rd)),
@@ -724,6 +725,19 @@ impl Block {
         match op {
             Op::Copy => {
                 self.emit_copy(word);
+                false
+            }
+            Op::Sm3 => {
+                self.sync();
+                // BL uses X30, while the helper ABI may clobber X15..X17.
+                // Preserve the guest values in their canonical state slots.
+                self.asm.emit(str_imm(3, 30, SP, offsets::x(30)));
+                self.asm.mov_imm(17, word as u64);
+                self.asm.bl_abs(self.ctx.stubs.sm3);
+                for r in 15..=17 {
+                    self.asm.emit(ldr_imm(3, r, SP, offsets::x(r)));
+                }
+                self.asm.emit(ldr_imm(3, 30, SP, offsets::x(30)));
                 false
             }
             Op::Nop => false,
@@ -2436,7 +2450,11 @@ pub fn gpr_field_positions(word: u32) -> &'static [u32] {
                     0b0000 => RD_RN_RM, // add/sub with carry
                     0b0010 => {
                         // conditional compare: no Rd
-                        if word & (1 << 11) == 0 { RN_RM } else { RN }
+                        if word & (1 << 11) == 0 {
+                            RN_RM
+                        } else {
+                            RN
+                        }
                     }
                     0b0100 => RD_RN_RM, // conditional select
                     0b0110 => {

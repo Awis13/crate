@@ -33,7 +33,7 @@ fn translation_speed() {
     let pages = (0x10000 / 4..words.len().min(0x80_0000 / 4)).step_by(1024);
     let region = JitRegion::new_dual(MAX_REGION).unwrap();
     // The helper is never called: nothing here runs.
-    let mut cache = CodeCache::with_region(region, 0x1000, true);
+    let mut cache = CodeCache::with_region(region, 0x1000, 0x2000, true);
     let (mut blocks, mut instructions) = (0u64, 0u64);
     let started = Instant::now();
     let rounds: usize = std::env::var("ROUNDS")
